@@ -19,7 +19,7 @@
 //! Replaces the SuffixStore-based `MatchGenerator` for the Fast strategy
 //! path with a upstream zstd-parity hash table and tight per-block loop.
 //!
-//! Wired into production: [`crate::encoding::match_generator::MatcherStorage::Simple`]
+//! Wired into production: the driver's `MatcherStorage::Simple` variant
 //! holds `FastKernelMatcher` directly; the driver's Matcher trait
 //! methods (`commit_space` / `start_matching` / `skip_matching_with_hint`
 //! / `reset` / `prime_with_dictionary` / `trim_after_budget_retire`)
@@ -85,7 +85,7 @@ pub(crate) const FAST_INITIAL_REP: [u32; 2] = [1, 4];
 
 /// Initial offset-history seed for the encoder's repcode-coded
 /// offsets — matches upstream zstd's `repToConfirm[] = { 1, 4, 8 }` at frame
-/// start and mirrors the value the old [`super::MatchGenerator`] used.
+/// start.
 pub(crate) const FAST_INITIAL_OFFSET_HIST: [u32; 3] = [1, 4, 8];
 
 /// Drain start offset used by eviction / drain paths. Set to 0:
@@ -247,8 +247,9 @@ pub(crate) struct FastKernelMatcher {
     /// the dictionary region at the front of `history` (positions
     /// `[1, region_len)`), using the same `(hash_log, mls)` as
     /// [`Self::hash_table`] so a single hash keys both. Attached
-    /// (`is_attached()`) activates the dual-probe [`compress_block_fast_dict`]
-    /// kernel; invalidated on any history eviction (absolute dict positions
+    /// (`is_attached()`) activates the dual-probe
+    /// [`super::fast_kernel::kernel::compress_block_fast_dict`] kernel;
+    /// invalidated on any history eviction (absolute dict positions
     /// would otherwise go stale) so the no-dict kernel takes over —
     /// correctness-safe, only the dict ratio benefit is lost when the input is
     /// large enough to slide the dictionary out of the window. `region_len()`
@@ -747,7 +748,7 @@ impl FastKernelMatcher {
     /// window borrow stays a disjoint field projection alongside the
     /// `&mut self.hash_table` borrow (a `&self` accessor call would
     /// borrow all of `self` and collide). Owned-only mutation paths
-    /// (append, drain, rehash) keep accessing the backing buffer
+    /// (append, drain, index slide) keep accessing the backing buffer
     /// directly.
     #[inline(always)]
     fn history_bytes(&self) -> &[u8] {
@@ -864,7 +865,7 @@ impl FastKernelMatcher {
     /// Accept a freshly-committed block from the driver.
     ///
     /// Upstream zstd's `ZSTD_window_update`: the new bytes are stashed for
-    /// the next [`Self::start_matching`] / [`Self::skip_matching`]
+    /// the next [`Self::start_matching`] / [`Self::skip_matching_with_hint`]
     /// call but NOT yet appended to `history` — that delay lets the
     /// driver-side `get_last_space` peek at the still-pending buffer
     /// without committing it to the matcher's hot path.
@@ -963,16 +964,34 @@ impl FastKernelMatcher {
     /// 2. Reset `prefix_start_index` to `INITIAL_PREFIX_START_INDEX = 1`
     ///    — drain re-indexes the retained tail; the sentinel-0
     ///    filter restores via this fixed baseline.
-    /// 3. Clear the hash table — entries hold pre-drain absolute
-    ///    positions that no longer reference live bytes.
+    /// 3. Slide the hash table's stored positions down by `drop_n`
+    ///    ([`FastHashTable::reduce_indices`], upstream `ZSTD_reduceIndex`)
+    ///    so they keep naming the same bytes, with anything that named
+    ///    the dropped prefix falling to the empty sentinel.
     /// 4. `saturating_sub` `last_block_start` by `drop_n`.
-    /// 5. Rehash retained tail starting at the sentinel-0 floor
-    ///    ([`INITIAL_PREFIX_START_INDEX`] = 1) so block N+1 can find
-    ///    matches against the kept bytes (without this they'd be
-    ///    "dead history" — visible in the Vec but unlookupable).
-    ///    Starting from index 1 instead of 0 avoids hashing a position
-    ///    that the kernel's `match_idx >= prefix_start_index` filter
-    ///    would reject anyway.
+    ///
+    /// Step 3 replaced a clear plus a dense rehash of the whole retained
+    /// tail, which was a pass over every byte the window kept — at level 1
+    /// on an 8 MiB input the rehash alone was a fifth of the encode, for a
+    /// window that slides every `max_window_size` bytes. Sliding the indices
+    /// is a pass over the table instead, and it is also the more faithful
+    /// state: the rehash indexed every position, including the ones the
+    /// matcher's step had skipped and never stored, so the table came out of
+    /// a slide holding more than it held going in.
+    ///
+    /// The two costs scale differently — the slide with the table's entries,
+    /// the rehash with the window's bytes — so the choice between them would
+    /// matter if a table could be much larger than the window it indexes. It
+    /// cannot: a frame without a dictionary caps `hash_log` at
+    /// `window_log + 1` (upstream `ZSTD_adjustCParams_internal`), which bounds
+    /// the table at two entries per window byte, and a dictionary frame takes
+    /// its table width from the dictionary's own cParams rather than from a
+    /// caller's `hashLog`. Measured over `windowLog` 10 to 16 with `hashLog`
+    /// pinned at 20 (`examples/slide_oversized_table.rs`): identical time
+    /// without a dictionary, and up to twice as fast with one. So there is no
+    /// size-dependent choice here to make, and adding one would buy a branch
+    /// and two code paths for a configuration the parameter resolution does
+    /// not produce.
     fn drain_real_prefix(&mut self, drop_n: usize) {
         let drain_end = HISTORY_DRAIN_BASE + drop_n;
         self.history.drain(HISTORY_DRAIN_BASE..drain_end);
@@ -991,12 +1010,11 @@ impl FastKernelMatcher {
         // prefix floor reverts to the windowed value (upstream zstd
         // `ZSTD_window_enforceMaxDist` zeroing `loadedDictEnd`).
         self.loaded_dict_end = 0;
-        self.hash_table.clear();
+        // `drop_n` is a length inside `history`, which the window ceiling
+        // (`window_log <= 30`, retained at most `2 * max_window_size`) keeps
+        // under 2^31.
+        self.hash_table.reduce_indices(drop_n as u32);
         self.last_block_start = self.last_block_start.saturating_sub(drop_n);
-        // Skip position 0 — `prefix_start_index = 1` means the kernel
-        // rejects any match resolving to index 0, so populating that
-        // slot would just pollute the table with an unreachable entry.
-        self.prime_hash_table_for_range(INITIAL_PREFIX_START_INDEX as usize);
     }
 
     /// Internal: drain `self.pending` into `self.history`, applying
@@ -1005,15 +1023,13 @@ impl FastKernelMatcher {
     /// `currentBlockStart` — what the kernel receives as
     /// `block_start`).
     ///
-    /// Eviction rule mirrors upstream zstd's `ZSTD_window_correctOverflow`:
-    /// when total retained bytes would exceed `2 × max_window_size`,
-    /// drop the oldest bytes back down to a `max_window_size` tail
-    /// and clear the hash table. The clear is forced because absolute
-    /// positions stored in the table would otherwise reference
-    /// evicted bytes; upstream zstd avoids the clear via a base-pointer trick
-    /// (`base += correction`) that the flat-`Vec<u8>` history can't
-    /// reuse, but pays for it with a one-time eviction every
-    /// `max_window_size` worth of input — amortised constant.
+    /// Eviction happens earlier, in `accept_data`: when total retained bytes
+    /// would exceed `2 × max_window_size`, the oldest bytes are dropped back
+    /// down to a `max_window_size` tail and the hash table's stored positions
+    /// slide down by the same amount ([`Self::drain_real_prefix`], upstream
+    /// zstd `ZSTD_reduceIndex`), so the retained entries keep naming the same
+    /// bytes. One eviction every `max_window_size` of input: amortised
+    /// constant.
     fn extend_history_with_pending(&mut self) -> usize {
         let mut space = self
             .pending
@@ -1257,8 +1273,8 @@ impl FastKernelMatcher {
     /// are supported: matches are bounded by `window_low = block_end -
     /// advertised_window` (the same bound the owned evicting path applies),
     /// and the per-position `put` during the scan keeps in-window hash
-    /// slots current — so an out-of-window stale slot is rejected exactly
-    /// where the owned rehash would have left the slot empty, giving
+    /// slots current, so an out-of-window stale slot is rejected exactly
+    /// where the owned index slide would have left the slot empty, giving
     /// identical match decisions with or without eviction.
     pub(crate) fn start_matching_borrowed(
         &mut self,
@@ -1333,8 +1349,8 @@ impl FastKernelMatcher {
     /// C performs with `dictBase` / `ZSTD_count_2segments`, which the flat
     /// single-base path cannot. Dispatches the active `(mls, use_cmov)` pair to
     /// the monomorphised dual-base kernel
-    /// [`compress_block_fast_dict_borrowed`], which carries the owned dict
-    /// kernel's full machinery (repcode probe, step-ramp two-position
+    /// [`super::fast_kernel::kernel::compress_block_fast_dict_borrowed`],
+    /// which carries the owned dict kernel's full machinery (repcode probe, step-ramp two-position
     /// lookahead, dense fills, backward extension, immediate repcode-2 loop) —
     /// the prior scalar greedy scan had none of these and was +68% slower.
     /// Validated by roundtrip + cross-validation + the FFI ratio gate.
@@ -1742,9 +1758,9 @@ impl FastKernelMatcher {
 
     /// Drop history bytes past `max_window_size` via
     /// [`Self::drain_real_prefix`] (resets `prefix_start_index` to
-    /// `INITIAL_PREFIX_START_INDEX` = 1 — the sentinel-0 floor — and
-    /// clears + rehashes the table). Returns evicted byte count;
-    /// idempotent when `real_len <= max_window_size`.
+    /// `INITIAL_PREFIX_START_INDEX` = 1, the sentinel-0 floor, and slides
+    /// the table's stored positions down by the evicted count). Returns
+    /// evicted byte count; idempotent when `real_len <= max_window_size`.
     pub(crate) fn trim_to_window(&mut self) -> usize {
         let real_len = self.history.len().saturating_sub(HISTORY_DRAIN_BASE);
         if real_len <= self.max_window_size {
@@ -1925,12 +1941,15 @@ impl FastKernelMatcher {
             }};
         }
         // Dense is the ordinary path — every searched block primes through it —
-        // and it has to stay a plain counted loop. Running it as `step_by(1)`
-        // over an inclusive range keeps the iterator's stride and exhausted
-        // flag live, which the optimiser does not reduce back to an induction
-        // variable: that alone cost a factor of two on every fast-level frame.
+        // and it has to stay a plain counted loop. Two shapes have cost it that:
+        // running it as `step_by(1)` keeps the iterator's stride live, and an
+        // INCLUSIVE range keeps its exhausted flag live. Neither is reduced back
+        // to an induction variable, and both show up as `next` / `lt` frames
+        // inside this function's profile. The half-open range is the one that
+        // compiles to a counted loop. The bound cannot overflow: `last_hashable`
+        // is `history.len() - HASH_READ_SIZE`.
         if step == 1 {
-            for pos in range_start..=last_hashable {
+            for pos in range_start..last_hashable + 1 {
                 index_at!(pos);
             }
             return;
@@ -1949,11 +1968,11 @@ impl FastKernelMatcher {
             // avoid.
             const SEAM: usize = 8;
             let head_end = last_hashable.min(range_start + SEAM);
-            for pos in range_start..=head_end {
+            for pos in range_start..head_end + 1 {
                 index_at!(pos);
             }
             let tail_start = last_hashable.saturating_sub(SEAM).max(range_start);
-            for pos in tail_start..=last_hashable {
+            for pos in tail_start..last_hashable + 1 {
                 index_at!(pos);
             }
         }
@@ -1974,12 +1993,11 @@ impl FastKernelMatcher {
 
     /// Dictionary-priming entry for the upstream zstd `dictMatchState` Fast path.
     /// Appends the pending dict slice to `history` and indexes its positions
-    /// into the SEPARATE immutable [`Self::dict_table`] — NOT the main hash
-    /// table. Keeping dict positions out of the main table is what lets the
-    /// dual-probe kernel prefer recent-input matches (main) over dictionary
-    /// matches (dict fallback), matching the upstream zstd's `prefixStart`/dict split.
-    /// Replaces the [`Self::skip_matching_with_hint`]`(Some(false))` call the
-    /// driver used to make for Fast-backend priming.
+    /// into the SEPARATE immutable dictionary table held by [`Self::dict`], NOT
+    /// the main hash table. Keeping dict positions out of the main table is
+    /// what lets the dual-probe kernel prefer recent-input matches (main) over
+    /// dictionary matches (dict fallback), matching the upstream zstd's
+    /// `prefixStart`/dict split.
     pub(crate) fn skip_matching_for_dict_prime(&mut self, dict_len: usize) {
         let block_start = self.extend_history_with_pending();
         self.prime_dict_table_for_range(block_start, dict_len);
@@ -2035,7 +2053,8 @@ impl FastKernelMatcher {
         self.dict.invalidate();
     }
 
-    /// Build (or extend) [`Self::dict_table`] over `history[range_start..]`,
+    /// Build (or extend) the dictionary table in [`Self::dict`] over
+    /// `history[range_start..]`,
     /// the freshly-appended dictionary bytes. Lazily allocates the dict table
     /// at the CDict geometry of the whole `dict_len`-byte dictionary and the
     /// main table's `mls`, so one hash keys both.
@@ -2374,7 +2393,8 @@ fn run_fast_kernel_block(
 }
 
 /// Dictionary-primed counterpart of [`run_fast_kernel_block`]: dispatches the
-/// `(mls, use_cmov)` pair to [`compress_block_fast_dict`], threading the
+/// `(mls, use_cmov)` pair to
+/// [`super::fast_kernel::kernel::compress_block_fast_dict`], threading the
 /// immutable `dict_table` alongside the main table. Emits any terminal tail
 /// literals exactly as the no-dict helper does.
 #[allow(clippy::too_many_arguments)]
