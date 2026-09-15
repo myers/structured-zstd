@@ -320,7 +320,13 @@ pub(crate) fn apply_param_overrides(
                     fast.hash_log = hash_log;
                 }
                 if let Some(min_match) = ov.min_match {
-                    fast.mls = min_match;
+                    fast.mls = fast_key_len(min_match);
+                }
+                // targetLength is the Fast strategy's step, as it is on the
+                // level's own row: upstream zstd_fast.c `stepSize =
+                // targetLength + !targetLength + 1`.
+                if let Some(target_length) = ov.target_length {
+                    fast.step_size = (target_length as usize).max(1) + 1;
                 }
             }
         }
@@ -390,6 +396,14 @@ pub(crate) fn apply_param_overrides(
             }
         }
     }
+}
+
+/// The key width the fast strategy hashes for a `minMatch`: upstream's fast
+/// block compressor takes 3 as 4 (zstd_fast.c, `ZSTD_compressBlock_fast`:
+/// `default: /* includes case 3 */`). A 3 reaches the fast strategy from the
+/// knob, or from an optimal level's CDict row a strategy knob moved onto it.
+fn fast_key_len(min_match: u32) -> u32 {
+    min_match.max(4)
 }
 
 /// Map the resolved runtime strategy to the upstream zstd LDM strategy ordinal
@@ -629,7 +643,7 @@ fn level_params_from_cparams(cp: crate::encoding::cparams::CParams) -> LevelPara
             // Upstream fast `stepSize`: `targetLength + 1` (0 -> 1, so step 2).
             fast: Some(FastConfig {
                 hash_log: cp.hash_log,
-                mls: cp.min_match,
+                mls: fast_key_len(cp.min_match),
                 step_size: target_len.max(1) + 1,
             }),
             dfast: None,
@@ -740,6 +754,102 @@ pub(crate) fn adjust_params_for_source_size(mut params: LevelParams, src_size: u
     params
 }
 
+/// Apply the caller's parameter overrides to the level params a frame
+/// resolved to: the step the matcher's reset takes after the level (and a
+/// dictionary's CDict tier) is resolved, kept in one place so the workspace
+/// estimate builds exactly what the encoder does. An all-`None` set leaves the
+/// params untouched, which keeps plain level-based geometry byte-identical.
+pub(crate) fn apply_frame_overrides(
+    params: &mut LevelParams,
+    ov: &crate::encoding::parameters::ParamOverrides,
+    dictionary_frame: bool,
+    hint: Option<u64>,
+) {
+    if ov.is_empty() {
+        return;
+    }
+    if dictionary_frame {
+        // A dictionary frame runs the CDict's cParams (upstream
+        // `ZSTD_resetCCtx_byAttachingCDict` / `byCopyingCDict`), and the
+        // search knobs are already part of them
+        // (`resolve_level_params_with_dict`); the frame's own knob is the
+        // window.
+        //
+        // The window still answers to the source, as it does for every
+        // other frame: `ZSTD_adjustCParams_internal` caps it by the source
+        // and dictionary extent, and a window neither can fill only makes
+        // decoders reserve memory the frame never uses. Capped here rather
+        // than through the full adjuster, which would reshape the search.
+        if let Some(window_log) = ov.window_log {
+            params.window_log = match hint {
+                // The source caps the window even here, and even with an
+                // explicit request: the reference command declares 2 KiB
+                // for `--ultra -22 --long=27 -D dict` on a 2 KiB file, and
+                // a window the content cannot fill only makes every decoder
+                // reserve memory the frame never uses. The floor that
+                // travels with the cap in `adjust_cparams` applies too, or
+                // a hint of a few dozen bytes asks for a window smaller
+                // than the format's smallest.
+                //
+                // The dictionary's own size is NOT part of that cap: the
+                // reference declares the same 2 KiB whether the dictionary
+                // is 4 KiB or 256 KiB, because a small window does not put
+                // the dictionary out of reach: sequences may reference it
+                // at offsets beyond the window while the output so far is
+                // within it (RFC 8878, Dictionary_Content). Counting it
+                // made our frames ask decoders for up to 256x what the
+                // reference asks.
+                Some(src) => {
+                    (crate::encoding::cparams::adjusted_window_log(u32::from(window_log), src, 0)
+                        as u8)
+                        .max(MIN_WINDOW_LOG)
+                }
+                None => window_log,
+            };
+        }
+    } else {
+        apply_param_overrides(params, ov);
+        // The level's own resolution applied the source-size cap for the
+        // LEVEL's native backend. If a strategy override moved the frame
+        // onto a different backend, `apply_param_overrides` synthesized that
+        // backend's DEFAULT config (FAST_L1 / HC_OVERRIDE_DEFAULT) with
+        // full-size table logs AFTER that cap ran. Re-apply the hint cap so a
+        // tiny hinted frame doesn't allocate the new backend's full-size
+        // tables.
+        //
+        // The cap covers an explicit `window_log` too, as
+        // `ZSTD_adjustCParams_internal` does upstream: the window is a
+        // promise about the memory decoding will need, and a source that
+        // cannot fill it makes that promise for nothing: every decoder
+        // opening the frame would reserve the whole declared window to read
+        // a few bytes. The override still raises the window as far as the
+        // source can use.
+        if let Some(hint_size) = hint {
+            *params = adjust_params_for_source_size(*params, hint_size);
+        }
+    }
+}
+
+/// The long-distance matcher's parameters for a frame: the caller-pinned knobs
+/// seeded first, then the upstream derivation fills the rest so the set stays
+/// consistent (`hash_rate_log = window_log - hash_log`, and so on); clobbering
+/// after the derivation would hand the producer an inconsistent set. Shared by
+/// the matcher's reset and the workspace estimate.
+#[cfg(feature = "ldm")]
+pub(crate) fn frame_ldm_params(
+    params: &LevelParams,
+    ldm: &crate::encoding::parameters::LdmOverride,
+) -> crate::encoding::ldm::params::LdmParams {
+    let seed = crate::encoding::ldm::params::LdmParams {
+        window_log: params.window_log as u32,
+        hash_log: ldm.hash_log.unwrap_or(0),
+        hash_rate_log: ldm.hash_rate_log.unwrap_or(0),
+        min_match_length: ldm.min_match.unwrap_or(0),
+        bucket_size_log: ldm.bucket_size_log.unwrap_or(0),
+    };
+    seed.derive(ldm_strategy_ordinal(params.strategy_tag, params.lazy_depth))
+}
+
 /// Estimated steady-state heap footprint of a one-shot compression context
 /// at `level` (window history + match-finder tables + block staging), in
 /// bytes. Computed from the same per-level tuning table the encoder
@@ -790,9 +900,16 @@ pub fn estimated_compression_workspace_bytes_for_run(
     long_distance_matching: bool,
     dictionary: Option<crate::encoding::DictionarySizes>,
 ) -> usize {
-    use crate::encoding::strategy::StrategyTag;
     let mut params = match dictionary.filter(|sizes| sizes.content != 0) {
-        Some(sizes) => resolve_level_params_with_dict(level, src_size_hint, sizes).0,
+        Some(sizes) => {
+            resolve_level_params_with_dict(
+                level,
+                src_size_hint,
+                sizes,
+                &crate::encoding::parameters::ParamOverrides::default(),
+            )
+            .0
+        }
         None => resolve_level_params(level, src_size_hint),
     };
     // The override is what the frame will keep, but never below the floor the
@@ -833,6 +950,81 @@ pub fn estimated_compression_workspace_bytes_for_run(
         let _ = long_distance_matching;
         0
     };
+    workspace_bytes(&params, ldm)
+}
+
+/// The workspace estimate for a frame run under `parameters`: the level, every
+/// knob that overrides it, the source size and the dictionary, resolved the way
+/// the encoder resolves them at frame start.
+///
+/// [`estimated_compression_workspace_bytes_for_run`] answers for a level with a
+/// window and long-distance matching on top; a caller that also sets `hashLog`,
+/// `chainLog`, a strategy or the long-distance matcher's own table sizes needs
+/// this one, since each of those resizes what the frame allocates. A dictionary
+/// frame runs the geometry the dictionary is prepared with, the knobs included,
+/// as the encoder does.
+///
+/// # Examples
+///
+/// ```
+/// use structured_zstd::encoding::{
+///     estimated_compression_workspace_bytes_for_parameters, CompressionLevel,
+///     CompressionParameters,
+/// };
+///
+/// let level = CompressionParameters::builder(CompressionLevel::Level(3)).build().unwrap();
+/// let wide = CompressionParameters::builder(CompressionLevel::Level(3))
+///     .window_log(27)
+///     .hash_log(24)
+///     .build()
+///     .unwrap();
+/// let source = Some(512 << 20);
+/// assert!(
+///     estimated_compression_workspace_bytes_for_parameters(&wide, source, None)
+///         > estimated_compression_workspace_bytes_for_parameters(&level, source, None)
+/// );
+/// ```
+pub fn estimated_compression_workspace_bytes_for_parameters(
+    parameters: &crate::encoding::CompressionParameters,
+    src_size_hint: Option<u64>,
+    dictionary: Option<crate::encoding::DictionarySizes>,
+) -> usize {
+    let level = parameters.level();
+    let overrides = parameters.overrides();
+    let dictionary = dictionary.filter(|sizes| sizes.content != 0);
+    let mut params = match dictionary {
+        Some(sizes) => resolve_level_params_with_dict(level, src_size_hint, sizes, &overrides).0,
+        None => resolve_level_params(level, src_size_hint),
+    };
+    apply_frame_overrides(&mut params, &overrides, dictionary.is_some(), src_size_hint);
+    #[cfg(feature = "ldm")]
+    let ldm = overrides.ldm.map_or(0, |ldm| {
+        let ldm_params = frame_ldm_params(&params, &ldm);
+        crate::encoding::ldm::table::LdmHashTable::estimated_workspace_bytes(
+            ldm_params.hash_log,
+            ldm_params.bucket_size_log,
+        )
+    });
+    #[cfg(not(feature = "ldm"))]
+    let ldm = 0;
+    workspace_bytes(&params, ldm)
+}
+
+/// `entry` bytes for each of `1 << log` slots, pinned at `usize::MAX` where
+/// the table is more than a `usize` counts: the estimate is a budget, and a
+/// figure that wrapped would call an impossible table affordable.
+fn table_bytes(entry: usize, log: usize) -> usize {
+    u32::try_from(log)
+        .ok()
+        .and_then(|log| 1usize.checked_shl(log))
+        .and_then(|slots| slots.checked_mul(entry))
+        .unwrap_or(usize::MAX)
+}
+
+/// Window, match-finder tables, optimal-parser scratch and block staging for a
+/// frame resolved to `params`, plus `ldm` bytes of long-distance table.
+fn workspace_bytes(params: &LevelParams, ldm: usize) -> usize {
+    use crate::encoding::strategy::{SearchMethod, StrategyTag};
     // A 30-bit window is a gibibyte, which a 32-bit `usize` cannot count: the
     // widest window is more memory than such a machine has, so the figure is
     // pinned rather than wrapped.
@@ -851,37 +1043,46 @@ pub fn estimated_compression_workspace_bytes_for_run(
         params.strategy_tag,
         StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
     );
-    // The lazy backend's chain / tree finders (window <= 2^14, or a btlazy2
-    // level) use a plain hash table (`4 << hash_bits`) plus the chain / tree
-    // table (`4 << chain_log`) instead of the row tables.
-    let row_chain = params
-        .row
-        .filter(|r| r.bt || params.window_log <= 14)
-        .map_or(0, |r| (4usize << r.hash_bits) + (4usize << r.chain_log));
-    let tables = params.fast.map(|f| 4usize << f.hash_log).unwrap_or(0)
-        + row_chain
-        + params
-            .dfast
-            .map(|d| (4usize << d.long_hash_log) + (4usize << d.short_hash_log))
-            .unwrap_or(0)
-        + params
-            .hc
-            .map(|h| {
-                let hash3 = if wants_hash3 {
-                    4usize
-                        << crate::encoding::match_table::storage::HC3_HASH_LOG
-                            .min(params.window_log as usize)
-                } else {
-                    0
-                };
-                (4usize << h.hash_log) + (4usize << h.chain_log) + hash3
-            })
-            .unwrap_or(0)
-        + params
-            .row
-            .filter(|r| !(r.bt || params.window_log <= 14))
-            .map(|r| (4usize << r.hash_bits) + (2usize << r.hash_bits))
-            .unwrap_or(0);
+    // Only the backend `params.search` selects is built: `reset` swaps in one
+    // matcher storage per frame. A strategy override leaves the level's own
+    // row in place beside the one it synthesized, so summing every populated
+    // config would charge a frame for tables it never allocates.
+    // Every term goes through `table_bytes` and every sum saturates: an
+    // override can ask for a table past what a 32-bit `usize` counts, and a
+    // shift that dropped its high bits would report that table as free.
+    let tables = match params.search {
+        SearchMethod::Fast => params
+            .fast
+            .map_or(0, |f| table_bytes(4, f.hash_log as usize)),
+        SearchMethod::DoubleFast => params.dfast.map_or(0, |d| {
+            table_bytes(4, usize::from(d.long_hash_log))
+                .saturating_add(table_bytes(4, usize::from(d.short_hash_log)))
+        }),
+        // The lazy backend's chain / tree finders (window <= 2^14, or a
+        // btlazy2 level) use a plain hash table (`4 << hash_bits`) plus the
+        // chain / tree table (`4 << chain_log`) instead of the row tables.
+        SearchMethod::RowHash | SearchMethod::BinaryTreeLazy => params.row.map_or(0, |r| {
+            if r.bt || params.window_log <= 14 {
+                table_bytes(4, r.hash_bits).saturating_add(table_bytes(4, r.chain_log))
+            } else {
+                table_bytes(4, r.hash_bits).saturating_add(table_bytes(2, r.hash_bits))
+            }
+        }),
+        SearchMethod::HashChain | SearchMethod::BinaryTree => params.hc.map_or(0, |h| {
+            let hash3 = if wants_hash3 {
+                table_bytes(
+                    4,
+                    crate::encoding::match_table::storage::HC3_HASH_LOG
+                        .min(params.window_log as usize),
+                )
+            } else {
+                0
+            };
+            table_bytes(4, h.hash_log)
+                .saturating_add(table_bytes(4, h.chain_log))
+                .saturating_add(hash3)
+        }),
+    };
     // BT modes box a `BtMatcher`; its retained scratch layout is budgeted
     // next to the struct so estimator and allocator evolve together.
     let bt = if uses_bt {
@@ -1044,11 +1245,14 @@ pub(crate) struct RowDictPlan {
 /// (`ZSTD_resetCCtx_byCopyingCDict`); only the frame's own `windowLog` is
 /// kept. The CDict's strategy is taken whatever backend family the plain
 /// level resolved to; a lazy-band CDict (greedy..btlazy2) also carries the
-/// lazy backend's [`RowDictPlan`].
+/// lazy backend's [`RowDictPlan`]. The caller's `overrides` are part of the
+/// CDict's cParams, as they are for a dictionary upstream loads into a context
+/// that carries them.
 pub(crate) fn resolve_level_params_with_dict(
     level: CompressionLevel,
     source_size: Option<u64>,
     sizes: crate::encoding::DictionarySizes,
+    overrides: &crate::encoding::parameters::ParamOverrides,
 ) -> (LevelParams, Option<RowDictPlan>) {
     use crate::encoding::cparams::{
         CONTENTSIZE_UNKNOWN, attach_cparams, copy_cparams, get_cdict_cparams, should_attach_dict,
@@ -1064,7 +1268,7 @@ pub(crate) fn resolve_level_params_with_dict(
     // btopt, but a 300 KiB CDict is btlazy2 and the frame runs btlazy2; L4
     // on a 1 MiB source is dfast, but a 4 KiB CDict is greedy. Only the
     // frame's own `windowLog` is kept.
-    let cdict = get_cdict_cparams(numeric_level(level), sizes.serialized);
+    let cdict = get_cdict_cparams(numeric_level(level), sizes.serialized, overrides);
     // `ZSTD_shouldAttachDict`, bounded by the backend's attach representability:
     // the Fast / Dfast attached tables pack the dict position next to a tag, so
     // they index at most 2^24 content bytes. A larger dictionary is primed in

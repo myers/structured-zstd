@@ -129,6 +129,32 @@ fn create_raw_dict_from_source_treats_source_size_as_hint() {
     assert!(!out.is_empty());
 }
 
+/// Training from a slice is the reader path without its buffering copy, so
+/// the two must write the same dictionary, byte for byte, at every size the
+/// tiny-source and epoch paths take.
+#[test]
+fn create_raw_dict_from_slice_matches_the_reader_path() {
+    let sample = training_data();
+    for (corpus, dict_size) in [
+        (sample.as_slice(), 1024),
+        (sample.as_slice(), 0),
+        (&b"short"[..], 3),
+        (&b""[..], 64),
+    ] {
+        let mut from_reader = Vec::new();
+        create_raw_dict_from_source(
+            Cursor::new(corpus),
+            corpus.len(),
+            &mut from_reader,
+            dict_size,
+        )
+        .unwrap();
+        let mut from_slice = Vec::new();
+        create_raw_dict_from_slice(corpus, &mut from_slice, dict_size).unwrap();
+        assert_eq!(from_slice, from_reader, "dict_size {dict_size}");
+    }
+}
+
 #[test]
 fn create_raw_dict_from_source_handles_tiny_source_without_epochs() {
     let sample = b"short";
@@ -234,6 +260,37 @@ fn train_fastcover_raw_from_slice_rejects_tiny_sample_with_empty_dict() {
     );
 }
 
+/// The widest frequency table the trainer takes (`f = 31`, 2^31 counts) is
+/// larger than a 32-bit target can lay out. Training at that width reports
+/// that as an error through the `io::Result` rather than panicking on the
+/// allocation.
+#[cfg(target_pointer_width = "32")]
+#[test]
+fn a_frequency_table_too_wide_for_the_target_is_an_error() {
+    let sample = training_data();
+    let options = FastCoverOptions {
+        optimize: false,
+        k: 256,
+        d: 8,
+        f: 31,
+        ..FastCoverOptions::default()
+    };
+    let err = train_fastcover_raw_from_slice(sample.as_slice(), 4096, &options)
+        .expect_err("a table this wide does not fit a 32-bit target");
+    assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+}
+
+/// A table that does not fit reaches the caller as an out-of-memory error
+/// that names the table and the knob that sizes it.
+#[test]
+fn a_table_that_does_not_fit_is_an_out_of_memory_error() {
+    let err = io::Error::from(super::fastcover::TableTooLarge { entries: 1 << 31 });
+    assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
+    let message = err.to_string();
+    assert!(message.contains("2147483648 entries"), "{message}");
+    assert!(message.contains("smaller f"), "{message}");
+}
+
 #[test]
 fn train_fastcover_raw_from_slice_normalizes_non_optimized_params() {
     let sample = training_data();
@@ -241,14 +298,16 @@ fn train_fastcover_raw_from_slice_normalizes_non_optimized_params() {
         optimize: false,
         k: 8,
         d: 64,
-        f: 42,
+        // Below the table widths the trainer takes; the top end (31) is
+        // checked without training, since a table that wide is gigabytes.
+        f: 0,
         ..FastCoverOptions::default()
     };
     let (_, tuned) =
         train_fastcover_raw_from_slice(sample.as_slice(), 2048, &options).expect("must train");
     assert_eq!(tuned.k, 32);
     assert_eq!(tuned.d, 32);
-    assert_eq!(tuned.f, 20);
+    assert_eq!(tuned.f, 1);
 }
 
 #[test]

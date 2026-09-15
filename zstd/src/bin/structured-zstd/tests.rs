@@ -2,8 +2,8 @@ use super::*;
 
 /// What a run with no `-D` carries: the codecs take their dictionary already
 /// parsed, and "no dictionary" is a prepared set holding neither side.
-fn no_dict() -> Dictionaries {
-    Dictionaries::default()
+fn no_dict() -> Codecs {
+    Codecs::default()
 }
 
 /// What a benchmark of `input_len` bytes across `levels` actually holds: the
@@ -30,16 +30,80 @@ fn benchmark_budget(input_len: u64, levels: std::ops::RangeInclusive<i32>) -> u6
 
 /// The same blob a `-D` run would hand the codecs, parsed for both directions
 /// so one helper serves a compressing test and a decoding one alike.
-fn prepared_dict(raw: &[u8]) -> Dictionaries {
-    Dictionaries::prepare(Some(raw), true, true).expect("the fixture dictionary must parse")
+fn prepared_dict(raw: &[u8]) -> Codecs {
+    Codecs::prepare(Some(raw), false, true, true).expect("the fixture dictionary must parse")
 }
 
+/// What a plain `zstd` invocation presets, before any flag.
+fn plain() -> ProgramPreset {
+    program_preset("zstd")
+}
+
+/// Parse `args` as the plain `zstd` command with the built-in default level.
 fn parse(args: &[&str]) -> Result<Options> {
-    let owned: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
-    match parse_args(&owned, Mode::Compress, false)? {
-        Parsed::Run(opts) => Ok(opts),
+    parse_as(&plain(), CompressionLevel::DEFAULT_LEVEL, args)
+}
+
+/// Parse `args` under `preset` (an `argv[0]` dispatch) with `default_level`
+/// standing in for the built-in default (`ZSTD_CLEVEL`).
+fn parse_as(preset: &ProgramPreset, default_level: i32, args: &[&str]) -> Result<Options> {
+    let owned: Vec<OsString> = args.iter().map(OsString::from).collect();
+    match parse_args(&owned, preset, default_level).map_err(|failure| failure.error)? {
+        Parsed::Run(opts) => Ok(*opts),
         Parsed::Handled => bail!("parse handled (help/version) unexpectedly"),
     }
+}
+
+/// A scratch directory unique to the test, removed when dropped.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("szstd-cli-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn file(&self, relative: &str, content: &[u8]) -> PathBuf {
+        let path = self.0.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, content).unwrap();
+        path
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A frame compressed the way the tool compresses by default.
+fn frame_of(payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    compress_stream(
+        payload,
+        &mut frame,
+        &FrameSettings {
+            level: 3,
+            ..FrameSettings::default()
+        },
+        &mut no_dict(),
+    )
+    .expect("compressing the fixture must succeed");
+    frame
+}
+
+/// Decode `stream` with the default decode settings.
+fn decoded(stream: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    decompress_stream(stream, &mut out, &mut no_dict(), &DecodeSettings::default())?;
+    Ok(out)
 }
 
 /// A filename is bytes, and on Unix those bytes need not be UTF-8. Reading the
@@ -53,8 +117,11 @@ fn a_non_utf8_argument_survives_parsing() {
 
     let name = OsStr::from_bytes(b"weird\xffname.zst");
     let args: Vec<OsString> = vec![OsString::from("-d"), name.to_os_string()];
-    let opts = match parse_args(&args, Mode::Compress, false).expect("parsing must not fail") {
-        Parsed::Run(opts) => opts,
+    let opts = match parse_args(&args, &plain(), CompressionLevel::DEFAULT_LEVEL)
+        .map_err(|failure| failure.error)
+        .expect("parsing must not fail")
+    {
+        Parsed::Run(opts) => *opts,
         Parsed::Handled => panic!("unexpected help/version"),
     };
     assert_eq!(
@@ -81,8 +148,11 @@ fn attached_path_options_keep_their_bytes() {
         let mut arg = flag.to_vec();
         arg.extend_from_slice(name.as_bytes());
         let args = vec![OsString::from(OsStr::from_bytes(&arg)), OsString::from("f")];
-        match parse_args(&args, Mode::Compress, false).expect("parsing must not fail") {
-            Parsed::Run(opts) => opts,
+        match parse_args(&args, &plain(), CompressionLevel::DEFAULT_LEVEL)
+            .map_err(|failure| failure.error)
+            .expect("parsing must not fail")
+        {
+            Parsed::Run(opts) => *opts,
             Parsed::Handled => panic!("unexpected help/version"),
         }
     };
@@ -92,6 +162,22 @@ fn attached_path_options_keep_their_bytes() {
     assert_eq!(
         attached(b"--use-dict=").dict.as_deref(),
         Some(expected.as_path())
+    );
+    // The options that take a directory or a list name are paths too.
+    assert_eq!(
+        attached(b"--output-dir-flat=").output_dir.as_deref(),
+        Some(expected.as_path())
+    );
+    assert_eq!(
+        attached(b"--output-dir-mirror=")
+            .output_dir_mirror
+            .as_deref(),
+        Some(expected.as_path())
+    );
+    assert_eq!(
+        attached(b"--filelist=").filelists,
+        vec![expected.clone()],
+        "a list name keeps its bytes as well"
     );
 }
 
@@ -119,9 +205,37 @@ fn list_file_walks_multi_frame_archive_by_seeking() {
     let dir = std::env::temp_dir();
     let path = dir.join(format!("szstd-list-test-{}.zst", std::process::id()));
     fs::write(&path, &archive).unwrap();
-    let result = list_file(&path);
+    let result = list_file(&path, false, 0);
     let _ = fs::remove_file(&path);
-    result.expect("list_file must walk both frames without error");
+    let summary = result.expect("list_file must walk both frames without error");
+    assert_eq!(summary.frames, 2);
+    assert_eq!(summary.decompressed, Some(4096 + 38));
+    assert!(
+        !summary.check && summary.checksum.is_none(),
+        "library-default frames carry no checksum, so the archive reports none"
+    );
+
+    // The tool's own frames do, and the stored value of the last frame that
+    // has one is kept for `-lv` to print.
+    let mut checked = frame_of(&[7u8; 4096]);
+    let trailer: [u8; 4] = checked[checked.len() - 4..].try_into().unwrap();
+    checked.extend_from_slice(&compress_slice_to_vec(
+        b"a second frame without a checksum",
+        CompressionLevel::Default,
+    ));
+    fs::write(&path, &checked).unwrap();
+    let result = list_file(&path, false, 0);
+    let _ = fs::remove_file(&path);
+    let summary = result.expect("a mixed archive lists");
+    assert!(
+        summary.check,
+        "one checksummed frame makes the archive checked"
+    );
+    assert_eq!(
+        summary.checksum,
+        Some(trailer),
+        "the checksummed frame's trailer is kept"
+    );
 }
 
 /// The `DictID` column holds one id, and a concatenated archive can need more
@@ -230,7 +344,7 @@ fn target_block_size_reaches_the_encoder() {
         payload.as_slice(),
         &mut default_geometry,
         &level_only,
-        &no_dict(),
+        &mut no_dict(),
     )
     .unwrap();
     let mut small_blocks = Vec::new();
@@ -241,7 +355,7 @@ fn target_block_size_reaches_the_encoder() {
             target_block_size: Some(4096),
             ..level_only
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .unwrap();
 
@@ -743,9 +857,9 @@ fn a_new_output_inherits_the_source_permissions() {
     fs::write(&input, b"secret payload").unwrap();
     fs::set_permissions(&input, fs::Permissions::from_mode(0o600)).unwrap();
 
-    let mut opts = parse(&["-3", "f"]).unwrap();
+    let mut opts = parse(&["-3", "-q", "f"]).unwrap();
     opts.inputs = vec![input.clone()];
-    let result = process_file(&opts, &input, &no_dict());
+    let result = process_file(&opts, &input, &mut no_dict(), 1);
 
     let output = PathBuf::from(format!("{}.zst", input.display()));
     let mode = fs::metadata(&output).map(|m| m.permissions().mode() & 0o777);
@@ -917,10 +1031,10 @@ fn compressing_a_setuid_file_does_not_produce_a_setuid_archive() {
         return;
     }
 
-    let mut opts = parse(&["-3", "-f", "s"]).unwrap();
+    let mut opts = parse(&["-3", "-f", "-q", "s"]).unwrap();
     opts.inputs = vec![source.clone()];
     opts.output = Some(archive.clone());
-    let compressed = process_file(&opts, &source, &no_dict());
+    let compressed = process_file(&opts, &source, &mut no_dict(), 1);
     let mode = fs::metadata(&archive).map(|m| m.permissions().mode() & 0o7777);
 
     let _ = fs::remove_file(&source);
@@ -989,10 +1103,10 @@ fn replacing_a_file_does_not_restore_its_old_permissions() {
     let archive = dir.join(format!("szstd-replace-arch-{}", std::process::id()));
     fs::write(&archive, b"the archive that was here before").unwrap();
     fs::set_permissions(&archive, fs::Permissions::from_mode(0o644)).unwrap();
-    let mut opts = parse(&["-3", "-f", "s"]).unwrap();
+    let mut opts = parse(&["-3", "-f", "-q", "s"]).unwrap();
     opts.inputs = vec![sample.clone()];
     opts.output = Some(archive.clone());
-    let compressed = process_file(&opts, &sample, &no_dict());
+    let compressed = process_file(&opts, &sample, &mut no_dict(), 1);
     let archive_mode = fs::metadata(&archive).map(|m| m.permissions().mode() & 0o777);
 
     let _ = fs::remove_file(&sample);
@@ -1010,46 +1124,6 @@ fn replacing_a_file_does_not_restore_its_old_permissions() {
         0o600,
         "the archive holds the private file's bytes"
     );
-}
-
-/// The summary is printed when the reader is done, and "done" is the reader
-/// saying so — not the byte count matching a number from a directory entry. A
-/// FIFO reports zero, a file can shrink after it was measured, and in both
-/// cases a monitor that waits for the two to meet waits forever.
-#[test]
-fn progress_finishes_when_the_reader_does_not_when_the_count_matches() {
-    // A reader with more bytes than the total it was created with.
-    let mut monitor = ProgressMonitor::new(&b"bytes that were not counted"[..], 0);
-    let mut sink = Vec::new();
-    io::copy(&mut monitor, &mut sink).expect("copying must succeed");
-    assert!(
-        monitor.finished,
-        "the reader reached its end, so the monitor has to be finished too"
-    );
-    assert_eq!(monitor.read, sink.len() as u64, "and count what it read");
-}
-
-/// `Read::read` answers `Ok(0)` for an empty buffer as well as for the end of
-/// the stream — the contract says so. Treating the first as the second finishes
-/// the monitor before any bytes have moved, and the summary for the work that
-/// followed is then never printed.
-#[test]
-fn an_empty_buffer_read_is_not_the_end_of_the_stream() {
-    let mut monitor = ProgressMonitor::new(&b"payload"[..], 7);
-    assert_eq!(monitor.read(&mut []).unwrap(), 0);
-    assert!(
-        !monitor.finished,
-        "an empty buffer says nothing about the reader"
-    );
-
-    let mut buf = [0u8; 7];
-    assert_eq!(monitor.read(&mut buf).unwrap(), 7);
-    assert!(
-        !monitor.finished,
-        "a total taken from a directory entry does not end the stream"
-    );
-    assert_eq!(monitor.read(&mut buf).unwrap(), 0);
-    assert!(monitor.finished, "the reader saying so does");
 }
 
 /// Listing walks frame headers and training builds a dictionary from samples;
@@ -1084,20 +1158,6 @@ fn a_dictionary_is_loaded_only_where_it_is_used() {
     assert!(load_dictionary(&decompressing).is_err());
 }
 
-/// Both directions stream, so a file only has to fit the window, never memory.
-/// Measuring its length in `usize` puts a 4 GiB ceiling on 32-bit targets that
-/// has nothing to do with what the work needs — the progress counter would be
-/// deciding which archives the tool can open.
-#[test]
-fn a_file_length_is_not_narrowed_to_the_pointer_width() {
-    let huge = u64::from(u32::MAX) + 1;
-    let monitor = ProgressMonitor::new(&b""[..], huge);
-    assert_eq!(
-        monitor.total, huge,
-        "a length larger than a 32-bit pointer must survive"
-    );
-}
-
 /// `--stream-size` exists precisely for inputs whose length cannot be stat'd.
 /// A named FIFO is one of those, so the per-file size being unavailable is the
 /// moment the option matters most — dropping it there leaves the pledge
@@ -1112,8 +1172,17 @@ fn an_explicit_stream_size_survives_an_unstattable_input() {
 
     let mut frame = Vec::new();
     // `None` is what a FIFO or device yields: no reliable size from metadata.
-    run_stream_core(&opts, &payload[..], &mut frame, None, &no_dict())
-        .expect("compressing must succeed");
+    let processed = stream(
+        &opts,
+        &mut no_dict(),
+        ProgressMonitor::new(&payload[..], None, false),
+        None,
+        &DecodeSettings::from_options(&opts),
+        &mut frame,
+    )
+    .expect("compressing must succeed");
+    assert_eq!(processed.read, payload.len() as u64);
+    assert_eq!(processed.written, frame.len() as u64);
 
     let info = read_frame_header_info(&frame, false).expect("the frame header must parse");
     assert_eq!(
@@ -1162,7 +1231,7 @@ fn a_serialized_dictionary_keeps_the_size_its_tier_is_chosen_by() {
             pledged_size: Some(payload.len() as u64),
             ..FrameSettings::default()
         },
-        &prepared_dict(&raw),
+        &mut prepared_dict(&raw),
     )
     .expect("compressing with the dictionary must succeed");
 
@@ -1199,7 +1268,7 @@ fn zero_means_unset_where_the_api_says_it_does() {
             target_block_size: Some(0),
             ..FrameSettings::default()
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .expect("compressing must succeed");
     let mut untargeted = Vec::new();
@@ -1210,7 +1279,7 @@ fn zero_means_unset_where_the_api_says_it_does() {
             level: 3,
             ..FrameSettings::default()
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .expect("compressing must succeed");
     assert_eq!(
@@ -1228,7 +1297,7 @@ fn zero_means_unset_where_the_api_says_it_does() {
             size_hint: Some(0),
             ..FrameSettings::default()
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .expect("compressing must succeed");
     assert_eq!(
@@ -1246,7 +1315,7 @@ fn zero_means_unset_where_the_api_says_it_does() {
             level: 3,
             ..FrameSettings::default()
         },
-        &prepared_dict(&[]),
+        &mut prepared_dict(&[]),
     )
     .expect("an empty dictionary is no dictionary, not a broken one");
     assert_eq!(without, untargeted, "and produces the same frame");
@@ -1254,11 +1323,18 @@ fn zero_means_unset_where_the_api_says_it_does() {
 
 /// An empty file holds no frame, so there is nothing to test and nothing to
 /// decode. Answering `OK` for it says the archive checked out when it was never
-/// an archive; upstream calls it an unexpected end of file.
+/// an archive; upstream calls it an unexpected end of file. (`-t` never passes
+/// anything through, so this holds for it whatever is set; pass-through itself
+/// is covered by `an_empty_input_passes_through_and_is_refused_otherwise`.)
 #[test]
 fn an_empty_stream_is_not_a_valid_archive() {
-    decompress_stream(&b""[..], io::sink(), &no_dict())
-        .expect_err("an empty input carries no frame to decode");
+    decompress_stream(
+        &b""[..],
+        io::sink(),
+        &mut no_dict(),
+        &DecodeSettings::default(),
+    )
+    .expect_err("an empty input carries no frame to decode");
 }
 
 /// Skippable frames sit inside ordinary archives — seekable-zstd puts its index
@@ -1282,9 +1358,26 @@ fn list_file_walks_past_skippable_frames() {
     let dir = std::env::temp_dir();
     let path = dir.join(format!("szstd-list-skip-{}.zst", std::process::id()));
     fs::write(&path, &archive).unwrap();
-    let result = list_file(&path);
+    let result = list_file(&path, true, 0);
     let _ = fs::remove_file(&path);
-    result.expect("a skippable frame between two frames must not fail the listing");
+    let summary = result.expect("a skippable frame between two frames must not fail the listing");
+    assert_eq!((summary.frames, summary.skips), (3, 1));
+}
+
+/// A frame declaring `content_size` bytes but holding one RLE block.
+fn frame_declaring(content_size: u64) -> Vec<u8> {
+    let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD];
+    // Descriptor: 8-byte Frame_Content_Size, no dictionary, no checksum,
+    // window descriptor present (not single-segment).
+    frame.push(0b11 << 6);
+    // Window descriptor: exponent 10, i.e. a 1 MiB window.
+    frame.push(10 << 3);
+    frame.extend_from_slice(&content_size.to_le_bytes());
+    // One RLE block, last of the frame: size 1, type 1, last-block bit set.
+    let block_header = (1u32 << 3) | (1 << 1) | 1;
+    frame.extend_from_slice(&block_header.to_le_bytes()[..3]);
+    frame.push(b'x');
+    frame
 }
 
 /// Frame_Content_Size is a declaration, not a measurement: a few bytes of
@@ -1293,43 +1386,100 @@ fn list_file_walks_past_skippable_frames() {
 /// total as fact.
 #[test]
 fn list_file_refuses_a_content_size_total_that_overflows() {
-    /// A frame declaring `content_size` bytes but holding one RLE block.
-    fn frame_declaring(content_size: u64) -> Vec<u8> {
-        let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD];
-        // Descriptor: 8-byte Frame_Content_Size, no dictionary, no checksum,
-        // window descriptor present (not single-segment).
-        frame.push(0b11 << 6);
-        // Window descriptor: exponent 10, i.e. a 1 MiB window.
-        frame.push(10 << 3);
-        frame.extend_from_slice(&content_size.to_le_bytes());
-        // One RLE block, last of the frame: size 1, type 1, last-block bit set.
-        let block_header = (1u32 << 3) | (1 << 1) | 1;
-        frame.extend_from_slice(&block_header.to_le_bytes()[..3]);
-        frame.push(b'x');
-        frame
-    }
-
     let mut archive = frame_declaring(u64::MAX);
     archive.extend_from_slice(&frame_declaring(u64::MAX));
 
     let dir = std::env::temp_dir();
     let path = dir.join(format!("szstd-list-overflow-{}.zst", std::process::id()));
     fs::write(&path, &archive).unwrap();
-    let result = list_file(&path);
+    let result = list_file(&path, false, 0);
     let _ = fs::remove_file(&path);
     result.expect_err("a total that cannot be represented must be reported, not wrapped");
 }
 
+/// `-lv` reports the window a decoder has to hold to read the whole archive,
+/// which is the largest any frame declares, not the last frame's: a small
+/// frame after a large one does not lower what decoding needs.
 #[test]
-fn argv0_unzstd_defaults_to_decompress() {
-    assert_eq!(program_mode("unzstd"), (Mode::Decompress, false));
-    assert_eq!(program_mode("/usr/bin/unzstd"), (Mode::Decompress, false));
+fn the_listed_window_is_the_largest_a_frame_declares() {
+    let scratch = Scratch::new("listwindow");
+    // `frame_declaring` declares a 1 MiB window; the second frame's
+    // descriptor is rewritten to exponent 0, a 1 KiB window.
+    let mut archive = frame_declaring(1);
+    let mut small = frame_declaring(1);
+    small[5] = 0;
+    archive.extend_from_slice(&small);
+    let path = scratch.file("windows.zst", &archive);
+    let summary = summarize_archive(&path).unwrap();
+    assert_eq!(summary.window_size, 1 << 20);
+}
+
+/// The closing row of `-l` adds up every listed archive, and the content
+/// sizes it adds are the same declarations: two tiny files can each claim
+/// nearly 2^64 bytes. That sum is checked like the one inside an archive, so
+/// the run reports it and fails instead of panicking or printing a wrapped
+/// total.
+#[test]
+fn a_list_total_that_overflows_is_reported_not_wrapped() {
+    let scratch = Scratch::new("listtotal");
+    let first = scratch.file("one.zst", &frame_declaring(u64::MAX));
+    let second = scratch.file("two.zst", &frame_declaring(u64::MAX));
+    let mut opts = parse(&["-l", "-q", "x"]).unwrap();
+    opts.inputs = vec![first, second];
+    assert_eq!(
+        list_files(&opts).expect("each archive lists; only the total fails"),
+        1,
+        "a total that cannot be represented fails the run"
+    );
 }
 
 #[test]
-fn argv0_zstdcat_decompresses_to_stdout() {
-    assert_eq!(program_mode("zstdcat"), (Mode::Decompress, true));
-    assert_eq!(program_mode("zstd"), (Mode::Compress, false));
+fn argv0_unzstd_defaults_to_decompress() {
+    let preset = program_preset("unzstd");
+    assert_eq!(preset.mode, Mode::Decompress);
+    assert!(!preset.to_stdout);
+    assert!(!preset.force);
+    assert_eq!(program_preset("/usr/bin/unzstd").mode, Mode::Decompress);
+    assert_eq!(program_preset("unzstd.exe").mode, Mode::Decompress);
+}
+
+/// `zstdcat` is `zstd -dcf` with pass-through and the quiet level, as the
+/// reference command sets it up: a `zcat` replacement copies a plain file
+/// through rather than refusing it, and says nothing on success.
+#[test]
+fn argv0_zstdcat_decompresses_to_stdout_passing_plain_input_through() {
+    for name in ["zstdcat", "zcat", "/usr/local/bin/zstdcat"] {
+        let preset = program_preset(name);
+        assert_eq!(preset.mode, Mode::Decompress, "{name}");
+        assert!(preset.to_stdout, "{name}");
+        assert!(preset.force, "{name}");
+        assert_eq!(preset.pass_through, Some(true), "{name}");
+        assert_eq!(preset.verbosity, 1, "{name}");
+    }
+    let plain = program_preset("zstd");
+    assert_eq!(plain.mode, Mode::Compress);
+    assert!(!plain.to_stdout && !plain.force);
+    assert_eq!(plain.pass_through, None);
+    assert_eq!(plain.verbosity, DEFAULT_LEVEL);
+    // `zstdmt` compresses like `zstd`; its worker count has no effect here.
+    assert_eq!(program_preset("zstdmt").mode, Mode::Compress);
+}
+
+/// The preset is the starting point, not the last word: `zstdcat -v` still
+/// raises the level, and `--no-pass-through` still turns pass-through off.
+#[test]
+fn flags_adjust_the_argv0_preset() {
+    let cat = program_preset("zstdcat");
+    let quiet = parse_as(&cat, 3, &["a.zst"]).unwrap();
+    assert_eq!(quiet.verbosity, 1);
+    assert!(quiet.force && quiet.follow_links);
+    assert!(
+        DecodeSettings::from_options(&quiet).pass_through,
+        "zstdcat passes unknown input through"
+    );
+    let louder = parse_as(&cat, 3, &["-v", "--no-pass-through", "a.zst"]).unwrap();
+    assert_eq!(louder.verbosity, 2);
+    assert!(!DecodeSettings::from_options(&louder).pass_through);
 }
 
 #[test]
@@ -1433,9 +1583,13 @@ fn dict_and_output_take_values() {
     assert_eq!(opts.dict, Some(PathBuf::from("dict.bin")));
 }
 
+/// Several inputs into one `-o` is a concatenation, which the reference
+/// command permits after a warning; the command line itself is not wrong.
 #[test]
-fn output_rejects_multiple_inputs() {
-    assert!(parse(&["-o", "out.zst", "a.txt", "b.txt"]).is_err());
+fn output_accepts_multiple_inputs_for_concatenation() {
+    let opts = parse(&["-o", "out.zst", "a.txt", "b.txt"]).unwrap();
+    assert_eq!(opts.inputs.len(), 2);
+    assert_eq!(opts.output, Some(PathBuf::from("out.zst")));
 }
 
 #[test]
@@ -1520,7 +1674,7 @@ fn long_window_log_reaches_the_encoder() {
             long_window_log: Some(27),
             ..FrameSettings::default()
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .expect("compressing with an explicit window log must succeed");
     let info = read_frame_header_info(&frame, false).expect("the frame header must parse");
@@ -1570,18 +1724,19 @@ fn training_refuses_to_overwrite_without_force() {
 }
 
 /// The trainer flags name algorithms, and the algorithm decides what the
-/// dictionary contains. Only FastCOVER is implemented here, so the flags that
-/// ask for COVER or the legacy trainer have to say no — running FastCOVER under
-/// their name returns a dictionary the caller did not ask for.
+/// dictionary contains. FastCOVER and COVER are here; the legacy trainer is
+/// not, so its flag has to say no rather than run another trainer under its
+/// name.
 #[test]
-fn unimplemented_trainers_are_refused_not_substituted() {
+fn the_legacy_trainer_is_refused_not_substituted() {
     assert_eq!(parse(&["--train", "s1"]).unwrap().mode, Mode::Train);
     assert_eq!(
         parse(&["--train-fastcover", "s1"]).unwrap().mode,
         Mode::Train
     );
-    assert!(parse(&["--train-cover", "s1"]).is_err());
+    assert_eq!(parse(&["--train-cover", "s1"]).unwrap().mode, Mode::Train);
     assert!(parse(&["--train-legacy", "s1"]).is_err());
+    assert!(parse(&["--train-legacy=s=8", "s1"]).is_err());
 }
 
 /// A window is a promise about how much memory decoding will need, so it is
@@ -1605,7 +1760,7 @@ fn an_explicit_window_is_capped_by_a_known_source_size() {
             pledged_size: Some(payload.len() as u64),
             ..FrameSettings::default()
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .expect("compressing must succeed");
 
@@ -1631,7 +1786,7 @@ fn an_explicit_window_is_capped_by_a_known_source_size() {
             pledged_size: Some(payload.len() as u64),
             ..FrameSettings::default()
         },
-        &prepared_dict(raw),
+        &mut prepared_dict(raw),
     )
     .expect("compressing with a dictionary must succeed");
 
@@ -1761,50 +1916,321 @@ fn fast_and_long_match_exactly_not_by_prefix() {
     assert!(parse(&["-19", "--long=27"]).unwrap().long);
 }
 
+/// The wire-format switches reach the frame: `--no-check` drops the
+/// checksum, `--no-content-size` the Frame_Content_Size field, and the later
+/// of `--no-check` / `-C` wins, as the last flag does elsewhere.
 #[test]
-fn unsupported_format_flags_are_rejected_not_ignored() {
-    // These change the wire format but are not wired through yet — accepting
-    // them silently would hand the caller the wrong frame layout.
-    assert!(parse(&["--no-check"]).is_err());
-    assert!(parse(&["--no-content-size"]).is_err());
-    assert!(parse(&["--no-dictID"]).is_err());
-    // Verbosity aliases stay honest no-ops.
-    assert!(parse(&["--quiet"]).is_ok());
-    assert!(parse(&["--verbose"]).is_ok());
+fn wire_format_flags_reach_the_frame_header() {
+    use structured_zstd::decoding::{FrameContentSize, read_frame_header_info};
+
+    let plain = parse(&["f"]).unwrap();
+    assert!(plain.checksum && plain.content_size_flag && plain.dict_id_flag);
+    let stripped = parse(&["--no-check", "--no-content-size", "--no-dictID", "f"]).unwrap();
+    assert!(!stripped.checksum && !stripped.content_size_flag && !stripped.dict_id_flag);
+    assert!(parse(&["--no-check", "-C", "f"]).unwrap().checksum);
+    assert!(parse(&["--no-check", "--check", "f"]).unwrap().checksum);
+    assert!(
+        parse(&["--no-content-size", "--content-size", "f"])
+            .unwrap()
+            .content_size_flag
+    );
+
+    let payload = b"payload whose header is inspected";
+    let mut bare = Vec::new();
+    compress_stream(
+        &payload[..],
+        &mut bare,
+        &FrameSettings {
+            level: 3,
+            pledged_size: Some(payload.len() as u64),
+            checksum: false,
+            content_size_flag: false,
+            ..FrameSettings::default()
+        },
+        &mut no_dict(),
+    )
+    .unwrap();
+    let info = read_frame_header_info(&bare, false).unwrap();
+    assert!(!info.content_checksum, "--no-check leaves the checksum out");
+    assert_eq!(
+        info.content_size,
+        FrameContentSize::Unknown,
+        "--no-content-size leaves the size out of the header"
+    );
+
+    let mut full = Vec::new();
+    compress_stream(
+        &payload[..],
+        &mut full,
+        &FrameSettings {
+            level: 3,
+            pledged_size: Some(payload.len() as u64),
+            ..FrameSettings::default()
+        },
+        &mut no_dict(),
+    )
+    .unwrap();
+    let info = read_frame_header_info(&full, false).unwrap();
+    assert!(info.content_checksum, "the default frame is checksummed");
+    assert_eq!(
+        info.content_size,
+        FrameContentSize::Known(payload.len() as u64)
+    );
+}
+
+/// `--no-dictID` keeps the dictionary's ID out of a dictionary frame: the
+/// decoder then has to be told which dictionary to use, and cannot check.
+#[test]
+fn no_dict_id_leaves_the_id_out_of_a_dictionary_frame() {
+    use structured_zstd::decoding::read_frame_header_info;
+
+    let raw = include_bytes!("../../../dict_tests/dictionary");
+    let mut codecs = prepared_dict(raw);
+    let payload: Vec<u8> = (0..4000u32).map(|i| (i % 97) as u8).collect();
+    let mut with_id = Vec::new();
+    compress_stream(
+        payload.as_slice(),
+        &mut with_id,
+        &FrameSettings {
+            level: 3,
+            ..FrameSettings::default()
+        },
+        &mut codecs,
+    )
+    .unwrap();
+    assert!(
+        read_frame_header_info(&with_id, false)
+            .unwrap()
+            .dictionary_id
+            .is_some(),
+        "a dictionary frame names its dictionary by default"
+    );
+    let mut anonymous = Vec::new();
+    compress_stream(
+        payload.as_slice(),
+        &mut anonymous,
+        &FrameSettings {
+            level: 3,
+            dict_id_flag: false,
+            ..FrameSettings::default()
+        },
+        &mut codecs,
+    )
+    .unwrap();
+    assert!(
+        read_frame_header_info(&anonymous, false)
+            .unwrap()
+            .dictionary_id
+            .is_none(),
+        "--no-dictID keeps the id out"
+    );
+    // Told the dictionary outright, the decoder still reads the frame.
+    let mut out = Vec::new();
+    decompress_stream(
+        anonymous.as_slice(),
+        &mut out,
+        &mut codecs,
+        &DecodeSettings::default(),
+    )
+    .expect("an explicit dictionary decodes an anonymous frame");
+    assert_eq!(out, payload);
+}
+
+/// `-q` and `-v` move the display level one step per occurrence, from the
+/// default of 2, so `-qq` reaches the level that silences errors too.
+#[test]
+fn quiet_and_verbose_move_the_display_level() {
+    assert_eq!(parse(&["f"]).unwrap().verbosity, DEFAULT_LEVEL);
+    assert_eq!(parse(&["-q", "f"]).unwrap().verbosity, 1);
+    assert_eq!(parse(&["-qq", "f"]).unwrap().verbosity, 0);
+    assert_eq!(parse(&["--quiet", "--quiet", "f"]).unwrap().verbosity, 0);
+    assert_eq!(parse(&["-v", "f"]).unwrap().verbosity, 3);
+    assert_eq!(parse(&["-vvv", "f"]).unwrap().verbosity, 5);
+    assert_eq!(parse(&["--verbose", "-q", "f"]).unwrap().verbosity, 2);
+}
+
+/// A mistaken command line reports the level the flags before it had reached,
+/// so `-q --bogus` gets the error alone while the default level adds usage.
+#[test]
+fn a_parse_failure_carries_the_display_level_reached() {
+    let owned: Vec<OsString> = ["-q", "--bogus"].iter().map(OsString::from).collect();
+    let failure = parse_args(&owned, &plain(), CompressionLevel::DEFAULT_LEVEL)
+        .err()
+        .expect("an unknown option fails");
+    assert_eq!(failure.verbosity, 1);
+    assert!(failure.error.to_string().contains("--bogus"));
+}
+
+/// `ZSTD_CLEVEL` replaces the default level only: a level on the command line
+/// still wins, and the benchmark's default start follows it too.
+#[test]
+fn the_environment_level_is_the_default_the_command_line_overrides() {
+    assert_eq!(parse_as(&plain(), 11, &["f"]).unwrap().level, 11);
+    assert_eq!(parse_as(&plain(), 11, &["-3", "f"]).unwrap().level, 3);
+    assert_eq!(
+        parse_as(&plain(), 11, &["-b", "f"]).unwrap().bench_start,
+        11
+    );
+    // An environment level above the ceiling is reduced like a typed one.
+    assert_eq!(parse_as(&plain(), 22, &["f"]).unwrap().level, 19);
+}
+
+/// A bare `-b` benchmarks the default level alone, a negative one from
+/// `ZSTD_CLEVEL` included: with no `-e` the range ends where it starts. An
+/// `-e` that was typed still sets the end, and one below the start is raised
+/// to it.
+#[test]
+fn a_bare_benchmark_of_a_negative_default_ends_at_its_start() {
+    let bare = parse_as(&plain(), -3, &["-b", "f"]).unwrap();
+    assert_eq!((bare.bench_start, bare.bench_end), (-3, -3));
+    let ranged = parse_as(&plain(), -3, &["-b", "-e0", "f"]).unwrap();
+    assert_eq!((ranged.bench_start, ranged.bench_end), (-3, 0));
+    let reversed = parse(&["-b5", "-e2", "f"]).unwrap();
+    assert_eq!((reversed.bench_start, reversed.bench_end), (5, 5));
+}
+
+/// `ZSTD_CLEVEL` is read the way the reference command reads it: a sign,
+/// digits, an optional `K`/`M`; anything else is ignored with a warning and
+/// the built-in default stands.
+#[test]
+fn the_environment_level_is_read_like_the_reference_reads_it() {
+    let read = |value: &str| level_from_env(Some(OsStr::new(value)), 0);
+    assert_eq!(read("11"), 11);
+    assert_eq!(read("-3"), -3);
+    assert_eq!(read("+2"), 2);
+    assert_eq!(read("1K"), 1024);
+    assert_eq!(
+        read("-999999999"),
+        CompressionLevel::MIN_LEVEL,
+        "a level below the scale is clamped, as the library clamps it"
+    );
+    assert_eq!(read("abc"), CompressionLevel::DEFAULT_LEVEL);
+    assert_eq!(read(""), CompressionLevel::DEFAULT_LEVEL);
+    assert_eq!(read("3x"), CompressionLevel::DEFAULT_LEVEL);
+    assert_eq!(read("99999999999"), CompressionLevel::DEFAULT_LEVEL);
+    assert_eq!(read("-"), CompressionLevel::DEFAULT_LEVEL);
+    assert_eq!(level_from_env(None, 0), CompressionLevel::DEFAULT_LEVEL);
+    // The thread count is validated the same way and never fails the run.
+    check_threads_env(Some(OsStr::new("4")), 0);
+    check_threads_env(Some(OsStr::new("nope")), 0);
+    check_threads_env(None, 0);
+}
+
+/// Options that take a value take it attached or as the next argument, the
+/// way the reference command's `NEXT_FIELD` reads them; a missing value, or
+/// another option where the value should be, is a broken command line.
+#[test]
+fn valued_long_options_take_the_next_argument_or_an_attached_value() {
+    let separated = parse(&[
+        "--filelist",
+        "list.txt",
+        "--output-dir-flat",
+        "out",
+        "--maxdict",
+        "4096",
+        "f",
+    ])
+    .unwrap();
+    assert_eq!(separated.filelists, vec![PathBuf::from("list.txt")]);
+    assert_eq!(separated.output_dir, Some(PathBuf::from("out")));
+    assert_eq!(separated.max_dict, 4096);
+    assert_eq!(separated.inputs, vec![PathBuf::from("f")]);
+
+    let attached = parse(&[
+        "--filelist=a.txt",
+        "--filelist=b.txt",
+        "--output-dir-mirror=tree",
+        "--stream-size",
+        "4K",
+        "f",
+    ])
+    .unwrap();
+    assert_eq!(
+        attached.filelists,
+        vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")]
+    );
+    assert_eq!(attached.output_dir_mirror, Some(PathBuf::from("tree")));
+    assert_eq!(attached.pledged_size, Some(4096));
+
+    assert!(parse(&["--filelist"]).is_err(), "a value is required");
+    assert!(
+        parse(&["--output-dir-flat", "-f", "f"]).is_err(),
+        "an option is not a value"
+    );
+    assert!(
+        parse(&["--output-dir-flat="]).is_err(),
+        "an empty directory"
+    );
+    assert!(parse(&["--output-dir-mirror", "", "f"]).is_err());
+    assert!(
+        parse(&["--maxdict", "big", "f"]).is_err(),
+        "a number is a number"
+    );
+}
+
+/// The remaining file-selection and decode flags parse and land in the
+/// options they steer.
+#[test]
+fn file_selection_flags_parse() {
+    let opts = parse(&[
+        "-r",
+        "--exclude-compressed",
+        "--pass-through",
+        "--progress",
+        "dir",
+    ])
+    .unwrap();
+    assert!(opts.recursive && opts.exclude_compressed);
+    assert_eq!(opts.pass_through, Some(true));
+    assert_eq!(opts.progress, Progress::Always);
+    let opts = parse(&["--no-pass-through", "--no-progress", "-C", "f"]).unwrap();
+    assert_eq!(opts.pass_through, Some(false));
+    assert_eq!(opts.progress, Progress::Never);
+    assert!(opts.checksum);
+    // `-f` follows links and admits a terminal on stdin, as the reference
+    // command's does; without it neither happens.
+    let forced = parse(&["-f", "f"]).unwrap();
+    assert!(forced.force && forced.follow_links && forced.force_stdin);
+    let plain_run = parse(&["f"]).unwrap();
+    assert!(!plain_run.follow_links && !plain_run.force_stdin);
+}
+
+/// The help and version texts carry no typographic dash and the version
+/// line names both the reference version followed and this build's own.
+#[test]
+fn help_and_version_texts_are_plain_ascii_punctuation() {
+    assert!(!HELP_ADVANCED.contains('\u{2014}'));
+    let mut usage = Vec::new();
+    write_short_usage(&mut usage, "zstd").unwrap();
+    let usage = String::from_utf8(usage).unwrap();
+    assert!(!usage.contains('\u{2014}'));
+    assert!(usage.contains("Usage: zstd [OPTIONS...] [INPUT... | -] [-o OUTPUT]"));
+    assert!(usage.contains("-H, --help"));
+    assert_eq!(UPSTREAM_VERSION, "1.5.7");
 }
 
 #[test]
 fn decompress_suffix_stripping() {
-    let opts = Options {
-        mode: Mode::Decompress,
-        level: 3,
-        store: false,
-        dict: None,
-        to_stdout: false,
-        output: None,
-        force: false,
-        keep: false,
-        remove_source: false,
-        inputs: vec![PathBuf::from("archive.tar.zst")],
-        max_dict: DEFAULT_MAX_DICT,
-        dict_id: None,
-        bench: false,
-        bench_start: 3,
-        bench_end: 0,
-        bench_secs: 1.0,
-        bench_separately: false,
-        long: false,
-        long_window_log: None,
-        memory_limit: None,
-        target_block_size: None,
-        pledged_size: None,
-        size_hint: None,
-    };
+    let opts = parse(&["-d", "archive.tar.zst"]).unwrap();
     assert_eq!(
         derive_output_path(&opts, Path::new("archive.tar.zst")).unwrap(),
         PathBuf::from("archive.tar")
     );
-    assert!(derive_output_path(&opts, Path::new("noext")).is_err());
+    // The reference command's suffix list: `.zstd` is dropped like `.zst`,
+    // and a `.tzst` tarball comes back as `.tar`.
+    assert_eq!(
+        derive_output_path(&opts, Path::new("data.zstd")).unwrap(),
+        PathBuf::from("data")
+    );
+    assert_eq!(
+        derive_output_path(&opts, Path::new("backup.tzst")).unwrap(),
+        PathBuf::from("backup.tar")
+    );
+    let err = derive_output_path(&opts, Path::new("noext"))
+        .expect_err("no suffix, no derived name")
+        .to_string();
+    assert!(err.contains("unknown suffix"), "{err}");
+    assert!(derive_output_path(&opts, Path::new("archive.gz")).is_err());
 
     // A path is bytes, not text. Rebuilding it through a lossy conversion
     // renames what it decompresses — and two different inputs can end up
@@ -1886,7 +2312,6 @@ fn unimplemented_output_changing_flags_are_rejected() {
     for args in [
         &["--format=gzip", "f"][..],
         &["--format=xz", "f"][..],
-        &["--patch-from=ref", "f"][..],
         &["--rsyncable", "f"][..],
     ] {
         assert!(
@@ -2049,7 +2474,7 @@ fn the_memory_limit_counts_what_a_benchmark_holds() {
     let path = dir.join(format!("szstd-benchmem-{}.bin", std::process::id()));
     fs::write(&path, vec![0u8; 64 * 1024]).unwrap();
 
-    let mut opts = parse(&["-b3", "f"]).unwrap();
+    let mut opts = parse(&["-b3", "-i1", "f"]).unwrap();
     opts.inputs = vec![path.clone()];
     // 64 KiB in and 64 KiB back out, against a limit with 32 KiB of headroom
     // above the decoder's own floor.
@@ -2089,7 +2514,7 @@ fn separate_benchmarking_measures_one_file_at_a_time() {
     // Measured one at a time, only one file is in memory at once — so a limit
     // that fits a single file is enough, while the concatenation needs both.
     // Sized the way the run sizes what it holds, for one file.
-    let mut opts = parse(&["-b3", "-S", "f"]).unwrap();
+    let mut opts = parse(&["-b3", "-S", "-i1", "f"]).unwrap();
     opts.inputs = vec![one.clone(), two.clone()];
     opts.memory_limit = Some(benchmark_budget(32 * 1024, 3..=3));
     let separately = run_benchmark(&opts, None);
@@ -2122,7 +2547,7 @@ fn benchmarking_refuses_inputs_that_are_not_regular_files() {
         return;
     }
 
-    let mut opts = parse(&["-b3", "f"]).unwrap();
+    let mut opts = parse(&["-b3", "-i1", "f"]).unwrap();
     opts.inputs = vec![fifo.clone()];
     let refused = run_benchmark(&opts, None);
     let _ = fs::remove_file(&fifo);
@@ -2154,15 +2579,21 @@ fn listing_refuses_inputs_that_are_not_regular_files() {
         return;
     }
 
-    let mut opts = parse(&["-l", "f"]).unwrap();
+    let refused = list_file(&fifo, false, 0);
+    let mut opts = parse(&["-l", "-qq", "f"]).unwrap();
     opts.inputs = vec![fifo.clone()];
-    let refused = run(opts);
+    let failed = run(opts);
     let _ = fs::remove_file(&fifo);
 
     let err = refused.expect_err("a FIFO cannot be listed").to_string();
     assert!(
-        err.contains("regular files"),
+        err.contains("is not a file"),
         "the refusal must name what is wrong with the input: {err}"
+    );
+    assert_eq!(
+        failed.expect("a listing reports per file and goes on"),
+        1,
+        "and the run counts it as failed"
     );
 }
 
@@ -2194,7 +2625,7 @@ fn the_memory_limit_counts_the_compressed_benchmark_buffer() {
         .collect();
     fs::write(&path, &payload).unwrap();
 
-    let mut opts = parse(&["-b3", "f"]).unwrap();
+    let mut opts = parse(&["-b3", "-i1", "f"]).unwrap();
     opts.inputs = vec![path.clone()];
     // Room for two 64 KiB buffers above the decoder's floor, not for three.
     opts.memory_limit =
@@ -2222,7 +2653,7 @@ fn benchmarking_refuses_the_stdin_marker() {
     let dash = dir.join("-");
     fs::write(&dash, vec![1u8; 4096]).unwrap();
 
-    let mut opts = parse(&["-b3", "f"]).unwrap();
+    let mut opts = parse(&["-b3", "-i1", "f"]).unwrap();
     // Exactly as the command line spells it, with the file there to be found.
     opts.inputs = vec![PathBuf::from("-")];
     let previous = std::env::current_dir().unwrap();
@@ -2330,7 +2761,7 @@ fn listing_refuses_the_stdin_marker() {
         .expect_err("the marker means stdin, which listing cannot walk")
         .to_string();
     assert!(
-        err.contains("stdin"),
+        err.contains("standard input"),
         "the refusal must say what is wrong with it: {err}"
     );
 }
@@ -2396,7 +2827,7 @@ fn the_memory_limit_counts_the_encoder_the_benchmark_builds() {
         "a compression pass allocates something to match with"
     );
 
-    let mut opts = parse(&["-b3", "f"]).unwrap();
+    let mut opts = parse(&["-b3", "-i1", "f"]).unwrap();
     opts.inputs = vec![input.clone()];
 
     // Room for everything but the encoder: it still has to fit beside them.
@@ -2412,6 +2843,33 @@ fn the_memory_limit_counts_the_encoder_the_benchmark_builds() {
     accepted.expect("with room for both it runs");
 }
 
+/// `--zstd=` knobs resize what a compression pass builds: a wider hash table,
+/// or a strategy that moves the level onto the optimal parser with its scratch
+/// arenas. The ceiling has to weigh the frame as the encoder will build it,
+/// not the level's preset, or it admits a run that then allocates past it.
+#[test]
+fn the_memory_limit_counts_the_advanced_parameters() {
+    let dir = std::env::temp_dir();
+    let input = dir.join(format!("szstd-advmem-{}.bin", std::process::id()));
+    fs::write(&input, vec![0u8; 32 * 1024]).unwrap();
+
+    let mut admitted = Vec::new();
+    for knobs in ["--zstd=hlog=16", "--zstd=strat=9"] {
+        let mut opts = parse(&["-b1", "-i1", knobs, "f"]).unwrap();
+        opts.inputs = vec![input.clone()];
+        // What level 1 holds with nothing overridden.
+        opts.memory_limit = Some(benchmark_budget(32 * 1024, 1..=1));
+        if run_benchmark(&opts, None).is_ok() {
+            admitted.push(knobs);
+        }
+    }
+    let _ = fs::remove_file(&input);
+    assert!(
+        admitted.is_empty(),
+        "the preset's figure does not cover {admitted:?}"
+    );
+}
+
 /// A benchmark holds the dictionary more than once: it measures both
 /// directions, so the blob is parsed into an encoder's tables and a decoder's,
 /// and the blob itself is still there while they are built from it. Counting it
@@ -2425,7 +2883,7 @@ fn the_memory_limit_counts_every_copy_of_the_dictionary() {
 
     let buffers = benchmark_budget(32 * 1024, 3..=3);
 
-    let mut opts = parse(&["-b3", "f"]).unwrap();
+    let mut opts = parse(&["-b3", "-i1", "f"]).unwrap();
     opts.inputs = vec![input.clone()];
 
     // Room for the buffers and two dictionaries: still one short.
@@ -2451,7 +2909,7 @@ fn the_memory_limit_counts_the_dictionary_and_the_benchmark_together() {
     fs::write(&input, vec![0u8; 32 * 1024]).unwrap();
     let dictionary = vec![0u8; 32 * 1024];
 
-    let mut opts = parse(&["-b3", "f"]).unwrap();
+    let mut opts = parse(&["-b3", "-i1", "f"]).unwrap();
     opts.inputs = vec![input.clone()];
     // Room for exactly what the benchmark holds, and so none to spare for a
     // dictionary beside it.
@@ -2470,21 +2928,599 @@ fn the_memory_limit_counts_the_dictionary_and_the_benchmark_together() {
     );
 }
 
-/// Flags whose whole purpose is to change which files are touched, or what
-/// happens to input that is not compressed, cannot be accepted as no-ops: the
-/// caller would get compression where they asked for a skip, or an error where
-/// they asked for a copy.
+/// Under `--output-dir-flat` two inputs collide when their outputs share a
+/// name, which for decompression is the name with its suffix gone: `a/foo.zst`
+/// and `b/foo.zstd` both become `out/foo`, and the second would replace the
+/// first unannounced if the inputs' own names were compared. Outputs that the
+/// mirror keeps apart, or that land beside their inputs, never collide.
 #[test]
-fn unimplemented_behaviour_flags_are_rejected() {
+fn flat_output_collisions_are_judged_by_the_output_names() {
+    let decompress = parse(&[
+        "-d",
+        "--output-dir-flat",
+        "out",
+        "a/foo.zst",
+        "b/foo.zstd",
+        "c/bar.tzst",
+        "d/bar.tar.zst",
+        "e/unknown.bin",
+    ])
+    .unwrap();
+    assert_eq!(
+        flat_output_collisions(&decompress),
+        vec![OsString::from("bar.tar"), OsString::from("foo")]
+    );
+    let compress = parse(&["--output-dir-flat", "out", "a/foo", "b/foo", "c/foo.zst"]).unwrap();
+    assert_eq!(
+        flat_output_collisions(&compress),
+        vec![OsString::from("foo.zst")]
+    );
+    let mirrored = parse(&["--output-dir-mirror", "tree", "a/foo", "b/foo"]).unwrap();
+    assert!(flat_output_collisions(&mirrored).is_empty());
+    let beside = parse(&["a/foo", "b/foo"]).unwrap();
+    assert!(flat_output_collisions(&beside).is_empty());
+}
+
+/// Outputs land where the directory flags say: `--output-dir-flat` beside
+/// nothing but the file name, `--output-dir-mirror` under the replayed source
+/// directory, and the mirror wins when both are given, as it does in the
+/// reference command. A source the mirror cannot place is an error for that
+/// input.
+#[test]
+fn output_directories_place_the_derived_name() {
+    let flat = parse(&["--output-dir-flat", "out", "f"]).unwrap();
+    assert_eq!(
+        derive_output_path(&flat, Path::new("a/b/c.txt")).unwrap(),
+        PathBuf::from("out/c.txt.zst")
+    );
+    let flat_decompress = parse(&["-d", "--output-dir-flat", "out", "f"]).unwrap();
+    assert_eq!(
+        derive_output_path(&flat_decompress, Path::new("a/b/c.txt.zst")).unwrap(),
+        PathBuf::from("out/c.txt")
+    );
+    let mirror = parse(&["--output-dir-mirror", "tree", "f"]).unwrap();
+    assert_eq!(
+        derive_output_path(&mirror, Path::new("a/b/c.txt")).unwrap(),
+        PathBuf::from("tree/a/b/c.txt.zst")
+    );
+    assert_eq!(
+        derive_output_path(&mirror, Path::new("/abs/c.txt")).unwrap(),
+        PathBuf::from("tree/abs/c.txt.zst")
+    );
+    let err = derive_output_path(&mirror, Path::new("../c.txt"))
+        .expect_err("a source that climbs cannot be mirrored")
+        .to_string();
+    assert!(err.contains("--output-dir-mirror cannot compress"), "{err}");
+    let both = parse(&[
+        "--output-dir-flat",
+        "out",
+        "--output-dir-mirror",
+        "tree",
+        "f",
+    ])
+    .unwrap();
+    assert_eq!(
+        derive_output_path(&both, Path::new("a/c.txt")).unwrap(),
+        PathBuf::from("tree/a/c.txt.zst"),
+        "the mirror takes precedence"
+    );
+    // `-o` names the destination outright, whatever directory flags say.
+    let named = parse(&["-o", "exact.zst", "--output-dir-flat", "out", "f"]).unwrap();
+    assert_eq!(
+        derive_output_path(&named, Path::new("a/c.txt")).unwrap(),
+        PathBuf::from("exact.zst")
+    );
+}
+
+/// `--exclude-compressed` leaves a file whose extension says it is already
+/// compressed alone: no output, no failure. A directory named without `-r` is
+/// refused as the reference command refuses it.
+#[test]
+fn already_compressed_inputs_are_skipped_and_directories_refused() {
+    let scratch = Scratch::new("exclude");
+    let archive = scratch.file("data.gz", b"pretend gzip");
+    let plain = scratch.file("data.txt", b"plain text to compress");
+
+    let mut opts = parse(&["--exclude-compressed", "-q", "f"]).unwrap();
+    opts.inputs = vec![archive.clone(), plain.clone()];
+    let skipped =
+        process_file(&opts, &archive, &mut no_dict(), 2).expect("skipping is not an error");
+    assert!(matches!(skipped, Outcome::Skipped));
+    assert!(
+        !scratch.path().join("data.gz.zst").exists(),
+        "nothing is written for a skipped input"
+    );
+    let done = process_file(&opts, &plain, &mut no_dict(), 2).expect("the plain file compresses");
+    assert!(matches!(done, Outcome::Done(_)));
+    assert!(scratch.path().join("data.txt.zst").exists());
+
+    let err = open_input(&opts, scratch.path())
+        .expect_err("a directory is not an input without -r")
+        .to_string();
+    assert!(err.contains("is a directory"), "{err}");
+    let err = open_input(&opts, &scratch.path().join("missing"))
+        .expect_err("a missing input is reported")
+        .to_string();
+    assert!(err.contains("can't stat"), "{err}");
+}
+
+/// One failing input does not end the run: the rest are processed and the
+/// failure count comes back to become the exit status, as the reference
+/// command's does.
+#[test]
+fn a_failing_input_is_reported_and_the_rest_are_processed() {
+    let scratch = Scratch::new("continue");
+    let good = scratch.file("good.txt", b"good bytes to compress");
+    let missing = scratch.path().join("missing.txt");
+
+    let mut opts = parse(&["-qq", "f", "g"]).unwrap();
+    opts.inputs = vec![missing, good.clone()];
+    let failed = run(opts).expect("the run itself completes");
+    assert_eq!(failed, 1, "one input failed");
+    assert!(
+        scratch.path().join("good.txt.zst").exists(),
+        "the good input was still compressed"
+    );
+}
+
+/// Without `-f` an existing output is not replaced. Below the default display
+/// level no question can be asked, so the input is refused and counted as
+/// failed, with the existing file untouched.
+#[test]
+fn an_existing_output_is_not_replaced_quietly() {
+    let scratch = Scratch::new("overwrite");
+    let input = scratch.file("in.txt", b"new content");
+    let existing = scratch.file("in.txt.zst", b"precious bytes");
+
+    let mut opts = parse(&["-q", "f"]).unwrap();
+    opts.inputs = vec![input.clone()];
+    let outcome =
+        process_file(&opts, &input, &mut no_dict(), 1).expect("a refusal is not an error");
+    assert!(matches!(outcome, Outcome::Refused));
+    assert_eq!(fs::read(&existing).unwrap(), b"precious bytes");
+
+    let mut forced = parse(&["-q", "-f", "f"]).unwrap();
+    forced.inputs = vec![input.clone()];
+    let outcome = process_file(&forced, &input, &mut no_dict(), 1).expect("-f replaces it");
+    assert!(matches!(outcome, Outcome::Done(_)));
+    assert_ne!(fs::read(&existing).unwrap(), b"precious bytes");
+}
+
+/// Several inputs into one `-o` are concatenated as frames into that file,
+/// which decodes to the inputs in order. It is a destructive shape, so
+/// `--rm` is set aside and the sources stay; without `-f` and with no way to
+/// ask, the run refuses and writes nothing.
+#[test]
+fn several_inputs_into_one_output_are_concatenated_and_keep_their_sources() {
+    let scratch = Scratch::new("concat");
+    let a = scratch.file("a.txt", b"first part, ");
+    let b = scratch.file("b.txt", b"second part");
+    let output = scratch.path().join("both.zst");
+
+    let mut refused = parse(&["-q", "--rm", "-o", "x", "a", "b"]).unwrap();
+    refused.inputs = vec![a.clone(), b.clone()];
+    refused.output = Some(output.clone());
+    assert_eq!(
+        run(refused).expect("a refusal is a failed run, not an error"),
+        2,
+        "every input counts as failed"
+    );
+    assert!(!output.exists(), "nothing is written without -f");
+
+    let mut opts = parse(&["-q", "-f", "--rm", "-o", "x", "a", "b"]).unwrap();
+    opts.inputs = vec![a.clone(), b.clone()];
+    opts.output = Some(output.clone());
+    assert_eq!(run(opts).expect("the concatenation runs"), 0);
+    assert_eq!(
+        decoded(&fs::read(&output).unwrap()).unwrap(),
+        b"first part, second part"
+    );
+    assert!(
+        a.exists() && b.exists(),
+        "--rm is set aside for a concatenation"
+    );
+}
+
+/// A single input into `-o` keeps the reference command's single-file path:
+/// `--rm` applies, and the output takes the source's permissions.
+#[test]
+fn a_single_input_into_a_named_output_is_removed_on_request() {
+    let scratch = Scratch::new("single");
+    let input = scratch.file("only.txt", b"only bytes");
+    let output = scratch.path().join("only.zst");
+
+    let mut opts = parse(&["-q", "--rm", "-o", "x", "a"]).unwrap();
+    opts.inputs = vec![input.clone()];
+    opts.output = Some(output.clone());
+    assert_eq!(run(opts).unwrap(), 0);
+    assert_eq!(decoded(&fs::read(&output).unwrap()).unwrap(), b"only bytes");
+    assert!(!input.exists(), "--rm removes the one source");
+}
+
+/// `zstdcat` and `zcat` behave like `cat`: with a terminal on stdin they read
+/// it, which is what `-dcf` does. The reference command's preset forces only
+/// the output side and refuses the terminal ("stdin is a console"), a refusal
+/// no script can rely on, so ours reads. Plain `zstd` still needs `-f` for it.
+#[test]
+fn zstdcat_reads_a_terminal_on_stdin() {
+    for name in ["zstdcat", "zcat"] {
+        let opts = parse_as(&program_preset(name), CompressionLevel::DEFAULT_LEVEL, &[]).unwrap();
+        assert!(opts.force_stdin, "{name} reads a terminal like cat");
+    }
+    assert!(
+        !parse(&[]).unwrap().force_stdin,
+        "plain zstd still refuses it"
+    );
+    assert!(parse(&["-f"]).unwrap().force_stdin, "unless forced");
+}
+
+/// Several inputs into an existing `-o` file, none of which can be read: the
+/// run has nothing to write, so the output keeps what it held instead of
+/// being replaced by an empty file, and the exit status still counts every
+/// input that failed.
+#[test]
+fn an_output_is_kept_when_no_concatenated_input_is_processed() {
+    let scratch = Scratch::new("keepout");
+    let output = scratch.file("existing.zst", b"what was there");
+    let mut opts = parse(&["-qq", "-f", "-o", "x", "a", "b"]).unwrap();
+    opts.inputs = vec![
+        scratch.path().join("missing-1"),
+        scratch.path().join("missing-2"),
+    ];
+    opts.output = Some(output.clone());
+    assert_eq!(
+        run(opts).expect("failed inputs are counted, not an error"),
+        2,
+        "both inputs failed"
+    );
+    assert_eq!(fs::read(&output).unwrap(), b"what was there");
+    let leftovers: Vec<_> = fs::read_dir(scratch.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().contains(".tmp."))
+        .collect();
+    assert!(leftovers.is_empty(), "no temporary is left: {leftovers:?}");
+}
+
+/// `-o` naming one of the inputs would read that input through its open
+/// descriptor and rename the finished frame over it, and `--rm` would then
+/// delete even the frame. The run is refused before anything is written, as
+/// the reference command refuses an output that would overwrite its input,
+/// whether the input is the only one, is spelled another way, or is one of
+/// several being concatenated.
+#[test]
+fn an_output_that_is_also_an_input_is_refused() {
+    let scratch = Scratch::new("oalias");
+    let input = scratch.file("data.txt", b"original bytes");
+    let other = scratch.file("other.txt", b"other bytes");
+    let respelled = scratch.path().join(".").join("data.txt");
+    for (inputs, output) in [
+        (vec![input.clone()], input.clone()),
+        (vec![input.clone()], respelled),
+        (vec![other.clone(), input.clone()], input.clone()),
+    ] {
+        let mut opts = parse(&["-q", "-f", "--rm", "-o", "x", "a"]).unwrap();
+        opts.inputs = inputs;
+        opts.output = Some(output.clone());
+        let err = run(opts)
+            .expect_err("an output that is an input is refused")
+            .to_string();
+        assert!(err.contains("also an input"), "the refusal says why: {err}");
+        assert_eq!(
+            fs::read(&input).unwrap(),
+            b"original bytes",
+            "{}",
+            output.display()
+        );
+        assert!(other.exists(), "--rm removed nothing");
+    }
+}
+
+/// `-o /dev/null` is written in place, as the reference command opens any
+/// destination that is not a regular file: no temporary, no rename (which
+/// would replace the device with a file) and no overwrite question, which is
+/// asked only about a regular file. Both directions take it. A directory as
+/// the destination is still refused.
+#[cfg(unix)]
+#[test]
+fn an_existing_device_output_is_written_in_place() {
+    let scratch = Scratch::new("devnull");
+    let input = scratch.file("in.txt", b"bytes for the bit bucket");
+    let mut opts = parse(&["-q", "-o", "x", "a"]).unwrap();
+    opts.inputs = vec![input.clone()];
+    opts.output = Some(PathBuf::from("/dev/null"));
+    assert_eq!(run(opts).expect("/dev/null takes the frame"), 0);
+
+    let frame = scratch.path().join("in.txt.zst");
+    fs::write(
+        &frame,
+        structured_zstd::encoding::compress_slice_to_vec(
+            b"bytes for the bit bucket",
+            CompressionLevel::Default,
+        ),
+    )
+    .unwrap();
+    let mut opts = parse(&["-q", "-d", "-o", "x", "a"]).unwrap();
+    opts.inputs = vec![frame];
+    opts.output = Some(PathBuf::from("/dev/null"));
+    assert_eq!(run(opts).expect("/dev/null takes the plaintext"), 0);
+
+    let mut opts = parse(&["-q", "-f", "-o", "x", "a"]).unwrap();
+    opts.inputs = vec![input];
+    opts.output = Some(scratch.path().to_path_buf());
+    assert!(run(opts).is_err(), "a directory is not a destination");
+}
+
+/// A run pointed only at empty directories has nothing to do: it says so and
+/// succeeds, rather than falling back to reading stdin.
+#[test]
+fn empty_directories_are_nothing_to_do_not_a_request_for_stdin() {
+    let scratch = Scratch::new("emptydir");
+    fs::create_dir_all(scratch.path().join("empty")).unwrap();
+    let mut opts = parse(&["-r", "-q", "d"]).unwrap();
+    opts.inputs = vec![scratch.path().join("empty")];
+    assert_eq!(run(opts).expect("nothing to do is not an error"), 0);
+
+    // And a directory named without `-r` is one failed input.
+    let mut opts = parse(&["-qq", "d"]).unwrap();
+    opts.inputs = vec![scratch.path().join("empty")];
+    assert_eq!(run(opts).unwrap(), 1);
+}
+
+/// Decompression reports how many bytes came out, which is what `-t` and the
+/// summaries print; a corrupted checksum is ignored under `--no-check`.
+#[test]
+fn decoding_counts_its_output_and_no_check_ignores_the_checksum() {
+    let payload = b"payload whose checksum will be corrupted";
+    let mut frame = frame_of(payload);
+    // One set of codecs throughout, as a run decodes every input with one
+    // decoder: the failure in the middle must not reach the decode after it.
+    let mut codecs = no_dict();
+    let written = decompress_stream(
+        frame.as_slice(),
+        io::sink(),
+        &mut codecs,
+        &DecodeSettings::default(),
+    )
+    .unwrap();
+    assert_eq!(written, payload.len() as u64);
+
+    let last = frame.len() - 1;
+    frame[last] ^= 0xFF;
+    decompress_stream(
+        frame.as_slice(),
+        io::sink(),
+        &mut codecs,
+        &DecodeSettings::default(),
+    )
+    .expect_err("verified by default");
+    let ignored = decompress_stream(
+        frame.as_slice(),
+        io::sink(),
+        &mut codecs,
+        &DecodeSettings {
+            verify_checksum: false,
+            pass_through: false,
+        },
+    )
+    .expect("--no-check decodes it regardless");
+    assert_eq!(ignored, payload.len() as u64);
+    assert!(
+        !DecodeSettings::from_options(&parse(&["-d", "--no-check", "f"]).unwrap()).verify_checksum
+    );
+}
+
+/// `-t` answers whether the input is a sound zstd archive, so it never passes
+/// anything through: not with `-f` on redirected stdin, where the forced
+/// default would otherwise turn on, and not with `--pass-through` named
+/// either, since either way plain input would be reported as intact. The
+/// reference command's `-t` writes to its null mark, which keeps the forced
+/// default off there too.
+#[test]
+fn testing_never_passes_input_through() {
     for args in [
-        &["--exclude-compressed", "f"][..],
-        &["-d", "--pass-through", "f"][..],
+        &["-tf"][..],
+        &["-t", "-f", "-"],
+        &["-t", "--pass-through", "f"],
     ] {
         assert!(
-            parse(args).is_err(),
-            "{args:?} changes which files are processed and is not implemented"
+            !DecodeSettings::from_options(&parse(args).unwrap()).pass_through,
+            "{args:?}"
         );
     }
+    let zstdcat_test = parse_as(
+        &program_preset("zstdcat"),
+        CompressionLevel::DEFAULT_LEVEL,
+        &["-t"],
+    )
+    .unwrap();
+    assert!(!DecodeSettings::from_options(&zstdcat_test).pass_through);
+    assert!(
+        DecodeSettings::from_options(&parse(&["-df"]).unwrap()).pass_through,
+        "decompressing stdin to stdout under -f still does"
+    );
+}
+
+/// stdin has no length to stat, so its counter runs over the `--stream-size`
+/// pledge when one is given, and `--progress` draws it as it draws a file's.
+/// Without a pledge the total is unknown rather than zero.
+#[test]
+fn progress_over_stdin_follows_the_flag_and_the_pledge() {
+    let pledged = parse(&["--progress", "--stream-size=100"]).unwrap();
+    let monitor = stdin_monitor(&pledged, io::empty());
+    assert!(monitor.is_shown(), "--progress draws it");
+    assert_eq!(monitor.total, Some(100));
+    let unpledged = parse(&["--progress"]).unwrap();
+    assert_eq!(stdin_monitor(&unpledged, io::empty()).total, None);
+    let quiet = parse(&["--no-progress"]).unwrap();
+    assert!(!stdin_monitor(&quiet, io::empty()).is_shown());
+}
+
+/// The forced pass-through default follows each input's own destination, as
+/// the reference command decides it per file: in `-df archive.zst -` the stdin
+/// member goes to stdout and passes plain input through, while the named
+/// archive is written to a file of its own and does not.
+#[test]
+fn forced_pass_through_follows_each_inputs_destination() {
+    let mixed = parse(&["-df", "archive.zst", "-"]).unwrap();
+    assert!(
+        DecodeSettings::for_stdin(&mixed).pass_through,
+        "stdin in a mixed run goes to stdout"
+    );
+    assert!(
+        !DecodeSettings::for_file(&mixed).pass_through,
+        "the named archive goes to its own file"
+    );
+    let into_file = parse(&["-df", "-o", "out", "-"]).unwrap();
+    assert!(
+        !DecodeSettings::for_stdin(&into_file).pass_through,
+        "stdin into -o is not stdout"
+    );
+    let cat = parse(&["-dcf", "archive.zst"]).unwrap();
+    assert!(
+        DecodeSettings::for_file(&cat).pass_through,
+        "-c sends a file to stdout"
+    );
+}
+
+/// An empty input holds no frame. Decoding it is an error, as the reference
+/// command reports it, but under pass-through it is plain input like any other
+/// and passes through as the empty output, as `cat`, `zcat -f` and `xzcat -f`
+/// pass it; the reference command refuses it there too.
+#[test]
+fn an_empty_input_passes_through_and_is_refused_otherwise() {
+    let pass = DecodeSettings {
+        verify_checksum: true,
+        pass_through: true,
+    };
+    let mut out = Vec::new();
+    let written = decompress_stream(&b""[..], &mut out, &mut no_dict(), &pass)
+        .expect("an empty input passes through");
+    assert_eq!(written, 0);
+    assert!(out.is_empty());
+
+    let err = decompress_stream(
+        &b""[..],
+        io::sink(),
+        &mut no_dict(),
+        &DecodeSettings::default(),
+    )
+    .expect_err("an empty archive is refused without pass-through")
+    .to_string();
+    assert!(err.contains("unexpected end of file"), "{err}");
+}
+
+/// Input that is not a zstd stream is copied through under `--pass-through`,
+/// bytes intact, and refused otherwise; a stream too short to hold a magic
+/// number is treated the same way, as the reference command treats it. Bytes
+/// that follow a frame and are not a frame themselves are a damaged or
+/// truncated archive, not plain input: they are refused with pass-through on,
+/// as xz refuses them, rather than copied into the output with success as the
+/// reference command and gzip copy them.
+#[test]
+fn plain_input_is_passed_through_or_refused() {
+    let pass = DecodeSettings {
+        verify_checksum: true,
+        pass_through: true,
+    };
+    let mut out = Vec::new();
+    let written = decompress_stream(
+        &b"plain text, not a frame"[..],
+        &mut out,
+        &mut no_dict(),
+        &pass,
+    )
+    .expect("pass-through copies it");
+    assert_eq!(out, b"plain text, not a frame");
+    assert_eq!(written, out.len() as u64);
+
+    let mut short = Vec::new();
+    decompress_stream(&b"ab"[..], &mut short, &mut no_dict(), &pass).unwrap();
+    assert_eq!(short, b"ab", "fewer than four bytes are passed through too");
+
+    let err = decompress_stream(
+        &b"plain text, not a frame"[..],
+        io::sink(),
+        &mut no_dict(),
+        &DecodeSettings::default(),
+    )
+    .expect_err("refused without pass-through")
+    .to_string();
+    assert!(err.contains("unsupported format"), "{err}");
+    let err = decompress_stream(
+        &b"ab"[..],
+        io::sink(),
+        &mut no_dict(),
+        &DecodeSettings::default(),
+    )
+    .expect_err("a stump is refused too")
+    .to_string();
+    assert!(err.contains("unknown header"), "{err}");
+
+    // A real frame followed by plain bytes: the frame decodes, and the tail
+    // is refused rather than passed through after it.
+    let mut mixed = frame_of(b"framed");
+    mixed.extend_from_slice(b" then plain");
+    let mut out = Vec::new();
+    let err = decompress_stream(mixed.as_slice(), &mut out, &mut no_dict(), &pass)
+        .expect_err("data after a frame is not plain input")
+        .to_string();
+    assert!(err.contains("unsupported format"), "{err}");
+    assert_eq!(out, b"framed", "only the frame reaches the output");
+
+    // A second frame whose header lost its first byte is the damage this
+    // guards against: its raw bytes must not land in the output as if they
+    // were content.
+    let first = frame_of(b"first");
+    let mut damaged = first.clone();
+    damaged.extend_from_slice(&frame_of(b"second")[1..]);
+    let mut out = Vec::new();
+    decompress_stream(damaged.as_slice(), &mut out, &mut no_dict(), &pass)
+        .expect_err("a damaged frame after a good one is refused");
+    assert_eq!(out, b"first");
+
+    // A skippable frame is a frame too: plain bytes after one are refused.
+    let mut after_skippable = 0x184D_2A50u32.to_le_bytes().to_vec();
+    after_skippable.extend_from_slice(&0u32.to_le_bytes());
+    after_skippable.extend_from_slice(b"plain");
+    decompress_stream(
+        after_skippable.as_slice(),
+        io::sink(),
+        &mut no_dict(),
+        &pass,
+    )
+    .expect_err("plain bytes after a skippable frame are refused");
+
+    // The default follows the reference command: on when forced and writing
+    // to stdout (`zstd -dcf`), off otherwise.
+    assert!(DecodeSettings::from_options(&parse(&["-dcf", "f"]).unwrap()).pass_through);
+    assert!(!DecodeSettings::from_options(&parse(&["-dc", "f"]).unwrap()).pass_through);
+    assert!(!DecodeSettings::from_options(&parse(&["-df", "f"]).unwrap()).pass_through);
+    assert!(
+        DecodeSettings::from_options(&parse(&["-df", "--pass-through", "f"]).unwrap()).pass_through
+    );
+}
+
+/// Data to stdout silences the result summary and sets `--rm` aside; the
+/// verbosity and the removal flag are what the run computes from the inputs
+/// and destination together.
+#[test]
+fn stdout_output_is_recognised_from_the_inputs_and_destination() {
+    assert!(writes_stdout(&parse(&["-c", "f"]).unwrap()));
+    assert!(
+        writes_stdout(&parse(&[]).unwrap()),
+        "stdin in, nothing named: stdout out"
+    );
+    assert!(writes_stdout(&parse(&["-"]).unwrap()));
+    assert!(!writes_stdout(&parse(&["-o", "out"]).unwrap()));
+    assert!(!writes_stdout(&parse(&["f"]).unwrap()));
+    assert!(
+        !writes_stdout(&parse(&["f", "-"]).unwrap()),
+        "a file among them gets its own"
+    );
+    assert!(reads_stdin(&[]));
+    assert!(reads_stdin(&[PathBuf::from("a"), PathBuf::from("-")]));
+    assert!(!reads_stdin(&[PathBuf::from("a")]));
 }
 
 /// `--adapt` also comes parameterised upstream (`--adapt=min=1,max=9`).
@@ -2496,18 +3532,37 @@ fn parameterised_adapt_is_accepted() {
     assert!(parse(&["--adapt=min=1,max=9", "f"]).is_ok());
 }
 
-/// The help text promises that `-f` is what allows output to a terminal, and
-/// upstream refuses without it. Writing a compressed frame into an interactive
-/// terminal corrupts the session and loses the data, so the guard has to exist
-/// rather than just be advertised.
+/// Compressing stdin with stdout on a terminal writes the frame into the
+/// session when nobody asked for stdout, so the reference command refuses it
+/// unless `-c` or `-f` says otherwise: with no input named, with an explicit
+/// `-`, and with `-` among several inputs and no `-o`. `-c` is the request
+/// for stdout "even if it is a console", and is what `ssh -t` and
+/// `docker run -t` pipelines rely on, since their stdout is a terminal on the
+/// far side of the redirect. A named `-o` file, decompression and a stdout
+/// that is not a terminal all proceed.
 #[test]
-fn binary_output_to_a_terminal_needs_force() {
-    // Not a terminal: always fine, `-f` or not.
-    assert!(guard_binary_stdout(false, false).is_ok());
-    assert!(guard_binary_stdout(false, true).is_ok());
-    // A terminal: refused, unless forced.
-    assert!(guard_binary_stdout(true, false).is_err());
-    assert!(guard_binary_stdout(true, true).is_ok());
+fn compressing_stdin_into_a_terminal_needs_c_or_f() {
+    let refused = |args: &[&str]| refuse_console_stdout(&parse(args).unwrap(), true).is_err();
+    assert!(refused(&[]), "no input: stdin to the terminal");
+    assert!(refused(&["-"]), "an explicit -");
+    assert!(refused(&["a", "-", "b"]), "- among inputs with no -o");
+    let err = refuse_console_stdout(&parse(&[]).unwrap(), true).unwrap_err();
+    assert_eq!(err.to_string(), "stdout is a console, aborting");
+
+    assert!(
+        !refused(&["-c", "-"]),
+        "-c asks for stdout, a console included"
+    );
+    assert!(!refused(&["--stdout"]), "and so does --stdout");
+    assert!(!refused(&["-f"]), "-f forces it");
+    assert!(!refused(&["-d"]), "decompressed text may go to a terminal");
+    assert!(!refused(&["-o", "out.zst"]), "the frame goes to a file");
+    assert!(!refused(&["a.txt"]), "no stdin among the inputs");
+    assert!(!refused(&["-t"]), "testing writes nothing");
+    assert!(
+        refuse_console_stdout(&parse(&[]).unwrap(), false).is_ok(),
+        "stdout is not a terminal"
+    );
 }
 
 /// Ignoring what a flag *does* is not the same as ignoring what it *says*: a
@@ -2569,15 +3624,20 @@ fn corrupted_checksum_is_reported_not_passed() {
             level: 3,
             ..FrameSettings::default()
         },
-        &no_dict(),
+        &mut no_dict(),
     )
     .expect("compressing the fixture must succeed");
     // The trailing four bytes are the frame's XXH64 check field.
     let last = frame.len() - 1;
     frame[last] ^= 0xFF;
 
-    let err = decompress_stream(frame.as_slice(), io::sink(), &no_dict())
-        .expect_err("a corrupted checksum must fail the decode");
+    let err = decompress_stream(
+        frame.as_slice(),
+        io::sink(),
+        &mut no_dict(),
+        &DecodeSettings::default(),
+    )
+    .expect_err("a corrupted checksum must fail the decode");
     let text = err.to_string();
     assert!(
         text.to_ascii_lowercase().contains("checksum"),
@@ -2598,7 +3658,7 @@ fn rm_keeps_the_source_when_output_went_to_stdout() {
 
     let mut opts = parse(&["--rm", "-c", "f"]).unwrap();
     opts.inputs = vec![path.clone()];
-    let result = remove_source_if_requested(&opts, &path);
+    let result = remove_source_if_requested(&opts, &path, Placement::File);
 
     let survived = path.exists();
     let _ = fs::remove_file(&path);
@@ -2607,6 +3667,29 @@ fn rm_keeps_the_source_when_output_went_to_stdout() {
         survived,
         "--rm with -c must keep the input: the output went somewhere we cannot verify"
     );
+}
+
+/// `--rm` removes a source once a regular file holds what it became. A device
+/// or pipe written in place (`-o /dev/null`, a FIFO) keeps nothing, so the
+/// source stays, as it does for stdout; the reference command deletes it and
+/// leaves no copy anywhere.
+#[cfg(unix)]
+#[test]
+fn a_source_written_only_to_a_device_is_not_removed() {
+    let scratch = Scratch::new("rmdevice");
+    let source = scratch.file("data.txt", b"the only copy of this data");
+    let mut opts = parse(&["--rm", "-q", "-o", "/dev/null", "x"]).unwrap();
+    opts.inputs = vec![source.clone()];
+    assert_eq!(run(opts).unwrap(), 0);
+    assert!(source.exists(), "nothing else holds these bytes");
+
+    // And a regular output still lets `--rm` do its job.
+    let archive = scratch.path().join("data.txt.zst");
+    let mut opts = parse(&["--rm", "-q", "-o", "x", "x"]).unwrap();
+    opts.inputs = vec![source.clone()];
+    opts.output = Some(archive.clone());
+    assert_eq!(run(opts).unwrap(), 0);
+    assert!(archive.exists() && !source.exists());
 }
 
 /// `-c` and `-o` name competing destinations, so the later one on the command
@@ -2624,15 +3707,6 @@ fn stdout_and_output_follow_last_option_wins() {
     assert_eq!(stdout_last.output, None);
 }
 
-/// `--[no-]compress-literals` forces literals compressed or stored, which
-/// changes the emitted frame. The encoder has no such switch here, so
-/// accepting the flag would hand back a frame laid out the other way.
-#[test]
-fn literal_mode_flags_are_rejected_until_wired() {
-    assert!(parse(&["--compress-literals", "f"]).is_err());
-    assert!(parse(&["--no-compress-literals", "f"]).is_err());
-}
-
 /// Concatenating frames is a documented property of the format: `cat a.zst
 /// b.zst` decodes to `a` followed by `b`, which is how `tar` archives and
 /// append-style logs are built. Stopping at the first frame loses the rest
@@ -2640,6 +3714,8 @@ fn literal_mode_flags_are_rejected_until_wired() {
 #[test]
 fn concatenated_frames_are_all_decoded() {
     let mut stream = Vec::new();
+    // One set of codecs for both, as a run shares its context across inputs.
+    let mut codecs = no_dict();
     for payload in [&b"first frame payload"[..], &b"second frame payload"[..]] {
         compress_stream(
             payload,
@@ -2648,17 +3724,99 @@ fn concatenated_frames_are_all_decoded() {
                 level: 3,
                 ..FrameSettings::default()
             },
-            &no_dict(),
+            &mut codecs,
         )
         .expect("compressing a fixture frame must succeed");
     }
 
-    let mut out = Vec::new();
-    decompress_stream(stream.as_slice(), &mut out, &no_dict()).expect("both frames must decode");
+    let out = decoded(&stream).expect("both frames must decode");
     assert_eq!(
         out, b"first frame payloadsecond frame payload",
         "every frame in the stream has to reach the output"
     );
+}
+
+/// A run compresses every input with one context, as the reference command
+/// does, and each input still gets the frame a context of its own would write:
+/// nothing an earlier input left in the match finder, the dictionary snapshot
+/// or the entropy tables may reach a later frame. Sizes straddle the
+/// dictionary's attach cutoffs and alternate pledged with unsized frames, so
+/// the context moves between the ways a dictionary is loaded.
+#[test]
+fn a_shared_context_writes_what_a_fresh_one_would() {
+    let text: Vec<u8> = (0..4_000u32)
+        .flat_map(|i| format!("line {} of {}\n", i % 89, i % 7).into_bytes())
+        .collect();
+    let raw = include_bytes!("../../../dict_tests/dictionary");
+    let inputs: [&[u8]; 6] = [
+        &text[..3_000],
+        &text,
+        &[],
+        &text[500..20_000],
+        &text[..40_000],
+        &text[..900],
+    ];
+    for level in [-1, 1, 3, 5, 7, 12, 16, 19] {
+        for dictionary in [None, Some(&raw[..])] {
+            let fresh = || dictionary.map_or_else(no_dict, prepared_dict);
+            let mut shared = fresh();
+            for (index, input) in inputs.iter().enumerate() {
+                let settings = FrameSettings {
+                    level,
+                    pledged_size: (index % 2 == 0).then_some(input.len() as u64),
+                    ..FrameSettings::default()
+                };
+                let mut reused = Vec::new();
+                compress_stream(*input, &mut reused, &settings, &mut shared).unwrap();
+                let mut alone = Vec::new();
+                compress_stream(*input, &mut alone, &settings, &mut fresh()).unwrap();
+                assert!(
+                    reused == alone,
+                    "level {level}, dictionary {}, input {index}: {} bytes shared, {} alone",
+                    dictionary.is_some(),
+                    reused.len(),
+                    alone.len()
+                );
+            }
+        }
+    }
+}
+
+/// A frame that fails part-way, here an input that ends short of the length
+/// it pledged, must not leave the run's context inside it: the next input
+/// starts a frame of its own rather than continuing the broken one.
+#[test]
+fn a_failed_frame_does_not_reach_the_next_input() {
+    let mut codecs = no_dict();
+    let settings = FrameSettings {
+        level: 3,
+        ..FrameSettings::default()
+    };
+    // Past one block, so the failure comes after blocks were written.
+    let payload = vec![b'x'; 300_000];
+    compress_stream(
+        payload.as_slice(),
+        &mut Vec::new(),
+        &FrameSettings {
+            pledged_size: Some(payload.len() as u64 + 1),
+            ..settings
+        },
+        &mut codecs,
+    )
+    .expect_err("an input shorter than its pledge fails");
+
+    let mut next = Vec::new();
+    compress_stream(&b"the next input"[..], &mut next, &settings, &mut codecs)
+        .expect("the next input compresses");
+    let mut alone = Vec::new();
+    compress_stream(
+        &b"the next input"[..],
+        &mut alone,
+        &settings,
+        &mut no_dict(),
+    )
+    .unwrap();
+    assert_eq!(next, alone, "the next input is a frame of its own");
 }
 
 /// Skippable frames carry caller metadata inside an otherwise ordinary stream;
@@ -2671,7 +3829,7 @@ fn skippable_frames_are_stepped_over() {
         level: 3,
         ..FrameSettings::default()
     };
-    compress_stream(&b"payload"[..], &mut stream, &level_only, &no_dict())
+    compress_stream(&b"payload"[..], &mut stream, &level_only, &mut no_dict())
         .expect("compressing the fixture must succeed");
     // Magic 0x184D2A50 (little-endian) + a 4-byte length + that many bytes.
     stream.extend_from_slice(&0x184D_2A50_u32.to_le_bytes());
@@ -2679,12 +3837,10 @@ fn skippable_frames_are_stepped_over() {
     stream.extend_from_slice(b"meta");
     // A frame after it, so the skip has to land on the right byte rather than
     // merely being tolerated at the end of the stream.
-    compress_stream(&b" and more"[..], &mut stream, &level_only, &no_dict())
+    compress_stream(&b" and more"[..], &mut stream, &level_only, &mut no_dict())
         .expect("compressing the trailing fixture must succeed");
 
-    let mut out = Vec::new();
-    decompress_stream(stream.as_slice(), &mut out, &no_dict())
-        .expect("a skippable frame must not fail the decode");
+    let out = decoded(&stream).expect("a skippable frame must not fail the decode");
     assert_eq!(
         out, b"payload and more",
         "skippable content is stepped over, not emitted"
@@ -2725,7 +3881,7 @@ fn the_memory_limit_counts_the_encoder_the_dictionary_asks_for() {
          64 KiB file: {with_dict} vs {plain}"
     );
 
-    let mut opts = parse(&["-b5", "f"]).unwrap();
+    let mut opts = parse(&["-b5", "-i1", "f"]).unwrap();
     opts.inputs = vec![input.clone()];
 
     // Everything the run holds, with the encoder weighed on the file alone:
@@ -2743,4 +3899,584 @@ fn the_memory_limit_counts_the_encoder_the_dictionary_asks_for() {
     refused
         .expect_err("a ceiling weighed on the file alone does not cover the dictionary's tables");
     accepted.expect("weighed on the dictionary's own parameters, the run fits");
+}
+
+/// `--zstd=` takes the reference command's keys in both spellings, reads each
+/// value as a leading number, treats zero as "the level's value", and refuses
+/// a key it does not have or a value that is not a number.
+#[test]
+fn advanced_parameters_parse_the_reference_spellings() {
+    let short =
+        parse_advanced_params("wlog=23,clog=23,hlog=22,slog=6,mml=3,tlen=48,strat=6").unwrap();
+    assert_eq!(
+        short,
+        AdvancedParams {
+            window_log: Some(23),
+            chain_log: Some(23),
+            hash_log: Some(22),
+            search_log: Some(6),
+            min_match: Some(3),
+            target_length: Some(48),
+            strategy: Some(Strategy::Btlazy2),
+            ..AdvancedParams::default()
+        }
+    );
+    let long = parse_advanced_params(
+        "windowLog=23,chainLog=23,hashLog=22,searchLog=6,minMatch=3,targetLength=48,strategy=6",
+    )
+    .unwrap();
+    assert_eq!(short, long, "the long spellings are the same knobs");
+    let ldm = parse_advanced_params("lhlog=20,lmml=64,lblog=3,lhrlog=7,ovlog=5").unwrap();
+    assert_eq!(ldm.ldm_hash_log, Some(20));
+    assert_eq!(ldm.ldm_min_match, Some(64));
+    assert_eq!(ldm.ldm_bucket_size_log, Some(3));
+    assert_eq!(ldm.ldm_hash_rate_log, Some(7));
+    assert!(
+        parse_advanced_params("wlog=0,strat=0")
+            .unwrap()
+            .is_default(),
+        "zero is the level's own value"
+    );
+    assert_eq!(
+        parse_advanced_params("tlen=1K").unwrap().target_length,
+        Some(1024),
+        "the reference reader's K multiplier applies"
+    );
+    assert!(parse_advanced_params("").unwrap().is_default());
+    assert!(
+        parse_advanced_params("strat=10").is_err(),
+        "no tenth strategy"
+    );
+    assert!(parse_advanced_params("nope=1").is_err(), "unknown key");
+    assert!(parse_advanced_params("wlog").is_err(), "no value");
+    assert!(parse_advanced_params("wlog=abc").is_err(), "not a number");
+    assert!(parse_advanced_params("wlog=23x").is_err(), "trailing junk");
+    assert!(parse_advanced_params("wlog=23,").is_err(), "trailing comma");
+}
+
+/// Each `--zstd=` sets the keys it names and leaves the others, as the
+/// reference command writes every list into one set of parameters: knobs split
+/// across occurrences all reach the encoder, a key named again takes its later
+/// value, and a later zero puts it back to the level's.
+#[test]
+fn repeated_advanced_parameter_lists_accumulate() {
+    let opts = parse(&["--zstd=wlog=20", "--zstd=hlog=18", "f"]).unwrap();
+    assert_eq!(
+        opts.advanced.window_log,
+        Some(20),
+        "kept from the first list"
+    );
+    assert_eq!(opts.advanced.hash_log, Some(18));
+
+    let opts = parse(&["--zstd=wlog=20,hlog=18", "--zstd=wlog=21", "f"]).unwrap();
+    assert_eq!(opts.advanced.window_log, Some(21), "the later value wins");
+    assert_eq!(opts.advanced.hash_log, Some(18));
+
+    let opts = parse(&["--zstd=wlog=20", "--zstd=wlog=0", "f"]).unwrap();
+    assert_eq!(
+        opts.advanced.window_log, None,
+        "zero is the level's value again"
+    );
+}
+
+/// The knobs reach the encoder: a `--zstd=wlog=` window is what the frame
+/// declares, it wins over the window `--long` would set, and a window the
+/// decoder cannot read back is refused at the command line like `--long=N`.
+#[test]
+fn advanced_parameters_reach_the_frame() {
+    use structured_zstd::decoding::read_frame_header_info;
+
+    let opts = parse(&["--zstd=wlog=20,strat=7", "f"]).unwrap();
+    assert_eq!(opts.advanced.window_log, Some(20));
+    assert_eq!(opts.advanced.strategy, Some(Strategy::Btopt));
+    assert!(
+        parse(&["--zstd=wlog=28", "f"]).is_err(),
+        "beyond what decodes"
+    );
+    assert!(
+        parse(&["--zstd=mml=9", "f"]).is_err(),
+        "out of the knob's range"
+    );
+
+    // Big enough that the window is not capped by the source.
+    let payload = vec![0u8; 3 << 20];
+    let mut frame = Vec::new();
+    compress_stream(
+        payload.as_slice(),
+        &mut frame,
+        &FrameSettings {
+            level: 3,
+            pledged_size: Some(payload.len() as u64),
+            advanced: AdvancedParams {
+                window_log: Some(20),
+                ..AdvancedParams::default()
+            },
+            ..FrameSettings::default()
+        },
+        &mut no_dict(),
+    )
+    .unwrap();
+    assert_eq!(
+        read_frame_header_info(&frame, false).unwrap().window_size,
+        1 << 20,
+        "the frame declares the window --zstd asked for"
+    );
+    let mut frame = Vec::new();
+    compress_stream(
+        payload.as_slice(),
+        &mut frame,
+        &FrameSettings {
+            level: 16,
+            long: true,
+            long_window_log: Some(27),
+            pledged_size: Some(payload.len() as u64),
+            advanced: AdvancedParams {
+                window_log: Some(21),
+                ..AdvancedParams::default()
+            },
+            ..FrameSettings::default()
+        },
+        &mut no_dict(),
+    )
+    .unwrap();
+    assert_eq!(
+        read_frame_header_info(&frame, false).unwrap().window_size,
+        1 << 21,
+        "--zstd=wlog wins over the window --long would set"
+    );
+}
+
+/// `--long` below level 16 is refused because the matcher does not run there,
+/// unless `--zstd=strat=` moves the level onto a parser where it does.
+#[test]
+fn a_strategy_override_onto_the_optimal_parser_admits_long() {
+    assert!(parse(&["-3", "--long", "f"]).is_err());
+    assert!(parse(&["-3", "--long", "--zstd=strat=7", "f"]).is_ok());
+    assert!(parse(&["-3", "--long", "--zstd=strat=9", "f"]).is_ok());
+    assert!(parse(&["-3", "--long", "--zstd=strat=6", "f"]).is_err());
+}
+
+/// `--[no-]compress-literals` decides whether literal sections are
+/// entropy-coded: forced raw, a literal-heavy input compresses worse than the
+/// level's default; forced on at a negative level, where the default is raw,
+/// it compresses better.
+#[test]
+fn literal_compression_flags_reach_the_frame() {
+    assert_eq!(
+        parse(&["--no-compress-literals", "f"]).unwrap().literals,
+        LiteralCompressionMode::Disable
+    );
+    assert_eq!(
+        parse(&["--compress-literals", "f"]).unwrap().literals,
+        LiteralCompressionMode::Enable
+    );
+    assert_eq!(
+        parse(&["f"]).unwrap().literals,
+        LiteralCompressionMode::Auto
+    );
+
+    let payload: Vec<u8> = (0..8192u32)
+        .map(|i| b'a' + (i.wrapping_mul(2_654_435_761) >> 27) as u8)
+        .collect();
+    let frame_with = |level: i32, literals: LiteralCompressionMode| {
+        let mut frame = Vec::new();
+        compress_stream(
+            payload.as_slice(),
+            &mut frame,
+            &FrameSettings {
+                level,
+                literals,
+                ..FrameSettings::default()
+            },
+            &mut no_dict(),
+        )
+        .unwrap();
+        frame
+    };
+    let auto = frame_with(3, LiteralCompressionMode::Auto);
+    let raw = frame_with(3, LiteralCompressionMode::Disable);
+    assert!(raw.len() > auto.len(), "{} vs {}", raw.len(), auto.len());
+    assert_eq!(decoded(&raw).unwrap(), payload);
+    let fast_auto = frame_with(-3, LiteralCompressionMode::Auto);
+    let fast_coded = frame_with(-3, LiteralCompressionMode::Enable);
+    assert!(
+        fast_coded.len() < fast_auto.len(),
+        "{} vs {}",
+        fast_coded.len(),
+        fast_auto.len()
+    );
+    assert_eq!(decoded(&fast_coded).unwrap(), payload);
+}
+
+/// The trainer flags take their tuning the way the reference command reads
+/// it, and the FastCOVER options built from it follow the reference's rules:
+/// both `k` and `d` fix the parameters, `steps` widens the search over `k`,
+/// and a value the trainer cannot take is refused.
+#[test]
+fn trainer_parameters_parse_and_build_options() {
+    let params = parse_trainer_params("k=200,d=8,f=20,steps=4,split=75,accel=2", true).unwrap();
+    assert_eq!(
+        params,
+        TrainerParams {
+            k: Some(200),
+            d: Some(8),
+            f: Some(20),
+            steps: Some(4),
+            split_percent: Some(75),
+            accel: Some(2),
+            shrink: false,
+        }
+    );
+    assert!(parse_trainer_params("shrink", false).unwrap().shrink);
+    assert!(parse_trainer_params("k=50,shrink=2", false).unwrap().shrink);
+    assert!(
+        parse_trainer_params("f=20", false).is_err(),
+        "cover has no f"
+    );
+    assert!(parse_trainer_params("accel=2", false).is_err(), "nor accel");
+    assert!(parse_trainer_params("k", true).is_err(), "no value");
+    assert!(parse_trainer_params("k=x", true).is_err(), "not a number");
+    assert!(parse_trainer_params("zzz=1", true).is_err(), "unknown key");
+
+    let fixed = fastcover_options(&params).unwrap();
+    assert!(!fixed.optimize, "k and d given: nothing to search");
+    assert_eq!((fixed.k, fixed.d, fixed.f, fixed.accel), (200, 8, 20, 2));
+    assert_eq!(fixed.split_point, 0.75);
+
+    let searched = fastcover_options(&TrainerParams {
+        steps: Some(10),
+        ..TrainerParams::default()
+    })
+    .unwrap();
+    assert!(searched.optimize);
+    assert_eq!(
+        searched.k_candidates.len(),
+        11,
+        "50..=2000 in strides of 195"
+    );
+    assert_eq!(searched.k_candidates[0], 50);
+
+    let bad = |params: TrainerParams| fastcover_options(&params).is_err();
+    assert!(bad(TrainerParams {
+        d: Some(7),
+        ..TrainerParams::default()
+    }));
+    assert!(bad(TrainerParams {
+        f: Some(32),
+        ..TrainerParams::default()
+    }));
+    assert!(bad(TrainerParams {
+        accel: Some(11),
+        ..TrainerParams::default()
+    }));
+    assert!(bad(TrainerParams {
+        k: Some(4),
+        d: Some(8),
+        ..TrainerParams::default()
+    }));
+    assert!(bad(TrainerParams {
+        split_percent: Some(101),
+        ..TrainerParams::default()
+    }));
+    assert!(bad(TrainerParams {
+        shrink: true,
+        ..TrainerParams::default()
+    }));
+
+    let opts = parse(&["--train-fastcover=k=200,d=8", "s1"]).unwrap();
+    assert_eq!(opts.mode, Mode::Train);
+    assert_eq!(opts.trainer, Trainer::FastCover);
+    assert_eq!(opts.trainer_params.k, Some(200));
+    let opts = parse(&["--train-cover", "s1"]).unwrap();
+    assert_eq!(opts.trainer, Trainer::Cover);
+    assert!(opts.trainer_params.is_default());
+    assert!(parse(&["--train-legacy", "s1"]).is_err());
+}
+
+/// An empty `--filelist` is nothing to do for the modes that stream, but the
+/// modes that take named files need some and say so, as the reference
+/// command's training and listing do: `--train` must not report success with
+/// no dictionary written, nor `-b` or `-l` with nothing measured or listed.
+#[test]
+fn file_only_modes_refuse_an_empty_selection() {
+    let scratch = Scratch::new("emptysel");
+    let list = scratch.file("empty.list", b"");
+    let list = list.to_str().unwrap();
+    for args in [
+        &["--train", "-q", "--filelist", list][..],
+        &["-b", "-q", "--filelist", list],
+        &["-l", "-q", "--filelist", list],
+    ] {
+        assert!(run(parse(args).unwrap()).is_err(), "{args:?}");
+    }
+    assert_eq!(
+        run(parse(&["-q", "--filelist", list]).unwrap()).unwrap(),
+        0,
+        "compressing nothing is not an error"
+    );
+}
+
+/// `--train` selects the mode and the trainer flags select the trainer, in
+/// either order, as upstream reads them: a bare `--train` after
+/// `--train-cover` does not switch back to FastCOVER, nor drop a tuning.
+#[test]
+fn a_bare_train_keeps_the_trainer_a_flag_named() {
+    let cover_first = parse(&["--train-cover", "--train", "s"]).unwrap();
+    assert_eq!(cover_first.trainer, Trainer::Cover);
+    let cover_last = parse(&["--train", "--train-cover", "s"]).unwrap();
+    assert_eq!(cover_last.trainer, Trainer::Cover);
+    let tuned = parse(&["--train-fastcover=k=64,d=6", "--train", "s"]).unwrap();
+    assert_eq!(tuned.trainer, Trainer::FastCover);
+    assert_eq!(
+        (tuned.trainer_params.k, tuned.trainer_params.d),
+        (Some(64), Some(6))
+    );
+    assert_eq!(
+        parse(&["--train", "s"]).unwrap().trainer,
+        Trainer::FastCover
+    );
+}
+
+/// Zero is how the reference's trainer options say "the default": its parser
+/// starts from a zeroed structure and its trainer fills in every zero
+/// (`zdict.h`, `ZDICT_optimizeTrainFromBuffer_fastCover`). So
+/// `k=0,d=0,f=0,steps=0,split=0,accel=0` tunes nothing and trains as the bare
+/// flag does, rather than being refused or narrowing the search.
+#[test]
+fn zero_trainer_knobs_ask_for_the_defaults() {
+    use structured_zstd::dictionary::FastCoverOptions;
+
+    let zeros = parse_trainer_params("k=0,d=0,f=0,steps=0,split=0,accel=0", true).unwrap();
+    assert!(zeros.is_default(), "{zeros:?}");
+    let options = fastcover_options(&zeros).expect("zero knobs are valid");
+    let defaults = FastCoverOptions::default();
+    assert!(options.optimize);
+    assert_eq!(options.k_candidates, defaults.k_candidates);
+    assert_eq!(options.d_candidates, defaults.d_candidates);
+    assert_eq!(options.f_candidates, defaults.f_candidates);
+    assert_eq!(
+        (options.accel, options.split_point),
+        (defaults.accel, defaults.split_point)
+    );
+    // A zero beside a real value leaves that value in force.
+    let mixed = parse_trainer_params("k=0,d=6", true).unwrap();
+    assert_eq!((mixed.k, mixed.d), (None, Some(6)));
+    assert!(
+        parse(&["--train-cover=k=0,d=0,steps=0", "s"])
+            .unwrap()
+            .trainer_params
+            .is_default(),
+        "for COVER too, zero is no tuning"
+    );
+}
+
+/// Whether a trainer takes the tuning it was given is known from the command
+/// line alone, so it is answered before any sample is read: a run over a large
+/// corpus that is bound to be refused does not read it first. A sample that is
+/// not there shows the order, since the refusal names the tuning rather than
+/// the missing file.
+#[test]
+fn trainer_tuning_is_refused_before_the_samples_are_read() {
+    let scratch = Scratch::new("tuneearly");
+    let missing = scratch.path().join("absent-sample");
+    for (args, expected) in [
+        (&["--train-cover=k=50", "-q", "s"][..], "takes no tuning"),
+        (
+            &["--train-fastcover=d=7", "-q", "s"][..],
+            "d must be 6 or 8",
+        ),
+    ] {
+        let mut opts = parse(args).unwrap();
+        opts.inputs = vec![missing.clone()];
+        opts.output = Some(scratch.path().join("dict"));
+        let err = train_dictionary(&opts)
+            .expect_err("the tuning is refused")
+            .to_string();
+        assert!(err.contains(expected), "{args:?}: {err}");
+    }
+}
+
+/// `--train-cover` trains with the COVER trainer and writes a real dictionary;
+/// its reference-side tuning names knobs this trainer does not have, so a
+/// tuned request is refused rather than trained under other terms.
+#[test]
+fn cover_training_writes_a_dictionary_and_refuses_tuning() {
+    let scratch = Scratch::new("cover");
+    let corpus: Vec<u8> = (0..60_000u32)
+        .flat_map(|i| format!("record {} value {}\n", i % 500, (i * 7919) % 1000).into_bytes())
+        .collect();
+    let sample = scratch.file("samples.txt", &corpus);
+    let output = scratch.path().join("cover.dict");
+
+    let mut opts = parse(&["--train-cover", "-q", "--maxdict=8192", "s"]).unwrap();
+    opts.inputs = vec![sample.clone()];
+    opts.output = Some(output.clone());
+    train_dictionary(&opts).expect("COVER training succeeds");
+    let dictionary = fs::read(&output).unwrap();
+    assert!(dictionary.len() <= 8192);
+    structured_zstd::decoding::Dictionary::decode_dict(&dictionary)
+        .expect("the output is a finalized dictionary");
+
+    let mut tuned = parse(&["--train-cover=k=50", "-q", "-f", "s"]).unwrap();
+    tuned.inputs = vec![sample];
+    tuned.output = Some(output);
+    let err = train_dictionary(&tuned)
+        .expect_err("tuning the reference's COVER has no meaning here")
+        .to_string();
+    assert!(err.contains("takes no tuning"), "{err}");
+}
+
+/// `--patch-from REF` compresses against the reference as raw content with a
+/// window wide enough to reach all of it, unlocks the ultra levels, and takes
+/// the reference back on decompression. A patch of a file against a near
+/// copy of itself is far smaller than the file compressed alone.
+#[test]
+fn patch_from_compresses_against_the_reference() {
+    let scratch = Scratch::new("patch");
+    let old: Vec<u8> = (0..4000u32)
+        .flat_map(|i| format!("line {i}: the quick brown fox {}\n", i * 31 % 977).into_bytes())
+        .collect();
+    let mut new = old.clone();
+    new.extend_from_slice(b"an appended line that the reference lacks\n");
+    new[1000..1010].copy_from_slice(b"EDITEDHERE");
+    let reference = scratch.file("old.txt", &old);
+    let input = scratch.file("new.txt", &new);
+    let patch = scratch.path().join("new.patch");
+
+    let opts = parse(&["--patch-from", "old", "-22", "f"]).unwrap();
+    assert_eq!(opts.patch_from, Some(PathBuf::from("old")));
+    assert_eq!(opts.level, 22, "--patch-from unlocks the ultra levels");
+    assert!(parse(&["--patch-from=old", "-D", "dict", "f"]).is_err());
+
+    for level in [3, 19] {
+        let mut opts = parse(&["-q", "-f", "--patch-from", "r", "f"]).unwrap();
+        opts.level = level;
+        opts.patch_from = Some(reference.clone());
+        opts.inputs = vec![input.clone()];
+        opts.output = Some(patch.clone());
+        assert_eq!(run(opts).expect("patching runs"), 0, "level {level}");
+        let patch_bytes = fs::read(&patch).unwrap();
+        assert!(
+            patch_bytes.len() * 4 < frame_of(&new).len(),
+            "level {level}: a patch ({} bytes) is far smaller than the file compressed alone ({})",
+            patch_bytes.len(),
+            frame_of(&new).len()
+        );
+
+        let restored = scratch.path().join("restored.txt");
+        let mut opts = parse(&["-d", "-q", "-f", "--patch-from", "r", "f"]).unwrap();
+        opts.patch_from = Some(reference.clone());
+        opts.inputs = vec![patch.clone()];
+        opts.output = Some(restored.clone());
+        assert_eq!(run(opts).expect("applying the patch runs"), 0);
+        assert_eq!(fs::read(&restored).unwrap(), new, "level {level}");
+    }
+
+    // One input against one reference, and stdin only with a declared length.
+    let mut two = parse(&["-q", "--patch-from", "r", "a", "b"]).unwrap();
+    two.patch_from = Some(reference.clone());
+    two.inputs = vec![input.clone(), input.clone()];
+    assert!(run(two).is_err());
+    let mut stdin = parse(&["-q", "--patch-from", "r"]).unwrap();
+    stdin.patch_from = Some(reference);
+    let err = run(stdin)
+        .expect_err("stdin needs --stream-size")
+        .to_string();
+    assert!(err.contains("--stream-size"), "{err}");
+}
+
+/// A named file is compressed at its own size whatever `--stream-size` says,
+/// so its patch window is sized from that too: a declared size far above it
+/// must not have the patch refused as too wide to decode, and one far below it
+/// must not leave the reference out of reach. Only stdin, which has no size of
+/// its own, takes the declared one.
+#[test]
+fn a_named_file_sizes_its_patch_window_from_the_file() {
+    let scratch = Scratch::new("patch-size");
+    let old: Vec<u8> = (0..4000u32)
+        .flat_map(|i| format!("line {i}: the quick brown fox {}\n", i * 31 % 977).into_bytes())
+        .collect();
+    let mut new = old.clone();
+    new[1000..1010].copy_from_slice(b"EDITEDHERE");
+    let reference = scratch.file("old.txt", &old);
+    let input = scratch.file("new.txt", &new);
+    let patch = scratch.path().join("new.patch");
+
+    for declared in [1u64 << 30, 16] {
+        let mut opts = parse(&["-q", "-f", "--patch-from", "r", "f"]).unwrap();
+        opts.pledged_size = Some(declared);
+        opts.patch_from = Some(reference.clone());
+        opts.inputs = vec![input.clone()];
+        opts.output = Some(patch.clone());
+        assert_eq!(
+            run(opts).expect("patching runs"),
+            0,
+            "--stream-size {declared}"
+        );
+        let patch_bytes = fs::read(&patch).unwrap();
+        assert!(
+            patch_bytes.len() * 4 < frame_of(&new).len(),
+            "--stream-size {declared}: a patch ({} bytes) reaches the reference",
+            patch_bytes.len()
+        );
+
+        let restored = scratch.path().join("restored.txt");
+        let mut opts = parse(&["-d", "-q", "-f", "--patch-from", "r", "f"]).unwrap();
+        opts.patch_from = Some(reference.clone());
+        opts.inputs = vec![patch.clone()];
+        opts.output = Some(restored.clone());
+        assert_eq!(run(opts).expect("applying the patch runs"), 0);
+        assert_eq!(
+            fs::read(&restored).unwrap(),
+            new,
+            "--stream-size {declared}"
+        );
+    }
+}
+
+/// The patch window covers the input (`highbit(size) + 1`), is never below the
+/// smallest window the format allows, and stops where the decoder would refuse
+/// the frame.
+#[test]
+fn the_patch_window_covers_the_input_within_what_decodes() {
+    assert_eq!(patch_window_log(0).unwrap(), 10);
+    assert_eq!(patch_window_log(1).unwrap(), 10);
+    assert_eq!(patch_window_log(2000).unwrap(), 11);
+    assert_eq!(patch_window_log(1 << 20).unwrap(), 21);
+    assert_eq!(patch_window_log((1 << 27) - 1).unwrap(), 27);
+    assert!(patch_window_log(1 << 27).is_err());
+}
+
+/// `-b` prints its result in the reference command's layout, at the default
+/// level and under `-q`, with the file name cut to its last 17 characters.
+#[test]
+fn benchmark_lines_follow_the_reference_layout() {
+    let result = BenchResult {
+        level: 3,
+        input: 7692,
+        output: 255,
+        compress_mb_s: 123.456,
+        decompress_mb_s: 1234.5,
+    };
+    assert_eq!(
+        result.line("a.txt"),
+        " 3#a.txt            :      7692 ->       255 (x30.16),  123.5 MB/s, 1234.5 MB/s"
+    );
+    assert_eq!(
+        result.quiet_line("a.txt"),
+        "-3          255 (30.165) 123.46 MB/s 1234.5 MB/s  a.txt"
+    );
+    let slow = BenchResult {
+        compress_mb_s: 1.5,
+        output: 7000,
+        ..result
+    };
+    assert!(slow.line("a.txt").contains("(x1.099),   1.50 MB/s"));
+    assert_eq!(bench_display_name("dir/a.txt"), "a.txt");
+    assert_eq!(
+        bench_display_name("a-very-long-file-name.txt"),
+        "ong-file-name.txt",
+        "the last 17 characters"
+    );
+    assert_eq!(bench_display_name(" 3 files"), " 3 files");
 }

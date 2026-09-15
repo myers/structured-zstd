@@ -1866,6 +1866,7 @@ fn dictionary_frame_takes_the_cdict_strategy_across_backend_families() {
         CompressionLevel::Level(13),
         Some(4096),
         crate::encoding::DictionarySizes::raw_content(300 * 1024),
+        &Default::default(),
     );
     assert_eq!(params.strategy_tag, StrategyTag::Btlazy2);
     assert_eq!(params.backend(), BackendTag::Row);
@@ -1875,6 +1876,7 @@ fn dictionary_frame_takes_the_cdict_strategy_across_backend_families() {
         CompressionLevel::Level(2),
         Some(100 * 1024),
         crate::encoding::DictionarySizes::raw_content(4096),
+        &Default::default(),
     );
     assert_eq!(params.strategy_tag, StrategyTag::Fast);
     assert_eq!(params.backend(), BackendTag::Simple);
@@ -1899,7 +1901,7 @@ fn driver_dfast_dictionary_tables_take_the_cdict_geometry() {
     driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
     driver.reset(CompressionLevel::Level(3));
     driver.prime_with_dictionary(&dict, [1, 4, 8]);
-    let cd = crate::encoding::cparams::get_cdict_cparams(3, dict.len());
+    let cd = crate::encoding::cparams::get_cdict_cparams(3, dict.len(), &Default::default());
     let live = driver.dfast_matcher().live_table_bits();
     let built = driver
         .dfast_matcher()
@@ -1930,7 +1932,8 @@ fn driver_fast_dictionary_table_takes_the_cdict_hash_log() {
     driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
     driver.reset(CompressionLevel::Level(1));
     driver.prime_with_dictionary(&dict, [1, 4, 8]);
-    let expected = crate::encoding::cparams::get_cdict_cparams(1, dict.len()).hash_log;
+    let expected =
+        crate::encoding::cparams::get_cdict_cparams(1, dict.len(), &Default::default()).hash_log;
     let built = driver
         .simple_mut()
         .built_dict_table_hash_log()
@@ -1960,7 +1963,9 @@ fn driver_fast_dictionary_table_follows_the_cdict_geometry_across_levels() {
         if !driver.dictionary_is_resident() {
             driver.prime_with_dictionary(&dict, [1, 4, 8]);
         }
-        let expected = crate::encoding::cparams::get_cdict_cparams(level, dict.len()).hash_log;
+        let expected =
+            crate::encoding::cparams::get_cdict_cparams(level, dict.len(), &Default::default())
+                .hash_log;
         let built = driver
             .simple_mut()
             .built_dict_table_hash_log()
@@ -1986,7 +1991,8 @@ fn driver_dfast_dictionary_tables_follow_the_cdict_geometry_across_levels() {
         if !driver.dictionary_is_resident() {
             driver.prime_with_dictionary(&dict, [1, 4, 8]);
         }
-        let cd = crate::encoding::cparams::get_cdict_cparams(level, dict.len());
+        let cd =
+            crate::encoding::cparams::get_cdict_cparams(level, dict.len(), &Default::default());
         let built = driver
             .dfast_matcher()
             .dict_table_bits()
@@ -1999,16 +2005,14 @@ fn driver_dfast_dictionary_tables_follow_the_cdict_geometry_across_levels() {
     }
 }
 
-/// Regression: a dictionary frame takes its finder geometry from the CDict
-/// (upstream `ZSTD_resetCCtx_byAttachingCDict`: "cdict overrides"), so
-/// public `search_log` / `min_match` overrides must not reshape the live
-/// search away from the tables the dictionary was indexed with; only the
-/// window override survives. A 20 KiB dictionary on a 16 KiB source is
-/// attached with the row finder at the CDict's `rowLog` 4 and key width 4;
-/// an override to 6 / 6 would probe rows of another width with another key
-/// and lose every dictionary match.
+/// A dictionary frame searches with the finder geometry its dictionary was
+/// indexed with. Finder overrides are part of that geometry (the dictionary
+/// is prepared under them, as upstream `ZSTD_createCDict_advanced2` does), so
+/// `search_log` / `min_match` of 6 / 6 reshape the attached tables and the
+/// live search alike, and the dictionary is still found. A 20 KiB dictionary
+/// on a 16 KiB source is attached to the lazy backend's row finder.
 #[test]
-fn driver_dictionary_frame_ignores_finder_overrides() {
+fn driver_dictionary_frame_indexes_the_dictionary_with_finder_overrides() {
     let ov = super::super::parameters::ParamOverrides {
         search_log: Some(6),
         min_match: Some(6),
@@ -2045,7 +2049,7 @@ fn driver_dictionary_frame_ignores_finder_overrides() {
     });
     assert!(
         dict_matches >= 2,
-        "the attached dictionary must be found through the CDict geometry (got {dict_matches})"
+        "the attached dictionary must be found through the geometry it was indexed with (got {dict_matches})"
     );
 }
 
@@ -2202,12 +2206,13 @@ fn driver_dfast_attach_table_is_dropped_when_the_next_frame_copies() {
     assert!(driver.dfast_matcher().dict_table_bits().is_none());
 }
 
-/// Regression: the "cdict overrides" rule holds for every dictionary
-/// backend, not only the lazy band: a 4 KiB CDict resolves L2 to the fast
-/// strategy (Simple backend) and a `BtUltra2` strategy override must not
-/// re-route the dictionary frame onto the optimal backend.
+/// A dictionary loaded under explicit parameters is prepared with them
+/// (upstream `ZSTD_createCDict_advanced2` builds the CDict from
+/// `ZSTD_getCParamsFromCCtxParams`, overrides included), so the frame runs the
+/// strategy asked for: a 4 KiB CDict resolves L2 to the fast strategy, and a
+/// `Btultra2` override moves the frame onto the optimal backend.
 #[test]
-fn driver_dictionary_frame_ignores_a_strategy_override_on_a_fast_cdict() {
+fn driver_dictionary_frame_runs_a_strategy_override() {
     use super::super::strategy::BackendTag;
     let ov = super::super::parameters::ParamOverrides {
         strategy: Some(crate::encoding::Strategy::Btultra2),
@@ -2218,7 +2223,11 @@ fn driver_dictionary_frame_ignores_a_strategy_override_on_a_fast_cdict() {
     driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(4096));
     driver.set_param_overrides(Some(ov));
     driver.reset(CompressionLevel::Level(2));
-    assert_eq!(driver.active_backend(), BackendTag::Simple);
+    assert_eq!(driver.active_backend(), BackendTag::HashChain);
+    assert_eq!(
+        driver.strategy_tag,
+        super::super::strategy::StrategyTag::BtUltra2
+    );
 }
 
 #[test]
@@ -2932,6 +2941,123 @@ fn primed_snapshot_not_restored_across_ldm_config_change() {
         driver.restore_primed_dictionary(CompressionLevel::Level(19)),
         "primed snapshot not restored under identical LDM config",
     );
+}
+
+/// btultra2 parses a frame's first block twice and hides the first pass from
+/// the second by re-encoding the stored positions. A reused matcher keeps the
+/// previous frame's entries below the floor, and the re-encoding has to leave
+/// them there too: an entry that decodes into the window names a position
+/// whose bytes hash to the entry's own bucket, never a stale one moved onto
+/// unrelated bytes.
+#[test]
+fn a_btultra2_second_pass_sees_no_entry_from_before_it() {
+    use crate::encoding::match_table::storage::MatchTable;
+
+    let mut state = 0x2545_F491u32;
+    let mut noise = |len: usize| -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                b'a' + ((state >> 24) % 16) as u8
+            })
+            .collect()
+    };
+    let mut driver = MatchGeneratorDriver::new(128 * 1024, 1);
+    for (frame, payload) in [noise(50_000), noise(60_000), noise(40_000)]
+        .iter()
+        .enumerate()
+    {
+        driver.reset(CompressionLevel::Level(22));
+        let mut space = driver.get_next_space();
+        space.clear();
+        space.extend_from_slice(payload);
+        driver.commit_space(space);
+        driver.start_matching(|_| {});
+
+        let table = &driver.hc_matcher().table;
+        let live = table.live_history();
+        let floor = table.history_abs_start;
+        let mut misplaced = 0usize;
+        for (bucket, &stored) in table.hash_table().iter().enumerate() {
+            let Some(abs) = MatchTable::stored_abs_position_fast(
+                stored,
+                table.position_base,
+                table.index_shift,
+            ) else {
+                continue;
+            };
+            if abs < floor {
+                continue;
+            }
+            let hashed =
+                MatchTable::hash_position_at(live, abs - floor, table.hash_log, table.search_mls);
+            misplaced += usize::from(hashed != bucket);
+        }
+        assert_eq!(
+            misplaced, 0,
+            "frame {frame}: entries naming the wrong bytes"
+        );
+    }
+}
+
+/// On a 32-bit build a long reused stream reaches a floor near half the
+/// address space while the offset the btultra2 seed pass leaves behind
+/// approaches `u32::MAX`, so neither the floor plus a stored index nor an
+/// absolute position plus the offset fits the word. Every conversion between
+/// the two, and the seed pass that forms the next offset, has to go through
+/// the distance from the floor. The table is put into that state directly and
+/// the frame must parse exactly as it does from the origin: an overflow panics
+/// in debug, and a wrapped sum reads as a spurious rebase or a lost candidate.
+#[test]
+fn a_btultra2_seed_pass_near_the_top_of_the_address_space_parses_like_a_fresh_one() {
+    let mut state = 0x6C07_8965u32;
+    let half: Vec<u8> = (0..20_000)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            b'a' + ((state >> 24) % 16) as u8
+        })
+        .collect();
+    let payload = [half.as_slice(), half.as_slice()].concat();
+
+    let parse = |floor: Option<(usize, usize)>| {
+        let mut driver = MatchGeneratorDriver::new(128 * 1024, 1);
+        driver.reset(CompressionLevel::Level(22));
+        if let Some((abs_start, index_shift)) = floor {
+            let table = &mut driver.hc_matcher_mut().table;
+            table.history_abs_start = abs_start;
+            table.position_base = abs_start;
+            table.index_shift = index_shift;
+            table.next_to_update3 = abs_start;
+            table.skip_insert_until_abs = abs_start;
+        }
+        let mut space = driver.get_next_space();
+        space.clear();
+        space.extend_from_slice(&payload);
+        driver.commit_space(space);
+        let mut sequences = Vec::new();
+        driver.start_matching(|seq| match seq {
+            Sequence::Literals { literals } => sequences.push((literals.len(), 0, 0)),
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => sequences.push((literals.len(), offset, match_len)),
+        });
+        sequences
+    };
+
+    // Past `usize::MAX - u32::MAX` on any word size, with room left for the
+    // window and the block, so the block's end plus the offset does not fit
+    // while every relative position still does.
+    let abs_start = usize::MAX - (1 << 28);
+    let fresh = parse(None);
+    for (floor, index_shift) in [(1 << 20, 1 << 31), (abs_start, 0), (abs_start, 1 << 31)] {
+        assert_eq!(
+            parse(Some((floor, index_shift))),
+            fresh,
+            "floor {floor:#x}, shift {index_shift:#x}"
+        );
+    }
 }
 
 #[test]

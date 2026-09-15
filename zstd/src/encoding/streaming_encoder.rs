@@ -1,6 +1,8 @@
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::borrow::BorrowMut;
+use core::marker::PhantomData;
 use core::mem;
 
 use crate::common::MAX_BLOCK_SIZE;
@@ -12,8 +14,8 @@ use twox_hash::XxHash64;
 use crate::encoding::levels::compress_block_encoded;
 use crate::encoding::{
     CompressionLevel, EncoderDictionary, MatchGeneratorDriver, Matcher, block_header::BlockHeader,
-    frame_compressor::CachedDictionaryEntropy, frame_compressor::CompressState,
-    frame_compressor::FseTables, frame_compressor::PreviousFseTable, frame_header::FrameHeader,
+    frame_compressor::CompressState, frame_compressor::FrameTuning, frame_compressor::FseTables,
+    frame_compressor::PreviousFseTable, frame_header::FrameHeader,
 };
 use crate::io::{Error, ErrorKind, Write};
 
@@ -22,8 +24,59 @@ use crate::io::{Error, ErrorKind, Write};
 /// Data can be provided with multiple `write()` calls. Full blocks are compressed
 /// automatically, `flush()` emits the currently buffered partial block as non-last,
 /// and `finish()` closes the frame and returns the wrapped writer.
-pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
+///
+/// One encoder writes one frame into the drain it owns, through a
+/// [`CompressionContext`] it owns ([`new`](StreamingEncoder::new)) or borrows
+/// ([`with_context`](Self::with_context)). Borrowing is how frame after frame
+/// is compressed with the same settings, dictionary and match-finder
+/// allocations: the context outlives each encoder and is ready for the next
+/// frame once [`finish`](Self::finish) returns.
+pub struct StreamingEncoder<
+    W: Write,
+    M: Matcher = MatchGeneratorDriver,
+    C: BorrowMut<CompressionContext<M>> = CompressionContext<M>,
+> {
     drain: Option<W>,
+    context: C,
+    matcher: PhantomData<M>,
+}
+
+/// A reusable streaming compression context: the settings, the attached
+/// dictionary, the match finder and its buffers, kept from one frame to the
+/// next, with the output handed in on each call rather than owned. The
+/// counterpart of upstream zstd's `ZSTD_CCtx` driven by `ZSTD_compressStream2`.
+///
+/// Settings apply from the next frame on and must be made before its first
+/// [`write`](Self::write); [`finish_frame`](Self::finish_frame) closes the
+/// frame and readies the context for another. A pledged size belongs to one
+/// frame; every other setting, the dictionary included, stays until replaced.
+/// A frame that fails leaves the context failed: every later call reports
+/// that failure, and a new context is needed.
+///
+/// Reusing a context produces the same frames as a fresh
+/// [`StreamingEncoder`] per frame, without rebuilding the match finder's
+/// tables or re-attaching the dictionary for each of them.
+///
+/// # Examples
+/// ```
+/// use structured_zstd::encoding::{CompressionContext, CompressionLevel};
+///
+/// let mut context = CompressionContext::new(CompressionLevel::Default);
+/// let mut frames = Vec::new();
+/// for payload in [&b"first frame"[..], b"second frame"] {
+///     let mut frame = Vec::new();
+///     context.set_pledged_content_size(payload.len() as u64).unwrap();
+///     context.write(&mut frame, payload).unwrap();
+///     context.finish_frame(&mut frame).unwrap();
+///     frames.push(frame);
+/// }
+/// use std::io::Read;
+/// let mut decoder = structured_zstd::decoding::StreamingDecoder::new(&frames[1][..]).unwrap();
+/// let mut decoded = Vec::new();
+/// decoder.read_to_end(&mut decoded).unwrap();
+/// assert_eq!(decoded, b"second frame");
+/// ```
+pub struct CompressionContext<M: Matcher = MatchGeneratorDriver> {
     compression_level: CompressionLevel,
     state: CompressState<M>,
     pending: Vec<u8>,
@@ -36,12 +89,14 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     /// semantics; see `FrameCompressor::set_target_block_size`). `None` =
     /// the format's 128 KiB ceiling.
     target_block_size: Option<u32>,
+    /// The pledged size of the frame in progress; cleared when it ends.
     pledged_content_size: Option<u64>,
     /// Advisory source-size hint from [`set_source_size_hint`](Self::set_source_size_hint).
     /// Unlike `pledged_content_size` it carries no end-of-frame enforcement, but
     /// it still feeds the small-input gates (matcher sizing AND the Fast HUF
     /// fast-path gate) so `set_source_size_hint(small)` reduces work the same way
     /// a pledge does. The HUF gate reads `pledged_content_size.or(source_size_hint)`.
+    /// A parameter like upstream `ZSTD_c_srcSizeHint`, so it outlives a frame.
     source_size_hint: Option<u64>,
     /// Whether a pledged size is written into the header's
     /// `Frame_Content_Size` field (upstream `ZSTD_c_contentSizeFlag`).
@@ -54,17 +109,7 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     /// bytes produced so far in this frame; the block pre-splitter only cuts
     /// full blocks once the frame has saved enough.
     savings: i64,
-    /// Effective strategy tag (and lazy depth) when a public-parameter
-    /// [`Strategy`](crate::encoding::Strategy) override (#27) is active, mirroring
-    /// [`FrameCompressor`](crate::encoding::FrameCompressor)'s field. `Some`
-    /// survives frame start so the literal-compression gates and the block
-    /// splitter run the same strategy the matcher does; `None` keeps the
-    /// level-derived tag.
-    strategy_override: Option<(crate::encoding::strategy::StrategyTag, u8)>,
-    /// Public `target_length` override (#27), kept so the raw-literals gate
-    /// resolved at frame start reads the value the matcher runs (dropped on a
-    /// dictionary frame, where the CDict's targetLength applies).
-    target_length_override: Option<u32>,
+    tuning: FrameTuning,
     /// `ZSTD_f_zstd1_magicless` — omit the 4-byte magic number prefix.
     /// Default false. See [`Self::set_magicless`].
     magicless: bool,
@@ -74,8 +119,9 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     /// the `hash` feature, so without `hash` no checksum is emitted
     /// regardless. See [`Self::set_content_checksum`].
     content_checksum: bool,
-    /// Dictionary applied to the frame (upstream zstd `ZSTD_CCtx_loadDictionary` on a
-    /// streaming context). `None` = no dictionary. Set before the first write.
+    /// Dictionary applied to each frame (upstream zstd `ZSTD_CCtx_loadDictionary`
+    /// on a streaming context), with the entropy tables it seeds. `None` = no
+    /// dictionary. Set before a frame's first write.
     dictionary: Option<EncoderDictionary>,
     /// Whether the frame header records the attached dictionary's ID
     /// (upstream `ZSTD_c_dictIDFlag`). Default `true`. Raw-content
@@ -83,10 +129,6 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     /// non-zero ID that must not reach the wire, so their attach path
     /// turns this off. See [`Self::set_dictionary_id_flag`].
     dictionary_id_flag: bool,
-    /// Encoder entropy tables (literals Huffman + LL/ML/OF FSE "previous"
-    /// tables) the dictionary seeds into the first block, derived once when the
-    /// dictionary is attached so each frame start is a cheap clone.
-    dictionary_entropy_cache: Option<CachedDictionaryEntropy>,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
 }
@@ -97,9 +139,210 @@ impl<W: Write> StreamingEncoder<W, MatchGeneratorDriver> {
     /// The encoder writes compressed bytes into `drain` and applies `compression_level`
     /// to all subsequently written blocks.
     pub fn new(drain: W, compression_level: CompressionLevel) -> Self {
+        Self::with_context(drain, CompressionContext::new(compression_level))
+    }
+}
+
+impl<W: Write, C: BorrowMut<CompressionContext>> StreamingEncoder<W, MatchGeneratorDriver, C> {
+    /// Configure fine-grained compression parameters; see
+    /// [`CompressionContext::set_parameters`]. Must be called before the first
+    /// [`write`](Write::write).
+    pub fn set_parameters(
+        &mut self,
+        params: &crate::encoding::CompressionParameters,
+    ) -> Result<(), Error> {
+        self.context.borrow_mut().set_parameters(params)
+    }
+}
+
+impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
+    /// Creates a streaming encoder with an explicitly provided matcher implementation.
+    ///
+    /// This constructor is primarily intended for tests and advanced callers that need
+    /// custom match-window behavior.
+    pub fn new_with_matcher(matcher: M, drain: W, compression_level: CompressionLevel) -> Self {
+        Self::with_context(
+            drain,
+            CompressionContext::new_with_matcher(matcher, compression_level),
+        )
+    }
+}
+
+impl<W: Write, M: Matcher, C: BorrowMut<CompressionContext<M>>> StreamingEncoder<W, M, C> {
+    /// Write one frame into `drain` through `context`: owned, or borrowed from
+    /// a caller that keeps it for the next frame with every setting, the
+    /// dictionary and the allocations it has.
+    ///
+    /// # Examples
+    /// ```
+    /// use std::io::Write;
+    /// use structured_zstd::encoding::{CompressionContext, CompressionLevel, StreamingEncoder};
+    ///
+    /// let mut context = CompressionContext::new(CompressionLevel::Default);
+    /// for payload in [&b"first frame"[..], b"second frame"] {
+    ///     let mut encoder = StreamingEncoder::with_context(Vec::new(), &mut context);
+    ///     encoder.write_all(payload).unwrap();
+    ///     let frame = encoder.finish().unwrap();
+    ///     assert!(!frame.is_empty());
+    /// }
+    /// ```
+    pub fn with_context(drain: W, context: C) -> Self {
+        Self {
+            drain: Some(drain),
+            context,
+            matcher: PhantomData,
+        }
+    }
+
+    /// Bound each block's payload; see
+    /// [`CompressionContext::set_target_block_size`]. Must be set before the
+    /// first write.
+    pub fn set_target_block_size(&mut self, target: Option<u32>) -> Result<(), Error> {
+        self.context.borrow_mut().set_target_block_size(target)
+    }
+
+    /// Enable or disable the trailing XXH64 content checksum; see
+    /// [`CompressionContext::set_content_checksum`]. Must be called before the
+    /// first write.
+    pub fn set_content_checksum(&mut self, emit: bool) -> Result<(), Error> {
+        self.context.borrow_mut().set_content_checksum(emit)
+    }
+
+    /// Enable or disable the magicless frame format; see
+    /// [`CompressionContext::set_magicless`]. Must be called before the first
+    /// write.
+    pub fn set_magicless(&mut self, magicless: bool) -> Result<(), Error> {
+        self.context.borrow_mut().set_magicless(magicless)
+    }
+
+    /// Pledge the total uncompressed content size of the frame; see
+    /// [`CompressionContext::set_pledged_content_size`]. Must be called before
+    /// the first write.
+    pub fn set_pledged_content_size(&mut self, size: u64) -> Result<(), Error> {
+        self.context.borrow_mut().set_pledged_content_size(size)
+    }
+
+    /// Control whether a pledged size reaches the header; see
+    /// [`CompressionContext::set_content_size_flag`]. Must be called before
+    /// the first write.
+    pub fn set_content_size_flag(&mut self, emit: bool) -> Result<(), Error> {
+        self.context.borrow_mut().set_content_size_flag(emit)
+    }
+
+    /// Provide an advisory size for the frame; see
+    /// [`CompressionContext::set_source_size_hint`]. Must be called before the
+    /// first write.
+    pub fn set_source_size_hint(&mut self, size: u64) -> Result<(), Error> {
+        self.context.borrow_mut().set_source_size_hint(size)
+    }
+
+    /// Attach a dictionary blob to the frame; see
+    /// [`CompressionContext::set_dictionary_from_bytes`]. Must be called before
+    /// the first write.
+    pub fn set_dictionary_from_bytes(&mut self, raw_dictionary: &[u8]) -> Result<(), Error> {
+        self.context
+            .borrow_mut()
+            .set_dictionary_from_bytes(raw_dictionary)
+    }
+
+    /// Whether the header records the dictionary ID; see
+    /// [`CompressionContext::set_dictionary_id_flag`]. Must be set before the
+    /// first write.
+    pub fn set_dictionary_id_flag(&mut self, emit: bool) -> Result<(), Error> {
+        self.context.borrow_mut().set_dictionary_id_flag(emit)
+    }
+
+    /// Attach an already-parsed [`EncoderDictionary`] to the frame; see
+    /// [`CompressionContext::set_encoder_dictionary`]. Must be called before
+    /// the first write.
+    pub fn set_encoder_dictionary(&mut self, dict: EncoderDictionary) -> Result<(), Error> {
+        self.context.borrow_mut().set_encoder_dictionary(dict)
+    }
+
+    /// Returns an immutable reference to the wrapped output drain.
+    ///
+    /// The drain remains available for the encoder lifetime; [`finish`](Self::finish)
+    /// consumes the encoder and returns ownership of the drain.
+    pub fn get_ref(&self) -> &W {
+        self.drain
+            .as_ref()
+            .expect("streaming encoder drain is present until finish consumes self")
+    }
+
+    /// Total heap bytes this encoder's allocations hold, excluding the inline
+    /// struct and the drain `W` (whose footprint the owner can measure through
+    /// [`get_ref`](Self::get_ref)); see [`CompressionContext::heap_size`].
+    pub fn heap_size(&self) -> usize {
+        self.context.borrow().heap_size()
+    }
+
+    /// Returns a mutable reference to the wrapped output drain.
+    ///
+    /// It is inadvisable to directly write to the underlying writer, as doing
+    /// so would corrupt the zstd frame being assembled by the encoder.
+    ///
+    /// The drain remains available for the encoder lifetime; [`finish`](Self::finish)
+    /// consumes the encoder and returns ownership of the drain.
+    pub fn get_mut(&mut self) -> &mut W {
+        self.drain
+            .as_mut()
+            .expect("streaming encoder drain is present until finish consumes self")
+    }
+
+    /// Finalizes the current zstd frame and returns the wrapped output drain.
+    ///
+    /// If no payload was written yet, this still emits a valid empty frame.
+    /// Calling this method consumes the encoder; a borrowed context is then
+    /// ready for the next frame, also when this fails: the frame goes with the
+    /// drain (see [`CompressionContext::abandon_frame`]).
+    pub fn finish(mut self) -> Result<W, Error> {
+        let mut drain = self
+            .drain
+            .take()
+            .expect("streaming encoder drain must be present when finishing");
+        self.context.borrow_mut().finish_frame(&mut drain)?;
+        Ok(drain)
+    }
+
+    fn drain_mut(&mut self) -> (&mut W, &mut CompressionContext<M>) {
+        let drain = self
+            .drain
+            .as_mut()
+            .expect("streaming encoder drain is present until finish consumes self");
+        (drain, self.context.borrow_mut())
+    }
+}
+
+/// The frame belongs to the drain this encoder writes into: an encoder that
+/// goes without finishing it (dropped mid-frame, or a `finish` that failed)
+/// takes it along, so a borrowed context starts the next encoder's frame
+/// afresh instead of continuing this one into another drain.
+impl<W: Write, M: Matcher, C: BorrowMut<CompressionContext<M>>> Drop for StreamingEncoder<W, M, C> {
+    fn drop(&mut self) {
+        self.context.borrow_mut().abandon_frame();
+    }
+}
+
+impl<W: Write, M: Matcher, C: BorrowMut<CompressionContext<M>>> Write
+    for StreamingEncoder<W, M, C>
+{
+    fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
+        let (drain, context) = self.drain_mut();
+        context.write(drain, buf)
+    }
+
+    fn flush(&mut self) -> Result<(), Error> {
+        let (drain, context) = self.drain_mut();
+        context.flush(drain)
+    }
+}
+
+impl CompressionContext<MatchGeneratorDriver> {
+    /// Creates a context backed by the default match generator, compressing
+    /// at `compression_level`.
+    pub fn new(compression_level: CompressionLevel) -> Self {
         Self::new_with_matcher(
             MatchGeneratorDriver::new(MAX_BLOCK_SIZE as usize, 1),
-            drain,
             compression_level,
         )
     }
@@ -107,27 +350,21 @@ impl<W: Write> StreamingEncoder<W, MatchGeneratorDriver> {
     /// Configure fine-grained compression parameters (#27): resets the level to
     /// the parameters' level and installs the per-knob overrides (window / hash
     /// / chain / search logs, strategy, long-distance matching) applied at the
-    /// next frame. Mirrors [`FrameCompressor::set_parameters`]. Must be called
-    /// before the first [`write`](Write::write). Only the built-in
-    /// `MatchGeneratorDriver` exposes the override knobs, so this lives on the
-    /// default-matcher impl.
+    /// next frame. Mirrors [`FrameCompressor::set_parameters`](crate::encoding::FrameCompressor::set_parameters).
+    /// Must be called before the frame's first [`write`](Self::write). Only the
+    /// built-in `MatchGeneratorDriver` exposes the override knobs, so this
+    /// lives on the default-matcher impl.
     pub fn set_parameters(
         &mut self,
         params: &crate::encoding::CompressionParameters,
     ) -> Result<(), Error> {
-        self.ensure_open()?;
-        if self.frame_started {
-            return Err(invalid_input_error(
-                "compression parameters must be set before the first write",
-            ));
-        }
+        self.ensure_settable("compression parameters must be set before the first write")?;
         self.compression_level = params.level();
         let overrides = params.overrides();
         // Persist the strategy override so `ensure_frame_started`'s level-based
         // resync does not discard it (matching `FrameCompressor::set_parameters`).
-        self.strategy_override = overrides.strategy.map(|s| (s.tag(), s.lazy_depth()));
-        self.target_length_override = overrides.target_length;
-        self.state.strategy_tag = self.strategy_override.map_or_else(
+        self.tuning = FrameTuning::from_overrides(&overrides);
+        self.state.strategy_tag = self.tuning.strategy.map_or_else(
             || {
                 crate::encoding::strategy::StrategyTag::for_compression_level(
                     self.compression_level,
@@ -144,14 +381,13 @@ impl<W: Write> StreamingEncoder<W, MatchGeneratorDriver> {
     }
 }
 
-impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
-    /// Creates a streaming encoder with an explicitly provided matcher implementation.
+impl<M: Matcher> CompressionContext<M> {
+    /// Creates a context with an explicitly provided matcher implementation.
     ///
     /// This constructor is primarily intended for tests and advanced callers that need
     /// custom match-window behavior.
-    pub fn new_with_matcher(matcher: M, drain: W, compression_level: CompressionLevel) -> Self {
+    pub fn new_with_matcher(matcher: M, compression_level: CompressionLevel) -> Self {
         Self {
-            drain: Some(drain),
             compression_level,
             state: CompressState {
                 matcher,
@@ -187,16 +423,38 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             content_size_flag: true,
             bytes_consumed: 0,
             savings: 0,
-            strategy_override: None,
-            target_length_override: None,
+            tuning: FrameTuning::default(),
             magicless: false,
             content_checksum: false,
             dictionary: None,
             dictionary_id_flag: true,
-            dictionary_entropy_cache: None,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
         }
+    }
+
+    /// Compress the next frames at `level`, with the level's own tuning: any
+    /// parameter override installed by
+    /// [`set_parameters`](CompressionContext::set_parameters) is dropped, as
+    /// [`FrameCompressor::set_compression_level`](crate::encoding::FrameCompressor::set_compression_level)
+    /// drops it. Must be called before the frame's first [`write`](Self::write).
+    ///
+    /// # Examples
+    /// ```
+    /// use structured_zstd::encoding::{CompressionContext, CompressionLevel};
+    ///
+    /// let mut context = CompressionContext::new(CompressionLevel::Fastest);
+    /// context.set_compression_level(CompressionLevel::Better).unwrap();
+    /// let mut frame = Vec::new();
+    /// context.write(&mut frame, b"compressed at the new level").unwrap();
+    /// context.finish_frame(&mut frame).unwrap();
+    /// ```
+    pub fn set_compression_level(&mut self, level: CompressionLevel) -> Result<(), Error> {
+        self.ensure_settable("the compression level must be set before the first write")?;
+        self.compression_level = level;
+        self.tuning = FrameTuning::default();
+        self.state.matcher.clear_param_overrides();
+        Ok(())
     }
 
     /// Set an upper bound on each physical block's payload (semantics of
@@ -206,14 +464,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     /// not a cap on header-inclusive wire bytes. Clamped to
     /// `[MIN_TARGET_BLOCK_SIZE, MAX_BLOCK_SIZE]`; mirrors
     /// `FrameCompressor::set_target_block_size`. Must be set before the
-    /// first write.
+    /// frame's first write.
     pub fn set_target_block_size(&mut self, target: Option<u32>) -> Result<(), Error> {
-        self.ensure_open()?;
-        if self.frame_started {
-            return Err(invalid_input_error(
-                "the block-size target must be set before the first write",
-            ));
-        }
+        self.ensure_settable("the block-size target must be set before the first write")?;
         self.target_block_size = target.map(|t| {
             t.clamp(
                 crate::common::MIN_TARGET_BLOCK_SIZE,
@@ -226,60 +479,45 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     /// Enable or disable the trailing XXH64 content checksum
     /// (upstream `ZSTD_c_checksumFlag`). Default `false`, matching the
     /// upstream library default (`ZSTD_c_checksumFlag = 0`). Must be called
-    /// before the first [`write`](Write::write); once the frame header is
-    /// emitted the flag is fixed, so a late change returns an error rather
+    /// before the frame's first [`write`](Self::write); once the frame header
+    /// is emitted the flag is fixed, so a late change returns an error rather
     /// than producing a header/trailer mismatch. Without the `hash` feature
     /// no checksum is emitted regardless.
     pub fn set_content_checksum(&mut self, emit: bool) -> Result<(), Error> {
-        self.ensure_open()?;
-        if self.frame_started {
-            return Err(invalid_input_error(
-                "content checksum must be set before the first write",
-            ));
-        }
+        self.ensure_settable("content checksum must be set before the first write")?;
         self.content_checksum = emit;
         Ok(())
     }
 
     /// Enable or disable magicless frame format (`ZSTD_f_zstd1_magicless`).
     ///
-    /// When set to `true`, the frame header serialized by this encoder
-    /// omits the 4-byte magic number prefix. Must be called BEFORE the
-    /// first [`write`](Write::write) call; calling it after the frame
-    /// header has already been emitted returns an error so the caller
-    /// can't be misled into thinking they produced a magicless stream.
+    /// When set to `true`, the frame header omits the 4-byte magic number
+    /// prefix. Must be called BEFORE the frame's first [`write`](Self::write)
+    /// call; calling it after the frame header has already been emitted
+    /// returns an error so the caller can't be misled into thinking they
+    /// produced a magicless stream.
     pub fn set_magicless(&mut self, magicless: bool) -> Result<(), Error> {
-        self.ensure_open()?;
-        if self.frame_started {
-            return Err(invalid_input_error(
-                "magicless format must be set before the first write",
-            ));
-        }
+        self.ensure_settable("magicless format must be set before the first write")?;
         self.magicless = magicless;
         Ok(())
     }
 
-    /// Pledge the total uncompressed content size for this frame.
+    /// Pledge the total uncompressed content size of the next frame.
     ///
     /// When set, the frame header will include a `Frame_Content_Size` field.
     /// This enables decoders to pre-allocate output buffers.
     /// The pledged size is also forwarded as a source-size hint to the
     /// matcher so small inputs can use smaller matching tables.
     ///
-    /// Must be called **before** the first [`write`](Write::write) call;
+    /// Must be called **before** the frame's first [`write`](Self::write);
     /// calling it after the frame header has already been emitted returns an
-    /// error.
+    /// error. The pledge ends with the frame.
     pub fn set_pledged_content_size(&mut self, size: u64) -> Result<(), Error> {
-        self.ensure_open()?;
-        if self.frame_started {
-            return Err(invalid_input_error(
-                "pledged content size must be set before the first write",
-            ));
-        }
+        self.ensure_settable("pledged content size must be set before the first write")?;
+        // The matcher is handed it as its size hint when the frame starts
+        // (`ensure_frame_started`), not here: a pledge that goes unused must
+        // not stay behind in the matcher for a later frame.
         self.pledged_content_size = Some(size);
-        // Also use pledged size as source-size hint so the matcher
-        // can select smaller tables for small inputs.
-        self.state.matcher.set_source_size_hint(size);
         Ok(())
     }
 
@@ -288,42 +526,32 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     /// default on). With the flag off the header omits the field, but a
     /// pledge set via [`set_pledged_content_size`](Self::set_pledged_content_size)
     /// is still enforced against the bytes actually written. Must be
-    /// called before the first [`write`](Write::write).
+    /// called before the frame's first [`write`](Self::write).
     pub fn set_content_size_flag(&mut self, emit: bool) -> Result<(), Error> {
-        self.ensure_open()?;
-        if self.frame_started {
-            return Err(invalid_input_error(
-                "content size flag must be set before the first write",
-            ));
-        }
+        self.ensure_settable("content size flag must be set before the first write")?;
         self.content_size_flag = emit;
         Ok(())
     }
 
-    /// Provide a hint about the total uncompressed size for the next frame.
+    /// Provide a hint about the total uncompressed size of each frame.
     ///
     /// Unlike [`set_pledged_content_size`](Self::set_pledged_content_size),
     /// this does **not** enforce that exactly `size` bytes are written; it
     /// may reduce matcher tables, advertised frame window, and block sizing
-    /// for small inputs. Must be called before the first
-    /// [`write`](Write::write).
+    /// for small inputs. A parameter, like upstream `ZSTD_c_srcSizeHint`: it
+    /// applies to every frame until replaced. Must be called before the
+    /// frame's first [`write`](Self::write).
     pub fn set_source_size_hint(&mut self, size: u64) -> Result<(), Error> {
-        self.ensure_open()?;
-        if self.frame_started {
-            return Err(invalid_input_error(
-                "source size hint must be set before the first write",
-            ));
-        }
-        self.state.matcher.set_source_size_hint(size);
-        // Feed the same hint to the Fast HUF fast-path gate (resolved in
-        // `set_parameters` / `ensure_frame_started` via
-        // `pledged_content_size.or(source_size_hint)`), so a small advisory size
-        // also lifts Fast streams off the expensive optimal-HUF search.
+        self.ensure_settable("source size hint must be set before the first write")?;
+        // Read at each frame start as `pledged_content_size.or(source_size_hint)`,
+        // by the matcher's sizing and the Fast HUF fast-path gate alike
+        // (`ensure_frame_started`), so a small advisory size also lifts Fast
+        // streams off the expensive optimal-HUF search.
         self.source_size_hint = Some(size);
         Ok(())
     }
 
-    /// Attach a dictionary blob to the frame (upstream zstd
+    /// Attach a dictionary blob to each frame (upstream zstd
     /// `ZSTD_CCtx_loadDictionary` on a streaming context, which loads in
     /// `ZSTD_dct_auto` mode): a blob prefixed with
     /// [`DICTIONARY_MAGIC`](crate::decoding::DICTIONARY_MAGIC) is a serialized
@@ -331,27 +559,17 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     /// match-finder and seeds the first block's entropy tables + repeat
     /// offsets; a serialized one's ID is written into the frame header, while
     /// raw content has none to write, so the decoder must be given the same
-    /// bytes explicitly. Must be called before the first
-    /// [`write`](Write::write); repeat offsets must be non-zero.
+    /// bytes explicitly. Must be called before the frame's first
+    /// [`write`](Self::write); repeat offsets must be non-zero.
     pub fn set_dictionary_from_bytes(&mut self, raw_dictionary: &[u8]) -> Result<(), Error> {
         if raw_dictionary.is_empty() {
             // An empty buffer is how the same upstream entry point is told
             // there is no dictionary: it clears and succeeds. Still refused
             // once the frame is open, like any other attach.
-            self.ensure_open()?;
-            if self.frame_started {
-                return Err(invalid_input_error(
-                    "dictionary must be attached before the first write",
-                ));
-            }
-            // The entropy tables were built at attach time and go with it:
-            // holding them past the clear keeps Huffman and FSE allocations
-            // the encoder can no longer reach, for as long as it lives, and
-            // reports them in `heap_size`. The primed match-finder snapshot
-            // needs no such call — priming happens at the first write, which
-            // is also the point after which this setter refuses to run, so
-            // there is never one to drop here.
-            self.dictionary_entropy_cache = None;
+            self.ensure_settable("dictionary must be attached before the first write")?;
+            // What the match finder kept of it across frames (its primed
+            // snapshot, the copy left resident) goes with it, entropy included.
+            self.state.matcher.invalidate_primed_dictionary();
             self.dictionary = None;
             return Ok(());
         }
@@ -360,61 +578,58 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         self.set_encoder_dictionary(dict)
     }
 
-    /// Whether the frame header records the dictionary ID when a dictionary
-    /// is attached (upstream `ZSTD_c_dictIDFlag` semantics; default `true`).
-    /// Mirrors [`FrameCompressor::set_dictionary_id_flag`]. Decoders can still
-    /// decode such frames by supplying the dictionary explicitly.
+    /// Whether the frame header records the attached dictionary's ID
+    /// (upstream `ZSTD_c_dictIDFlag` semantics; default `true`).
+    /// Mirrors [`FrameCompressor::set_dictionary_id_flag`](crate::encoding::FrameCompressor::set_dictionary_id_flag).
+    /// Decoders can still decode such frames by supplying the dictionary
+    /// explicitly.
     pub fn set_dictionary_id_flag(&mut self, emit: bool) -> Result<(), Error> {
-        self.ensure_open()?;
-        if self.frame_started {
-            return Err(invalid_input_error(
-                "dictionary ID flag must be set before the first write",
-            ));
-        }
+        self.ensure_settable("dictionary ID flag must be set before the first write")?;
         self.dictionary_id_flag = emit;
         Ok(())
     }
 
-    /// Attach an already-parsed [`EncoderDictionary`] to the frame. See
+    /// Attach an already-parsed [`EncoderDictionary`] to each frame. See
     /// [`set_dictionary_from_bytes`](Self::set_dictionary_from_bytes); must be
-    /// called before the first write.
+    /// called before the frame's first write. The entropy tables it seeds were
+    /// built when it was prepared, so attaching builds nothing.
     pub fn set_encoder_dictionary(&mut self, dict: EncoderDictionary) -> Result<(), Error> {
-        self.ensure_open()?;
-        if self.frame_started {
-            return Err(invalid_input_error(
-                "dictionary must be attached before the first write",
-            ));
-        }
+        self.ensure_settable("dictionary must be attached before the first write")?;
         // A zero id marks a raw-content dictionary, which carries no header to
         // hold one; the frame then records no dictionary ID and the decoder
         // must be given the same bytes explicitly.
-        let inner = &dict.inner;
-        if inner.offset_hist.contains(&0) {
+        if dict.inner.offset_hist.contains(&0) {
             return Err(invalid_input_error(
                 "dictionary carries a zero repeat offset",
             ));
         }
-        self.dictionary_entropy_cache = Some(CachedDictionaryEntropy::from_dictionary(inner));
+        // The match finder's primed snapshot and resident copy belong to the
+        // dictionary being replaced; the next frame primes the new one.
+        self.state.matcher.invalidate_primed_dictionary();
         self.dictionary = Some(dict);
         Ok(())
     }
 
-    /// Returns an immutable reference to the wrapped output drain.
+    /// The dictionary each frame is compressed with, if one is attached.
     ///
-    /// The drain remains available for the encoder lifetime; [`finish`](Self::finish)
-    /// consumes the encoder and returns ownership of the drain.
-    pub fn get_ref(&self) -> &W {
-        self.drain
-            .as_ref()
-            .expect("streaming encoder drain is present until finish consumes self")
+    /// # Examples
+    /// ```
+    /// use structured_zstd::encoding::{CompressionContext, CompressionLevel, EncoderDictionary};
+    ///
+    /// let dictionary = EncoderDictionary::from_serialized_or_raw_content(b"some shared history").unwrap();
+    /// let mut context = CompressionContext::new(CompressionLevel::Default);
+    /// assert!(context.dictionary().is_none());
+    /// context.set_encoder_dictionary(dictionary).unwrap();
+    /// assert!(context.dictionary().is_some());
+    /// ```
+    pub fn dictionary(&self) -> Option<&EncoderDictionary> {
+        self.dictionary.as_ref()
     }
 
-    /// Total heap bytes this encoder's allocations hold, excluding the
-    /// inline struct and the drain `W` (whose footprint the owner can
-    /// measure through [`get_ref`](Self::get_ref)): match-finder tables /
-    /// history / recycled buffers, retained Huffman tables, the staging
-    /// `pending` / `encoded_scratch` buffers, the retained dictionary
-    /// content, and the cached dictionary entropy tables. Mirrors
+    /// Total heap bytes this context's allocations hold, excluding the inline
+    /// struct: match-finder tables / history / recycled buffers, retained
+    /// Huffman tables, the staging `pending` / `encoded_scratch` buffers, the
+    /// retained dictionary content, and its entropy tables. Mirrors
     /// `FrameCompressor::heap_size` so a context can report its true
     /// footprint through `ZSTD_sizeof_CCtx`.
     pub fn heap_size(&self) -> usize {
@@ -438,37 +653,100 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         total += self
             .dictionary
             .as_ref()
-            .map_or(0, |d| d.inner.dict_content.capacity());
-        total += self
-            .dictionary_entropy_cache
-            .as_ref()
-            .map_or(0, CachedDictionaryEntropy::heap_size);
+            .map_or(0, EncoderDictionary::heap_size);
         total
     }
 
-    /// Returns a mutable reference to the wrapped output drain.
+    /// Compress `buf` into the frame in progress, starting one (and writing
+    /// its header to `drain`) if none is. Full blocks are compressed as they
+    /// fill and written to `drain`; the rest stays buffered for the next call,
+    /// [`flush`](Self::flush) or [`finish_frame`](Self::finish_frame).
     ///
-    /// It is inadvisable to directly write to the underlying writer, as doing
-    /// so would corrupt the zstd frame being assembled by the encoder.
-    ///
-    /// The drain remains available for the encoder lifetime; [`finish`](Self::finish)
-    /// consumes the encoder and returns ownership of the drain.
-    pub fn get_mut(&mut self) -> &mut W {
-        self.drain
-            .as_mut()
-            .expect("streaming encoder drain is present until finish consumes self")
+    /// Returns how much of `buf` was taken, which is all of it unless a pledge
+    /// set with [`set_pledged_content_size`](Self::set_pledged_content_size)
+    /// allows less.
+    pub fn write<D: Write + ?Sized>(&mut self, drain: &mut D, buf: &[u8]) -> Result<usize, Error> {
+        self.ensure_open()?;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        // Check pledge before emitting the frame header so that a misuse
+        // like set_pledged_content_size(0) + write(non_empty) doesn't leave
+        // a partially-written header in the drain.
+        if let Some(pledged) = self.pledged_content_size
+            && self.bytes_consumed >= pledged
+        {
+            return Err(invalid_input_error(
+                "write would exceed pledged content size",
+            ));
+        }
+
+        self.ensure_frame_started(drain)?;
+
+        // Enforce pledged upper bound: truncate the accepted slice to the
+        // remaining allowance so that partial-write semantics are honored
+        // (return Ok(n) with n < buf.len()) instead of failing the full call.
+        // The check above leaves at least one byte of it.
+        let buf = if let Some(pledged) = self.pledged_content_size {
+            debug_assert!(self.bytes_consumed < pledged);
+            let remaining_allowed = pledged - self.bytes_consumed;
+            let accepted = core::cmp::min(
+                buf.len(),
+                usize::try_from(remaining_allowed).unwrap_or(usize::MAX),
+            );
+            &buf[..accepted]
+        } else {
+            buf
+        };
+
+        let block_capacity = self.block_capacity();
+        if self.pending.capacity() == 0 {
+            self.pending = self.allocate_pending_space(block_capacity);
+        }
+        let mut remaining = buf;
+        let mut consumed = 0usize;
+
+        while !remaining.is_empty() {
+            // A block is emitted the moment it fills, below, and the
+            // capacity is fixed for the frame, so there is always room here.
+            debug_assert!(self.pending.len() < block_capacity);
+            let to_take = core::cmp::min(remaining.len(), block_capacity - self.pending.len());
+            self.pending.extend_from_slice(&remaining[..to_take]);
+            remaining = &remaining[to_take..];
+            consumed += to_take;
+
+            if self.emit_full_pending_block(drain, block_capacity).is_err() {
+                // The bytes this call took are reported; the failure, sticky
+                // on the context now, is what the next call returns.
+                break;
+            }
+        }
+        self.bytes_consumed += consumed as u64;
+        Ok(consumed)
     }
 
-    /// Finalizes the current zstd frame and returns the wrapped output drain.
-    ///
-    /// If no payload was written yet, this still emits a valid empty frame.
-    /// Calling this method consumes the encoder.
-    pub fn finish(mut self) -> Result<W, Error> {
+    /// Emit the buffered partial block as a non-last block and flush `drain`.
+    pub fn flush<D: Write + ?Sized>(&mut self, drain: &mut D) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.pending.is_empty() {
+            return drain.flush().map_err(|err| self.fail(err));
+        }
+        self.ensure_frame_started(drain)?;
+        self.emit_pending_block(drain, false)?;
+        drain.flush().map_err(|err| self.fail(err))
+    }
+
+    /// Close the frame in progress into `drain`: its last block, then its
+    /// checksum when enabled. A frame nothing was written to is still a valid
+    /// empty frame. The context is then ready for the next frame, with every
+    /// setting and the dictionary as they were and the pledge cleared.
+    pub fn finish_frame<D: Write + ?Sized>(&mut self, drain: &mut D) -> Result<(), Error> {
         self.ensure_open()?;
 
-        // Validate the pledge before finalizing the frame. If finish() is
-        // called before any writes, this also avoids emitting a header with
-        // an incorrect FCS into the drain on mismatch.
+        // Validate the pledge before finalizing the frame. If this is called
+        // before any writes, this also avoids emitting a header with an
+        // incorrect FCS into the drain on mismatch.
         if let Some(pledged) = self.pledged_content_size
             && self.bytes_consumed != pledged
         {
@@ -477,19 +755,14 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             ));
         }
 
-        self.ensure_frame_started()?;
+        self.ensure_frame_started(drain)?;
 
         if self.pending.is_empty() {
-            self.write_empty_last_block()
+            self.write_empty_last_block(drain)
                 .map_err(|err| self.fail(err))?;
         } else {
-            self.emit_pending_block(true)?;
+            self.emit_pending_block(drain, true)?;
         }
-
-        let mut drain = self
-            .drain
-            .take()
-            .expect("streaming encoder drain must be present when finishing");
 
         #[cfg(feature = "hash")]
         if self.content_checksum {
@@ -500,12 +773,56 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         }
 
         drain.flush().map_err(|err| self.fail(err))?;
-        Ok(drain)
+        self.abandon_frame();
+        Ok(())
+    }
+
+    /// Drop the frame in progress without closing it (upstream
+    /// `ZSTD_CCtx_reset(ZSTD_reset_session_only)`): its buffered input and its
+    /// pledge go, and the next [`write`](Self::write) starts a new frame. The
+    /// settings, the dictionary and every allocation stay. What the frame
+    /// already wrote to its drain stays there, an unfinished frame.
+    ///
+    /// This is the way on from a [`finish_frame`](Self::finish_frame) refused
+    /// for a pledge the frame did not meet, when the rest of the input is not
+    /// coming; writing it and finishing again completes the frame instead.
+    ///
+    /// # Examples
+    /// ```
+    /// use structured_zstd::encoding::{CompressionContext, CompressionLevel};
+    ///
+    /// let mut context = CompressionContext::new(CompressionLevel::Default);
+    /// let mut unfinished = Vec::new();
+    /// context.set_pledged_content_size(100).unwrap();
+    /// context.write(&mut unfinished, b"only part of it").unwrap();
+    /// assert!(context.finish_frame(&mut unfinished).is_err());
+    /// context.abandon_frame();
+    ///
+    /// let mut frame = Vec::new();
+    /// context.write(&mut frame, b"a frame of its own").unwrap();
+    /// context.finish_frame(&mut frame).unwrap();
+    /// ```
+    pub fn abandon_frame(&mut self) {
+        // What belongs to the frame goes with it; the settings, the dictionary
+        // and every allocation stay for the next one.
+        self.frame_started = false;
+        self.bytes_consumed = 0;
+        self.pledged_content_size = None;
+        self.pending.clear();
     }
 
     fn ensure_open(&self) -> Result<(), Error> {
         if self.errored {
             return Err(self.sticky_error());
+        }
+        Ok(())
+    }
+
+    /// Refuse a setting once the frame it would change is under way.
+    fn ensure_settable(&self, too_late: &str) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.frame_started {
+            return Err(invalid_input_error(too_late));
         }
         Ok(())
     }
@@ -529,13 +846,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         }
     }
 
-    fn drain_mut(&mut self) -> Result<&mut W, Error> {
-        self.drain
-            .as_mut()
-            .ok_or_else(|| other_error("streaming encoder has no active drain"))
-    }
-
-    fn ensure_frame_started(&mut self) -> Result<(), Error> {
+    fn ensure_frame_started<D: Write + ?Sized>(&mut self, drain: &mut D) -> Result<(), Error> {
         if self.frame_started {
             return Ok(());
         }
@@ -573,29 +884,57 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             self.state.matcher.set_source_size_hint(size);
         }
         self.state.matcher.reset(self.compression_level);
+        // Sync `state.strategy_tag` / `state.pre_split` to the strategy the
+        // matcher's reset resolved (size- and dictionary-adaptive; a public
+        // strategy override wins) so the literal-compression gates, the block
+        // pre-splitter and the dictionary load below agree with the parse.
+        // Mirrors `FrameCompressor::compress` and keeps both entry points
+        // byte-equivalent.
+        let hint = self.pledged_content_size.or(self.source_size_hint);
+        let params = crate::encoding::frame_compressor::resolve_frame_params(
+            self.compression_level,
+            hint,
+            self.dictionary.as_ref().filter(|_| use_dictionary_state),
+        );
+        crate::encoding::frame_compressor::sync_effective_strategy(
+            &mut self.state,
+            self.compression_level,
+            &params,
+            self.tuning.strategy,
+        );
+        self.state.huf_optimal_search =
+            crate::encoding::frame_compressor::huf_search_enabled(self.state.strategy_tag, hint);
+        self.state.literal_compression_disabled =
+            crate::encoding::frame_compressor::literal_compression_disabled(
+                self.state.strategy_tag,
+                self.compression_level,
+                crate::encoding::frame_compressor::gate_target_length(
+                    self.compression_level,
+                    &self.tuning,
+                    self.dictionary.as_ref().filter(|_| use_dictionary_state),
+                ),
+                self.tuning.literal_compression,
+            );
         // Seed the repeat-offset history from the dictionary (upstream zstd
-        // `ZSTD_compress_insertDictionary`), or the default rep codes otherwise.
-        self.state.offset_hist = if use_dictionary_state {
-            self.dictionary
-                .as_ref()
-                .map(|dict| dict.inner.offset_hist)
-                .unwrap_or([1, 4, 8])
-        } else {
-            [1, 4, 8]
-        };
-        // Prime the match-finder with the dictionary content + offsets.
-        // `dict` borrows `self.dictionary`; `self.state.matcher` is a disjoint
-        // field, so the immutable dict borrow and the mutable matcher borrow
-        // coexist (field-level borrow splitting) with no conflict.
+        // `ZSTD_compress_insertDictionary`), or the default rep codes
+        // otherwise, and load the dictionary into the match finder: primed,
+        // restored from a snapshot, or, on a reused context whose reset kept
+        // it resident, left in place with its offsets reapplied.
+        // `dict` borrows `self.dictionary`; `self.state` is a disjoint field.
+        self.state.offset_hist = [1, 4, 8];
         if use_dictionary_state && let Some(dict) = self.dictionary.as_ref() {
-            let offset_hist = dict.inner.offset_hist;
-            self.state
-                .matcher
-                .prime_with_dictionary(dict.inner.dict_content.as_slice(), offset_hist);
+            self.state.offset_hist = dict.inner.offset_hist;
+            crate::encoding::frame_compressor::load_frame_dictionary(
+                &mut self.state,
+                self.compression_level,
+                dict,
+                hint,
+            );
         }
-        // Seed the first block's entropy from the dictionary's cached encoder
-        // tables (upstream zstd `cdict->cBlockState`), or clear to defaults.
-        if use_dictionary_state && let Some(cache) = self.dictionary_entropy_cache.as_ref() {
+        // Seed the first block's entropy from the dictionary's encoder tables
+        // (upstream zstd `cdict->cBlockState`), or clear to defaults.
+        if use_dictionary_state && let Some(dict) = self.dictionary.as_ref() {
+            let cache = &dict.inner.entropy;
             self.state.last_huff_table.clone_from(&cache.huff);
             self.state
                 .fse_tables
@@ -633,32 +972,6 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             self.state.fse_tables.ml_previous = None;
             self.state.fse_tables.of_previous = None;
         }
-        // Sync `state.strategy_tag` / `state.pre_split` to the strategy the
-        // matcher's reset resolved (size- and dictionary-adaptive; a public
-        // strategy override wins on a plain frame, a dictionary frame runs the
-        // CDict's strategy) so the literal-compression gates and the block
-        // pre-splitter agree with the parse. Mirrors `FrameCompressor::compress`
-        // and keeps both entry points byte-equivalent.
-        let hint = self.pledged_content_size.or(self.source_size_hint);
-        let (params, dict_frame) = crate::encoding::frame_compressor::resolve_frame_params(
-            self.compression_level,
-            hint,
-            self.dictionary.as_ref().filter(|_| use_dictionary_state),
-        );
-        crate::encoding::frame_compressor::sync_effective_strategy(
-            &mut self.state,
-            self.compression_level,
-            &params,
-            self.strategy_override.filter(|_| !dict_frame),
-        );
-        self.state.huf_optimal_search =
-            crate::encoding::frame_compressor::huf_search_enabled(self.state.strategy_tag, hint);
-        self.state.literal_compression_disabled =
-            crate::encoding::frame_compressor::literal_compression_disabled(
-                self.state.strategy_tag,
-                self.compression_level,
-                self.target_length_override.filter(|_| !dict_frame),
-            );
         self.savings = 0;
         #[cfg(feature = "hash")]
         {
@@ -715,8 +1028,8 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         };
         let mut encoded_header = Vec::new();
         header.serialize(&mut encoded_header);
-        self.drain_mut()
-            .and_then(|drain| drain.write_all(&encoded_header))
+        drain
+            .write_all(&encoded_header)
             .map_err(|err| self.fail(err))?;
 
         self.frame_started = true;
@@ -774,8 +1087,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     /// suffix stays pending (the next block starts with it, as the frame
     /// compressor's reader path carries a pre-split suffix). On a drain
     /// error the whole pending buffer is restored so no input is lost.
-    fn emit_pending_prefix(
+    fn emit_pending_prefix<D: Write + ?Sized>(
         &mut self,
+        drain: &mut D,
         block_len: usize,
         block_capacity: usize,
     ) -> Result<(), Error> {
@@ -783,7 +1097,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         suffix.extend_from_slice(&self.pending[block_len..]);
         let mut block = mem::replace(&mut self.pending, suffix);
         block.truncate(block_len);
-        if let Err((err, mut restored_block)) = self.encode_block(block, false) {
+        if let Err((err, mut restored_block)) = self.encode_block(drain, block, false) {
             restored_block.extend_from_slice(&self.pending);
             self.pending = restored_block;
             return Err(err);
@@ -791,26 +1105,26 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         Ok(())
     }
 
-    fn emit_full_pending_block(
+    /// Emit the pending block once it is full, cut where the pre-splitter
+    /// says; a failure leaves the context failed.
+    fn emit_full_pending_block<D: Write + ?Sized>(
         &mut self,
+        drain: &mut D,
         block_capacity: usize,
-        consumed: usize,
-    ) -> Option<Result<usize, Error>> {
+    ) -> Result<(), Error> {
         if self.pending.len() != block_capacity {
-            return None;
+            return Ok(());
         }
         let block_len = self.pre_split_len(block_capacity, block_capacity);
-        if let Err(err) = self.emit_pending_prefix(block_len, block_capacity) {
-            let err = self.fail(err);
-            if consumed > 0 {
-                return Some(Ok(consumed));
-            }
-            return Some(Err(err));
-        }
-        None
+        self.emit_pending_prefix(drain, block_len, block_capacity)
+            .map_err(|err| self.fail(err))
     }
 
-    fn emit_pending_block(&mut self, last_block: bool) -> Result<(), Error> {
+    fn emit_pending_block<D: Write + ?Sized>(
+        &mut self,
+        drain: &mut D,
+        last_block: bool,
+    ) -> Result<(), Error> {
         let block_capacity = self.block_capacity();
         if last_block {
             // A full final buffer is cut like any other block (the reader
@@ -821,12 +1135,12 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 if block_len == self.pending.len() {
                     break;
                 }
-                self.emit_pending_prefix(block_len, block_capacity)
+                self.emit_pending_prefix(drain, block_len, block_capacity)
                     .map_err(|err| self.fail(err))?;
             }
         }
         let block = mem::take(&mut self.pending);
-        if let Err((err, restored_block)) = self.encode_block(block, last_block) {
+        if let Err((err, restored_block)) = self.encode_block(drain, block, last_block) {
             self.pending = restored_block;
             return Err(self.fail(err));
         }
@@ -850,8 +1164,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         }
     }
 
-    fn encode_block(
+    fn encode_block<D: Write + ?Sized>(
         &mut self,
+        drain: &mut D,
         uncompressed_data: Vec<u8>,
         last_block: bool,
     ) -> Result<(), (Error, Vec<u8>)> {
@@ -912,7 +1227,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             }
         }
 
-        if let Err(err) = self.drain_mut().and_then(|drain| drain.write_all(&encoded)) {
+        if let Err(err) = drain.write_all(&encoded) {
             encoded.clear();
             mem::swap(&mut encoded, &mut self.encoded_scratch);
             let restored = if moved_into_matcher {
@@ -939,8 +1254,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         Ok(())
     }
 
-    fn write_empty_last_block(&mut self) -> Result<(), Error> {
-        self.encode_block(Vec::new(), true).map_err(|(err, _)| err)
+    fn write_empty_last_block<D: Write + ?Sized>(&mut self, drain: &mut D) -> Result<(), Error> {
+        self.encode_block(drain, Vec::new(), true)
+            .map_err(|(err, _)| err)
     }
 
     fn fail(&mut self, err: Error) -> Error {
@@ -963,95 +1279,6 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
 
     #[cfg(not(feature = "hash"))]
     fn hash_block(&mut self, _uncompressed_data: &[u8]) {}
-}
-
-impl<W: Write, M: Matcher> Write for StreamingEncoder<W, M> {
-    fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
-        self.ensure_open()?;
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        // Check pledge before emitting the frame header so that a misuse
-        // like set_pledged_content_size(0) + write(non_empty) doesn't leave
-        // a partially-written header in the drain.
-        if let Some(pledged) = self.pledged_content_size
-            && self.bytes_consumed >= pledged
-        {
-            return Err(invalid_input_error(
-                "write would exceed pledged content size",
-            ));
-        }
-
-        self.ensure_frame_started()?;
-
-        // Enforce pledged upper bound: truncate the accepted slice to the
-        // remaining allowance so that partial-write semantics are honored
-        // (return Ok(n) with n < buf.len()) instead of failing the full call.
-        let buf = if let Some(pledged) = self.pledged_content_size {
-            let remaining_allowed = pledged
-                .checked_sub(self.bytes_consumed)
-                .ok_or_else(|| invalid_input_error("bytes consumed exceed pledged content size"))?;
-            if remaining_allowed == 0 {
-                return Err(invalid_input_error(
-                    "write would exceed pledged content size",
-                ));
-            }
-            let accepted = core::cmp::min(
-                buf.len(),
-                usize::try_from(remaining_allowed).unwrap_or(usize::MAX),
-            );
-            &buf[..accepted]
-        } else {
-            buf
-        };
-
-        let block_capacity = self.block_capacity();
-        if self.pending.capacity() == 0 {
-            self.pending = self.allocate_pending_space(block_capacity);
-        }
-        let mut remaining = buf;
-        let mut consumed = 0usize;
-
-        while !remaining.is_empty() {
-            if let Some(result) = self.emit_full_pending_block(block_capacity, consumed) {
-                return result;
-            }
-
-            let available = block_capacity - self.pending.len();
-            let to_take = core::cmp::min(remaining.len(), available);
-            if to_take == 0 {
-                break;
-            }
-            self.pending.extend_from_slice(&remaining[..to_take]);
-            remaining = &remaining[to_take..];
-            consumed += to_take;
-
-            if let Some(result) = self.emit_full_pending_block(block_capacity, consumed) {
-                if let Ok(n) = &result {
-                    self.bytes_consumed += *n as u64;
-                }
-                return result;
-            }
-        }
-        self.bytes_consumed += consumed as u64;
-        Ok(consumed)
-    }
-
-    fn flush(&mut self) -> Result<(), Error> {
-        self.ensure_open()?;
-        if self.pending.is_empty() {
-            return self
-                .drain_mut()
-                .and_then(|drain| drain.flush())
-                .map_err(|err| self.fail(err));
-        }
-        self.ensure_frame_started()?;
-        self.emit_pending_block(false)?;
-        self.drain_mut()
-            .and_then(|drain| drain.flush())
-            .map_err(|err| self.fail(err))
-    }
 }
 
 fn error_from_kind(kind: ErrorKind) -> Error {

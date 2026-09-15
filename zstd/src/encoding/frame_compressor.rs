@@ -9,8 +9,8 @@ use twox_hash::XxHash64;
 use core::hash::Hasher;
 
 use super::{
-    CompressionLevel, Matcher, block_header::BlockHeader, frame_header::FrameHeader, levels::*,
-    match_generator::MatchGeneratorDriver,
+    CompressionLevel, LiteralCompressionMode, Matcher, block_header::BlockHeader,
+    frame_header::FrameHeader, levels::*, match_generator::MatchGeneratorDriver,
 };
 use crate::common::MAX_BLOCK_SIZE;
 use crate::fse::fse_encoder::{FSETable, default_ll_table, default_ml_table, default_of_table};
@@ -33,9 +33,13 @@ use crate::io::{Read, Write};
 /// value, so a dictionary serving many frames would otherwise have its parsed
 /// tables and content duplicated for each of them — on exactly the path where
 /// one dictionary is prepared once precisely to be used again and again.
+///
+/// The encoder entropy tables a dictionary seeds into each frame's first block
+/// (upstream zstd `cdict->cBlockState`) are built once, here, and shared by
+/// every compressor the dictionary is attached to.
 #[derive(Clone)]
 pub struct EncoderDictionary {
-    pub(crate) inner: crate::decoding::dictionary::SharedDictionary,
+    pub(crate) inner: SharedEncoderDictionary,
     /// Size of the serialized dictionary this was built from (header, entropy
     /// tables, repeat offsets and content); the CDict cParams tier key
     /// (upstream `ZSTD_createCDict(dictBuffer, dictSize, level)`). Falls back
@@ -45,7 +49,43 @@ pub struct EncoderDictionary {
     serialized_len: usize,
 }
 
+/// What an [`EncoderDictionary`] shares between its clones: the parsed
+/// dictionary and the encoder entropy tables derived from it, in one
+/// allocation so a clone is one reference count, not two. Reads through to the
+/// [`Dictionary`](crate::decoding::Dictionary) for its content, offsets and id.
+pub(crate) struct EncoderDictionaryParts {
+    dictionary: crate::decoding::Dictionary,
+    pub(crate) entropy: CachedDictionaryEntropy,
+}
+
+impl core::ops::Deref for EncoderDictionaryParts {
+    type Target = crate::decoding::Dictionary;
+
+    fn deref(&self) -> &Self::Target {
+        &self.dictionary
+    }
+}
+
+/// Shared owner of [`EncoderDictionaryParts`]: `Arc` on atomic-pointer
+/// targets, `Rc` otherwise, as [`SharedFseTable`] is.
+#[cfg(target_has_atomic = "ptr")]
+pub(crate) type SharedEncoderDictionary = alloc::sync::Arc<EncoderDictionaryParts>;
+#[cfg(not(target_has_atomic = "ptr"))]
+pub(crate) type SharedEncoderDictionary = alloc::rc::Rc<EncoderDictionaryParts>;
+
 impl EncoderDictionary {
+    /// Share `dictionary` with the entropy tables it seeds, built once here.
+    fn prepared(dictionary: crate::decoding::Dictionary, serialized_len: usize) -> Self {
+        let entropy = CachedDictionaryEntropy::from_dictionary(&dictionary);
+        Self {
+            inner: SharedEncoderDictionary::new(EncoderDictionaryParts {
+                dictionary,
+                entropy,
+            }),
+            serialized_len,
+        }
+    }
+
     /// Wrap an already-parsed [`Dictionary`](crate::decoding::Dictionary) for
     /// encoder use. A fully-decoded dictionary is valid here; only the encoder
     /// entropy tables, content, and offset history are read. The CDict cParams
@@ -53,10 +93,8 @@ impl EncoderDictionary {
     /// when the serialized blob is at hand — it keys the tier by the exact
     /// serialized size as upstream `ZSTD_createCDict` does.
     pub fn from_dictionary(dictionary: crate::decoding::Dictionary) -> Self {
-        Self {
-            serialized_len: dictionary.dict_content.len(),
-            inner: crate::decoding::dictionary::SharedDictionary::new(dictionary),
-        }
+        let serialized_len = dictionary.dict_content.len();
+        Self::prepared(dictionary, serialized_len)
     }
 
     /// Parse a serialized dictionary blob for encoder use, skipping the decode
@@ -66,12 +104,10 @@ impl EncoderDictionary {
     pub fn from_bytes(
         raw_dictionary: &[u8],
     ) -> Result<Self, crate::decoding::errors::DictionaryDecodeError> {
-        Ok(Self {
-            inner: crate::decoding::dictionary::SharedDictionary::new(
-                crate::decoding::Dictionary::decode_dict_for_encoding(raw_dictionary)?,
-            ),
-            serialized_len: raw_dictionary.len(),
-        })
+        Ok(Self::prepared(
+            crate::decoding::Dictionary::decode_dict_for_encoding(raw_dictionary)?,
+            raw_dictionary.len(),
+        ))
     }
 
     /// Load whichever kind of dictionary `raw_dictionary` holds, the way
@@ -95,12 +131,79 @@ impl EncoderDictionary {
         if raw_dictionary.starts_with(&crate::decoding::DICTIONARY_MAGIC) {
             return Self::from_bytes(raw_dictionary);
         }
-        Ok(Self {
-            inner: crate::decoding::dictionary::SharedDictionary::new(
-                crate::decoding::Dictionary::from_raw_content(0, raw_dictionary.to_vec())?,
-            ),
-            serialized_len: raw_dictionary.len(),
-        })
+        Ok(Self::prepared(
+            crate::decoding::Dictionary::from_raw_content(0, raw_dictionary.to_vec())?,
+            raw_dictionary.len(),
+        ))
+    }
+
+    /// Heap bytes the prepared dictionary holds: the shared allocation itself,
+    /// the parsed dictionary's content and tables, and the entropy tables it
+    /// seeds. Clones share all of it, so this counts once however many
+    /// compressors the dictionary is attached to.
+    ///
+    /// # Examples
+    /// ```
+    /// use structured_zstd::encoding::EncoderDictionary;
+    ///
+    /// let dictionary =
+    ///     EncoderDictionary::from_serialized_or_raw_content(b"raw content, no header").unwrap();
+    /// assert!(dictionary.heap_size() >= b"raw content, no header".len());
+    /// ```
+    pub fn heap_size(&self) -> usize {
+        // `Arc` and `Rc` both place two word-sized counts ahead of the value,
+        // padded to its alignment.
+        let shared = core::alloc::Layout::new::<[usize; 2]>()
+            .extend(core::alloc::Layout::new::<EncoderDictionaryParts>())
+            .expect("a fixed-size layout extends")
+            .0
+            .pad_to_align()
+            .size();
+        shared + self.inner.dictionary.heap_bytes() + self.inner.entropy.heap_size()
+    }
+
+    /// Heap bytes that `handles` alone keep alive: each distinct dictionary
+    /// among them once, and only when no handle outside them shares it.
+    ///
+    /// For an owner holding several handles, such as a context whose
+    /// compressors each keep the dictionary they last ran with: what it reports
+    /// should count one dictionary once, and none that someone else also holds.
+    ///
+    /// # Examples
+    /// ```
+    /// use structured_zstd::encoding::EncoderDictionary;
+    ///
+    /// let dictionary = EncoderDictionary::from_serialized_or_raw_content(b"some shared history").unwrap();
+    /// let copy = dictionary.clone();
+    /// // Both handles are in the set: counted once.
+    /// assert_eq!(
+    ///     EncoderDictionary::exclusive_heap_size([&dictionary, &copy]),
+    ///     dictionary.heap_size()
+    /// );
+    /// // `copy` is held elsewhere: nothing is this set's alone.
+    /// assert_eq!(EncoderDictionary::exclusive_heap_size([&dictionary]), 0);
+    /// ```
+    pub fn exclusive_heap_size<'a, I>(handles: I) -> usize
+    where
+        I: IntoIterator<Item = &'a EncoderDictionary>,
+        I::IntoIter: Clone,
+    {
+        let handles = handles.into_iter();
+        let mut total = 0;
+        for (position, handle) in handles.clone().enumerate() {
+            let same = |other: &&EncoderDictionary| {
+                SharedEncoderDictionary::ptr_eq(&handle.inner, &other.inner)
+            };
+            // The first handle to an allocation speaks for all of them.
+            if handles.clone().take(position).any(|other| same(&other)) {
+                continue;
+            }
+            let held_here = handles.clone().filter(same).count();
+            if SharedEncoderDictionary::strong_count(&handle.inner) == held_here {
+                total += handle.heap_size();
+            }
+        }
+        total
     }
 
     /// The content and serialized sizes the encoder's matcher is hinted with.
@@ -150,7 +253,6 @@ pub struct FrameCompressor<
     compressed_data: Option<W>,
     compression_level: CompressionLevel,
     dictionary: Option<EncoderDictionary>,
-    dictionary_entropy_cache: Option<CachedDictionaryEntropy>,
     source_size_hint: Option<u64>,
     state: CompressState<M>,
     /// When true, emitted frames omit the 4-byte magic number prefix
@@ -219,20 +321,40 @@ pub struct FrameCompressor<
     /// the per-block sizes. Cleared and refilled per frame.
     #[cfg(feature = "lsm")]
     block_decompressed_sizes: alloc::vec::Vec<u32>,
-    /// Effective strategy tag when a public-parameter
-    /// [`Strategy`](crate::encoding::Strategy) override (#27) is active.
-    /// `Some` overrides the level-derived `state.strategy_tag` so the
-    /// literal-compression gates and dict-attach cutoff see the strategy
-    /// the matcher actually runs, not the base level's. `None` keeps the
-    /// level-derived tag.
-    /// A public-parameter strategy override: its tag and lazy depth (the
-    /// collapsed `Lazy` tag needs the depth for the pre-split tier).
-    strategy_override: Option<(crate::encoding::strategy::StrategyTag, u8)>,
-    /// Public `target_length` override (#27), persisted so the raw-literals
-    /// gate can be recomputed per frame: a dictionary attached or cleared
-    /// after `set_parameters` flips whether the override applies (the
-    /// matcher drops it on a dictionary frame).
-    target_length_override: Option<u32>,
+    tuning: FrameTuning,
+}
+
+/// What a compressor keeps of the fine-grained parameters (#27) beside the
+/// level: the parts the literal-compression gates and the block splitter read
+/// at frame start, where the matcher holds the rest. Shared by
+/// [`FrameCompressor`] and [`CompressionContext`](crate::encoding::CompressionContext).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FrameTuning {
+    /// A public-parameter [`Strategy`](crate::encoding::Strategy) override:
+    /// its tag and lazy depth (the collapsed `Lazy` tag needs the depth for
+    /// the pre-split tier). `Some` wins over the level-derived
+    /// `state.strategy_tag` so the gates and the dict-attach cutoff see the
+    /// strategy the matcher runs; `None` keeps the level's.
+    pub(crate) strategy: Option<(crate::encoding::strategy::StrategyTag, u8)>,
+    /// Public `target_length` override, kept so the raw-literals gate can be
+    /// recomputed per frame: a dictionary attached or cleared after
+    /// `set_parameters` can move the strategy the gate reads.
+    pub(crate) target_length: Option<u32>,
+    /// Public literal-compression mode (upstream
+    /// `ZSTD_c_literalCompressionMode`), kept for the same per-frame
+    /// recomputation of the raw-literals gate.
+    pub(crate) literal_compression: LiteralCompressionMode,
+}
+
+impl FrameTuning {
+    /// The tuning `overrides` asks for.
+    pub(crate) fn from_overrides(overrides: &crate::encoding::parameters::ParamOverrides) -> Self {
+        Self {
+            strategy: overrides.strategy.map(|s| (s.tag(), s.lazy_depth())),
+            target_length: overrides.target_length,
+            literal_compression: overrides.literal_compression,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -999,6 +1121,81 @@ pub(crate) fn optimal_block_size_with(
         .min(MAX_BLOCK_SIZE as usize)
 }
 
+/// Load `dict` into the matcher for the frame about to start, `size_hint`
+/// bytes long when known, once `state.strategy_tag` holds the strategy the
+/// frame runs. Shared by the frame compressor and the streaming context so a
+/// reused one of either loads its dictionary the same way.
+///
+/// A dictionary a reused matcher kept resident across the reset (its bytes
+/// and index still in place) only gets its offset history back: priming it
+/// again would commit it into the window a second time. Otherwise it is
+/// primed, or restored from the matcher's copy-mode snapshot when the source
+/// is past the strategy's attach cutoff.
+pub(crate) fn load_frame_dictionary<M: Matcher>(
+    state: &mut CompressState<M>,
+    level: CompressionLevel,
+    dict: &EncoderDictionary,
+    size_hint: Option<u64>,
+) {
+    // Upstream zstd `ZSTD_shouldAttachDict` (`zstd_compress.c`): a
+    // precomputed-dictionary table is COPIED into the working context
+    // only when the source is larger than a per-strategy cutoff; at or
+    // below it (and for unknown size) the upstream zstd ATTACHES the dictionary
+    // tables by reference (no per-frame table touch at all). We don't
+    // have an attach-by-reference path yet, so:
+    //   - large source (> cutoff): reuse the captured prime snapshot
+    //     (a table copy) instead of re-hashing the dictionary — the
+    //     upstream zstd COPY regime, where the copy is cheaper than re-priming;
+    //   - small / unknown source: re-prime (the snapshot copy of the
+    //     whole table would cost MORE than the sparse re-prime here,
+    //     which is exactly why the upstream zstd attaches by reference instead).
+    // `attachDictSizeCutoffs` per strategy: fast 8K, dfast 16K,
+    // greedy/lazy/btopt 32K, btultra/btultra2 8K. Expressed as the
+    // ceil-log bucket (8K = 2^13, 16K = 2^14, 32K = 2^15) so the
+    // decision uses the SAME bucketed representation as the driver's
+    // attach/copy gate (`reset_size_log`) — comparing
+    // `source_size_ceil_log(hint)` on the full u64 avoids the `as usize`
+    // truncation that could diverge from the driver on 32-bit targets.
+    // For a power-of-two cutoff `2^k`, `ceil_log2(hint) > k` is exactly
+    // `hint > 2^k`, so this is identical to the raw `hint > cutoff` on
+    // 64-bit.
+    let cutoff_log = match state.strategy_tag {
+        // Keep the copy-snapshot gate in sync with the matcher's own
+        // attach cutoff, so Fast never captures or restores a snapshot
+        // for a mode it did not resolve.
+        crate::encoding::strategy::StrategyTag::Fast => {
+            crate::encoding::levels::config::FAST_ATTACH_DICT_CUTOFF_LOG
+        }
+        crate::encoding::strategy::StrategyTag::BtUltra
+        | crate::encoding::strategy::StrategyTag::BtUltra2 => 13,
+        crate::encoding::strategy::StrategyTag::Dfast => 14,
+        crate::encoding::strategy::StrategyTag::Greedy
+        | crate::encoding::strategy::StrategyTag::Lazy
+        | crate::encoding::strategy::StrategyTag::Btlazy2
+        | crate::encoding::strategy::StrategyTag::BtOpt => 15,
+    };
+    if state.matcher.dictionary_is_resident() {
+        // Re-borrow fast path: the previous frame's reset kept this
+        // dict's bytes + cached index resident, so skip the re-commit /
+        // re-index and only reapply the offset history.
+        state
+            .matcher
+            .reapply_resident_dictionary(dict.inner.offset_hist);
+        return;
+    }
+    let prefer_copy_snapshot = size_hint
+        .is_some_and(|s| crate::encoding::levels::config::source_size_ceil_log(s) > cutoff_log);
+    let restored = prefer_copy_snapshot && state.matcher.restore_primed_dictionary(level);
+    if !restored {
+        state
+            .matcher
+            .prime_with_dictionary(dict.inner.dict_content.as_slice(), dict.inner.offset_hist);
+        if prefer_copy_snapshot {
+            state.matcher.capture_primed_dictionary(level);
+        }
+    }
+}
+
 /// Record in `state` the strategy the matcher runs for the next frame (the
 /// honoured public override, else the size- and dictionary-adaptive
 /// resolution in `params`) and its pre-split tier; the literal gates and the
@@ -1029,48 +1226,84 @@ pub(crate) fn sync_effective_strategy<M: Matcher>(
     }
 }
 
-/// Upstream `ZSTD_literalsCompressionIsDisabled` (`ps_auto`): raw literals
-/// iff the EFFECTIVE cParams are the fast strategy with `targetLength > 0`.
+/// Upstream `ZSTD_literalsCompressionIsDisabled`: an explicit
+/// [`LiteralCompressionMode`] decides outright; under `Auto`, raw literals iff
+/// the EFFECTIVE cParams are the fast strategy with `targetLength > 0`.
 /// The effective strategy tag gates this (a strategy override can move a
 /// negative level off fast). For the fast strategy the level table sets
-/// `targetLength > 0` exactly on the negative (acceleration) rows, so absent
-/// an honoured `target_length` override `level < 0` is that test; the caller
-/// drops the override on a dictionary frame, where the matcher runs the
-/// CDict's targetLength instead.
+/// `targetLength > 0` exactly on the negative (acceleration) rows (a CDict's
+/// too), so where [`gate_target_length`] has no value `level < 0` is that
+/// test.
 pub(crate) fn literal_compression_disabled(
     strategy_tag: crate::encoding::strategy::StrategyTag,
     level: CompressionLevel,
     target_length_override: Option<u32>,
+    mode: LiteralCompressionMode,
 ) -> bool {
-    strategy_tag == crate::encoding::strategy::StrategyTag::Fast
-        && target_length_override.map_or_else(
-            || matches!(level, CompressionLevel::Level(n) if n < 0),
-            |tl| tl > 0,
-        )
+    match mode {
+        LiteralCompressionMode::Disable => true,
+        LiteralCompressionMode::Enable => false,
+        LiteralCompressionMode::Auto => {
+            strategy_tag == crate::encoding::strategy::StrategyTag::Fast
+                && target_length_override.map_or_else(
+                    || matches!(level, CompressionLevel::Level(n) if n < 0),
+                    |tl| tl > 0,
+                )
+        }
+    }
+}
+
+/// The `target_length` the raw-literals gate reads for a frame: the caller's,
+/// else, for a dictionary frame a strategy knob moves onto the fast strategy,
+/// the CDict row's, which the fast matcher runs as its step (upstream
+/// `ZSTD_overrideCParams` replaces only the strategy, and
+/// `ZSTD_literalsCompressionIsDisabled` reads the resulting cParams). Every
+/// other frame's fast targetLength is what the level says, which
+/// [`literal_compression_disabled`] derives itself.
+pub(crate) fn gate_target_length(
+    level: CompressionLevel,
+    tuning: &FrameTuning,
+    dictionary: Option<&EncoderDictionary>,
+) -> Option<u32> {
+    match (tuning.target_length, tuning.strategy, dictionary) {
+        (Some(target_length), _, _) => Some(target_length),
+        (None, Some((crate::encoding::strategy::StrategyTag::Fast, _)), Some(dict))
+            if !dict.inner.dict_content.is_empty() =>
+        {
+            Some(
+                crate::encoding::cparams::get_cdict_cparams(
+                    crate::encoding::levels::config::numeric_level(level),
+                    dict.sizes().serialized,
+                    &crate::encoding::parameters::ParamOverrides::default(),
+                )
+                .target_length,
+            )
+        }
+        _ => None,
+    }
 }
 
 /// The level params the matcher's reset resolves for a frame: through the
 /// dictionary's CDict tier when a dictionary is in play, else by source size.
-/// Returns whether the frame is a dictionary frame (the matcher then runs the
-/// CDict's strategy and ignores a strategy override).
+/// Resolved without the caller's knobs: the frame gates read only the
+/// strategy from these, and a strategy override replaces it
+/// ([`sync_effective_strategy`]) on a dictionary frame as on any other.
 pub(crate) fn resolve_frame_params(
     level: CompressionLevel,
     hint: Option<u64>,
     dictionary: Option<&EncoderDictionary>,
-) -> (crate::encoding::levels::config::LevelParams, bool) {
+) -> crate::encoding::levels::config::LevelParams {
     match dictionary {
         Some(dict) if !dict.inner.dict_content.is_empty() => {
-            let (params, _plan) = crate::encoding::levels::config::resolve_level_params_with_dict(
+            crate::encoding::levels::config::resolve_level_params_with_dict(
                 level,
                 hint,
                 dict.sizes(),
-            );
-            (params, true)
+                &crate::encoding::parameters::ParamOverrides::default(),
+            )
+            .0
         }
-        _ => (
-            crate::encoding::levels::config::resolve_level_params(level, hint),
-            false,
-        ),
+        _ => crate::encoding::levels::config::resolve_level_params(level, hint),
     }
 }
 
@@ -1434,7 +1667,6 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             compressed_data: None,
             compression_level,
             dictionary: None,
-            dictionary_entropy_cache: None,
             source_size_hint: None,
             state: CompressState {
                 matcher: MatchGeneratorDriver::new(1024 * 128, 1),
@@ -1474,8 +1706,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             block_checksums: None,
             #[cfg(feature = "lsm")]
             block_decompressed_sizes: alloc::vec::Vec::new(),
-            strategy_override: None,
-            target_length_override: None,
+            tuning: FrameTuning::default(),
         }
     }
 
@@ -1504,8 +1735,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     pub fn set_parameters(&mut self, params: &crate::encoding::CompressionParameters) {
         self.compression_level = params.level();
         let overrides = params.overrides();
-        self.strategy_override = overrides.strategy.map(|s| (s.tag(), s.lazy_depth()));
-        self.target_length_override = overrides.target_length;
+        self.tuning = FrameTuning::from_overrides(&overrides);
         // Keep `state.strategy_tag` consistent immediately so the borrowed
         // one-shot eligibility gate (`borrowed_eligible`) and literal gates
         // are correct even before the next `compress()` re-sync. Resolve it
@@ -1517,15 +1747,19 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         // ignores an attached dictionary and has no CDict tier to resolve.
         let with_dictionary = !matches!(self.compression_level, CompressionLevel::Uncompressed)
             && self.state.matcher.supports_dictionary_priming();
-        let (params, dict_frame) =
-            self.resolve_frame_params(self.source_size_hint, with_dictionary);
-        self.sync_effective_strategy(&params, !dict_frame);
+        let params = self.resolve_frame_params(self.source_size_hint, with_dictionary);
+        self.sync_effective_strategy(&params);
         self.state.huf_optimal_search =
             huf_search_enabled(self.state.strategy_tag, self.source_size_hint);
         self.state.literal_compression_disabled = literal_compression_disabled(
             self.state.strategy_tag,
             self.compression_level,
-            overrides.target_length.filter(|_| !dict_frame),
+            gate_target_length(
+                self.compression_level,
+                &self.tuning,
+                self.dictionary.as_ref().filter(|_| with_dictionary),
+            ),
+            self.tuning.literal_compression,
         );
         self.state.matcher.set_param_overrides(Some(overrides));
     }
@@ -1600,6 +1834,19 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// known) or the drain tail.
     fn run_one_frame(&mut self, input: &[u8], prep: &FramePrep, out: &mut Vec<u8>) -> u64 {
         if self.borrowed_eligible(input.len(), prep) {
+            // A reused Dfast matcher's tables hold earlier frames, which its
+            // borrowed kernel (numbering this input from zero) would read as
+            // its own: emptied, the frame is the one a fresh matcher writes
+            // (upstream: first and later uses of a context compress the
+            // same). Measured cheaper than the owned path, which retires them
+            // by moving the floor but copies the input and runs slower: level 3
+            // on a reused ZSTD_compress2 context, the owned path costs 3.5% at
+            // 1 KiB frames, 4.1% at 4 KiB and 10.8% at 1 MiB, and gains at most
+            // 1% below 256 bytes, within noise. The emptied tables are sized
+            // from the frame's own source, so a tiny frame clears a tiny table.
+            if !self.state.matcher.borrowed_frame_is_independent() {
+                self.state.matcher.forget_earlier_frames();
+            }
             self.run_borrowed_block_loop(input, out)
         } else {
             let mut cursor: &[u8] = input;
@@ -1848,7 +2095,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             uncompressed_data: None,
             compressed_data: None,
             dictionary: None,
-            dictionary_entropy_cache: None,
             source_size_hint: None,
             state: CompressState {
                 matcher,
@@ -1889,8 +2135,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             block_checksums: None,
             #[cfg(feature = "lsm")]
             block_decompressed_sizes: alloc::vec::Vec::new(),
-            strategy_override: None,
-            target_length_override: None,
+            tuning: FrameTuning::default(),
         }
     }
 
@@ -2003,14 +2248,12 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     }
 
     /// The level params the matcher's reset resolves for the next frame
-    /// (dictionary-aware when a dictionary will be used) and whether the
-    /// frame is a dictionary frame (the matcher then runs the CDict's
-    /// strategy and ignores a strategy override).
+    /// (dictionary-aware when a dictionary will be used).
     fn resolve_frame_params(
         &self,
         hint: Option<u64>,
         with_dictionary: bool,
-    ) -> (crate::encoding::levels::config::LevelParams, bool) {
+    ) -> crate::encoding::levels::config::LevelParams {
         resolve_frame_params(
             self.compression_level,
             hint,
@@ -2019,20 +2262,16 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     }
 
     /// Record the strategy the matcher actually runs for the next frame (a
-    /// public-parameter override when the matcher honours one, else the
-    /// size- and dictionary-adaptive resolution in `params`) and its
-    /// pre-split tier: the literal gates and the block splitter read these,
-    /// and upstream indexes `splitLevels` by the effective strategy too.
-    fn sync_effective_strategy(
-        &mut self,
-        params: &crate::encoding::levels::config::LevelParams,
-        override_applies: bool,
-    ) {
+    /// public-parameter override, else the size- and dictionary-adaptive
+    /// resolution in `params`) and its pre-split tier: the literal gates and
+    /// the block splitter read these, and upstream indexes `splitLevels` by
+    /// the effective strategy too.
+    fn sync_effective_strategy(&mut self, params: &crate::encoding::levels::config::LevelParams) {
         sync_effective_strategy(
             &mut self.state,
             self.compression_level,
             params,
-            self.strategy_override.filter(|_| override_applies),
+            self.tuning.strategy,
         );
     }
 
@@ -2076,11 +2315,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         total += self
             .dictionary
             .as_ref()
-            .map_or(0, |d| d.inner.dict_content.capacity());
-        total += self
-            .dictionary_entropy_cache
-            .as_ref()
-            .map_or(0, CachedDictionaryEntropy::heap_size);
+            .map_or(0, EncoderDictionary::heap_size);
         #[cfg(all(feature = "lsm", feature = "hash"))]
         {
             total += self
@@ -2208,27 +2443,28 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // frame runs, costing a few bytes on small literal sections).
         // A dictionary frame runs the CDict's strategy (upstream
         // `ZSTD_resetCCtx_usingCDict`), so resolve through the same
-        // dictionary-aware path the matcher's reset took; a lazy-band CDict
-        // plan also makes the matcher ignore a strategy override.
-        let (params, planned) = self.resolve_frame_params(initial_size_hint, use_dictionary_state);
-        self.sync_effective_strategy(&params, !planned);
+        // dictionary-aware path the matcher's reset took.
+        let params = self.resolve_frame_params(initial_size_hint, use_dictionary_state);
+        self.sync_effective_strategy(&params);
         // `initial_size_hint` (captured before the `.take()` above) — by here
         // `self.source_size_hint` is None.
         self.state.huf_optimal_search =
             huf_search_enabled(self.state.strategy_tag, initial_size_hint);
-        // The raw-literals gate is dictionary-aware too: attaching or
-        // clearing a dictionary AFTER `set_parameters` flips whether the
-        // `target_length` override applies (the matcher drops it on a
-        // dictionary frame, which runs the CDict's targetLength), so the
-        // gate set there is recomputed per frame from the persisted
-        // override.
+        // Recomputed per frame from the persisted override: attaching or
+        // clearing a dictionary after `set_parameters` can move the strategy
+        // this gate reads.
         self.state.literal_compression_disabled = literal_compression_disabled(
             self.state.strategy_tag,
             self.compression_level,
-            self.target_length_override.filter(|_| !planned),
+            gate_target_length(
+                self.compression_level,
+                &self.tuning,
+                self.dictionary.as_ref().filter(|_| use_dictionary_state),
+            ),
+            self.tuning.literal_compression,
         );
         let cached_entropy = if use_dictionary_state {
-            self.dictionary_entropy_cache.as_ref()
+            self.dictionary.as_ref().map(|dict| &dict.inner.entropy)
         } else {
             None
         };
@@ -2236,71 +2472,12 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // This state drives sequence encoding, while matcher priming below updates
             // the match generator's internal repeat-offset history for match finding.
             self.state.offset_hist = dict.inner.offset_hist;
-            // Upstream zstd `ZSTD_shouldAttachDict` (`zstd_compress.c`): a
-            // precomputed-dictionary table is COPIED into the working context
-            // only when the source is larger than a per-strategy cutoff; at or
-            // below it (and for unknown size) the upstream zstd ATTACHES the dictionary
-            // tables by reference (no per-frame table touch at all). We don't
-            // have an attach-by-reference path yet, so:
-            //   - large source (> cutoff): reuse the captured prime snapshot
-            //     (a table copy) instead of re-hashing the dictionary — the
-            //     upstream zstd COPY regime, where the copy is cheaper than re-priming;
-            //   - small / unknown source: re-prime (the snapshot copy of the
-            //     whole table would cost MORE than the sparse re-prime here,
-            //     which is exactly why the upstream zstd attaches by reference instead).
-            // `attachDictSizeCutoffs` per strategy: fast 8K, dfast 16K,
-            // greedy/lazy/btopt 32K, btultra/btultra2 8K. Expressed as the
-            // ceil-log bucket (8K = 2^13, 16K = 2^14, 32K = 2^15) so the
-            // decision uses the SAME bucketed representation as the driver's
-            // attach/copy gate (`reset_size_log`) — comparing
-            // `source_size_ceil_log(hint)` on the full u64 avoids the `as usize`
-            // truncation that could diverge from the driver on 32-bit targets.
-            // For a power-of-two cutoff `2^k`, `ceil_log2(hint) > k` is exactly
-            // `hint > 2^k`, so this is identical to the raw `hint > cutoff` on
-            // 64-bit.
-            let cutoff_log = match self.state.strategy_tag {
-                // Keep the copy-snapshot gate in sync with the matcher's own
-                // attach cutoff, so Fast never captures or restores a snapshot
-                // for a mode it did not resolve.
-                crate::encoding::strategy::StrategyTag::Fast => {
-                    crate::encoding::levels::config::FAST_ATTACH_DICT_CUTOFF_LOG
-                }
-                crate::encoding::strategy::StrategyTag::BtUltra
-                | crate::encoding::strategy::StrategyTag::BtUltra2 => 13,
-                crate::encoding::strategy::StrategyTag::Dfast => 14,
-                crate::encoding::strategy::StrategyTag::Greedy
-                | crate::encoding::strategy::StrategyTag::Lazy
-                | crate::encoding::strategy::StrategyTag::Btlazy2
-                | crate::encoding::strategy::StrategyTag::BtOpt => 15,
-            };
-            if self.state.matcher.dictionary_is_resident() {
-                // Re-borrow fast path: the previous frame's reset kept this
-                // dict's bytes + cached index resident, so skip the re-commit /
-                // re-index and only reapply the offset history.
-                self.state
-                    .matcher
-                    .reapply_resident_dictionary(dict.inner.offset_hist);
-            } else {
-                let prefer_copy_snapshot = initial_size_hint.is_some_and(|s| {
-                    crate::encoding::levels::config::source_size_ceil_log(s) > cutoff_log
-                });
-                let restored = prefer_copy_snapshot
-                    && self
-                        .state
-                        .matcher
-                        .restore_primed_dictionary(self.compression_level);
-                if !restored {
-                    self.state.matcher.prime_with_dictionary(
-                        dict.inner.dict_content.as_slice(),
-                        dict.inner.offset_hist,
-                    );
-                    if prefer_copy_snapshot {
-                        self.state
-                            .matcher
-                            .capture_primed_dictionary(self.compression_level);
-                    }
-                }
-            }
+            load_frame_dictionary(
+                &mut self.state,
+                self.compression_level,
+                dict,
+                initial_size_hint,
+            );
         }
         if let Some(cache) = cached_entropy {
             // Refill an empty slot from the recycled spare before
@@ -3072,7 +3249,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// This also clears any fine-grained parameter overrides installed via
     /// [`set_parameters`](Self::set_parameters): reverting to a bare level
     /// means plain level-based tuning, not the previous frame's customized
-    /// strategy / LDM / log overrides. To keep overriding, call
+    /// strategy / LDM / log / literal-mode overrides. To keep overriding, call
     /// [`set_parameters`](Self::set_parameters) again with the new base level.
     pub fn set_compression_level(
         &mut self,
@@ -3088,9 +3265,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             compression_level,
             CompressionLevel::Level(n) if n < 0
         );
-        // Drop sticky overrides so the level switch yields plain geometry.
-        self.strategy_override = None;
-        self.target_length_override = None;
+        // Drop sticky overrides so the level switch yields plain geometry,
+        // the literal mode included: the gate above is the bare level's rule.
+        self.tuning = FrameTuning::default();
         self.state.matcher.clear_param_overrides();
         old
     }
@@ -3158,9 +3335,24 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.attach_dictionary(dictionary)
     }
 
+    /// The dictionary frames are compressed with, if one is attached.
+    ///
+    /// # Examples
+    /// ```
+    /// use structured_zstd::encoding::{CompressionLevel, EncoderDictionary, FrameCompressor};
+    ///
+    /// let dictionary = EncoderDictionary::from_serialized_or_raw_content(b"some shared history").unwrap();
+    /// let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+    /// assert!(compressor.dictionary().is_none());
+    /// compressor.set_encoder_dictionary(dictionary).unwrap();
+    /// assert_eq!(compressor.dictionary().map(EncoderDictionary::id), Some(0));
+    /// ```
+    pub fn dictionary(&self) -> Option<&EncoderDictionary> {
+        self.dictionary.as_ref()
+    }
+
     /// Remove the attached dictionary, returning it as an [`EncoderDictionary`].
     pub fn clear_dictionary(&mut self) -> Option<EncoderDictionary> {
-        self.dictionary_entropy_cache = None;
         // Drop the CDict prime snapshot — it is keyed to the dictionary
         // being removed and must not be restored against a different (or no)
         // dictionary on the next frame.
@@ -3168,10 +3360,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.dictionary.take()
     }
 
-    /// Validate `enc`, build the encoder entropy cache from it, store it, and
-    /// return the previously-attached dictionary. Shared by every public
-    /// attach entry point: `set_dictionary`, `set_dictionary_from_bytes`, and
-    /// `set_encoder_dictionary`.
+    /// Validate `enc`, store it, and return the previously-attached
+    /// dictionary; its entropy tables come with it, built when it was
+    /// prepared. Shared by every public attach entry point: `set_dictionary`,
+    /// `set_dictionary_from_bytes`, and `set_encoder_dictionary`.
     fn attach_dictionary(
         &mut self,
         enc: EncoderDictionary,
@@ -3187,7 +3379,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 },
             );
         }
-        self.dictionary_entropy_cache = Some(CachedDictionaryEntropy::from_dictionary(dictionary));
         // A previously-captured CDict prime snapshot belongs to the OLD
         // dictionary; drop it so the first frame with the new dictionary
         // re-primes (and re-captures) instead of restoring stale tables.

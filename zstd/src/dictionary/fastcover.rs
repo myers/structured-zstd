@@ -59,8 +59,41 @@ fn hash_dmer_index(sample: &[u8], pos: usize, f: u32, d: usize) -> usize {
     (h >> (64 - f)) as usize
 }
 
+/// The frequency-table width, in the range upstream zstd's FastCOVER takes
+/// (`FASTCOVER_MAX_F`, fastcover.c). A width outside it is brought to its
+/// nearest end rather than refused; inside it, the width is used as given, so
+/// memory grows as `2^f` exactly as the caller chose.
 fn clamp_table_bits(f: u32) -> u32 {
-    f.clamp(8, 20)
+    f.clamp(1, 31)
+}
+
+/// A count table that does not fit in memory: larger than this target can lay
+/// out, or refused by the allocator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TableTooLarge {
+    pub(crate) entries: usize,
+}
+
+/// `len` zeroed counts, allocated as `vec![0; len]` is (zero pages the
+/// allocator hands out lazily, so a wide table costs only what is touched),
+/// but reporting a table that does not fit rather than panicking on the layout
+/// or aborting on a refused allocation.
+fn zeroed_counts<C: WindowCount>(len: usize) -> Result<Vec<C>, TableTooLarge> {
+    let too_large = TableTooLarge { entries: len };
+    let layout = core::alloc::Layout::array::<C>(len).map_err(|_| too_large)?;
+    if layout.size() == 0 {
+        return Ok(Vec::new());
+    }
+    // SAFETY: the layout has a non-zero size, checked above.
+    let pointer = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    if pointer.is_null() {
+        return Err(too_large);
+    }
+    // SAFETY: `pointer` comes from the global allocator with the layout of
+    // `[C; len]`, which is what `Vec<C>` with capacity `len` frees it with, and
+    // every element is initialised: all-zero bytes are the value 0 of the
+    // integer counts `WindowCount` is implemented for (`u16`, `u32`).
+    Ok(unsafe { Vec::from_raw_parts(pointer.cast::<C>(), len, len) })
 }
 
 pub(crate) fn normalize_fastcover_params(mut params: FastCoverParams) -> FastCoverParams {
@@ -71,17 +104,22 @@ pub(crate) fn normalize_fastcover_params(mut params: FastCoverParams) -> FastCov
     params
 }
 
-fn build_frequency_table(sample: &[u8], d: usize, f: u32, accel: usize) -> Vec<u32> {
+fn build_frequency_table(
+    sample: &[u8],
+    d: usize,
+    f: u32,
+    accel: usize,
+) -> Result<Vec<u32>, TableTooLarge> {
     let bits = clamp_table_bits(f);
     let size = 1usize << bits;
     // Upstream zstd accel table: `skip = accel - 1` dmers between counted dmers
     // (`FASTCOVER_defaultAccelParameters`), i.e. a stride of `accel`.
     let step = accel.max(1);
-    let mut table = vec![0u32; size];
+    let mut table = zeroed_counts::<u32>(size)?;
 
     let read_len = dmer_read_len(d);
     if sample.len() < read_len {
-        return table;
+        return Ok(table);
     }
 
     let mut i = 0usize;
@@ -91,12 +129,16 @@ fn build_frequency_table(sample: &[u8], d: usize, f: u32, accel: usize) -> Vec<u
         table[hash_dmer_index(sample, i, bits, d)] += 1;
         i += step;
     }
-    table
+    Ok(table)
 }
 
-fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> Vec<u8> {
+fn build_raw_dict(
+    sample: &[u8],
+    dict_size: usize,
+    params: FastCoverParams,
+) -> Result<Vec<u8>, TableTooLarge> {
     if sample.is_empty() || dict_size == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let params = normalize_fastcover_params(params);
@@ -107,7 +149,7 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
     if sample.len() < read_len {
         // Too short for even one wide-read dmer: no trainable content.
         // Callers treat an empty raw dict as "sample too small".
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // Upstream zstd `FASTCOVER_buildDictionary` epoch model: split the corpus into
@@ -122,23 +164,72 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
     // order of magnitude slower than the reference trainer at equal
     // coverage quality.
     let nb_dmers = sample.len() - read_len + 1;
-    let mut freqs = build_frequency_table(sample, d, f, params.accel);
+    let mut freqs = build_frequency_table(sample, d, f, params.accel)?;
     let dmers_in_k = k - d + 1; // `normalize` guarantees k >= d
 
     // Upstream zstd `COVER_computeEpochs` (passes = 1): target one selection per
     // epoch, with a floor so epochs stay large enough to contain useful
     // segments.
-    let min_epoch_size = k * 10;
+    // The floor only matters up to the corpus it is capped at, so a product
+    // past `usize` (a `k` near the top of it) is that cap, not an overflow.
+    let min_epoch_size = k
+        .checked_mul(10)
+        .map_or(nb_dmers, |floor| floor.min(nb_dmers));
     let mut epoch_count = (dict_size / k).max(1);
     let mut epoch_size = nb_dmers / epoch_count;
     if epoch_size < min_epoch_size {
-        epoch_size = min_epoch_size.min(nb_dmers);
+        epoch_size = min_epoch_size;
         epoch_count = (nb_dmers / epoch_size).max(1);
     }
 
-    // Per-window dmer occurrence counts (upstream zstd `segmentFreqs`, u16: a window
-    // holds at most `dmers_in_k` <= k occurrences of one index).
-    let mut segment_freqs = vec![0u16; 1usize << f];
+    let layout = EpochLayout {
+        dmers_in_k,
+        epoch_size,
+        epoch_count,
+    };
+    // A window holds at most `dmers_in_k + 1` occurrences of one index (one
+    // past the segment before the oldest leaves). Upstream zstd keeps them in
+    // `u16` for any `k`; a longer segment than that counts in `u32`.
+    if dmers_in_k < usize::from(u16::MAX) {
+        select_segments::<u16>(sample, dict_size, f, d, &mut freqs, layout)
+    } else {
+        select_segments::<u32>(sample, dict_size, f, d, &mut freqs, layout)
+    }
+}
+
+/// How the corpus is walked: the dmers a segment spans, and the epochs it is
+/// split into.
+#[derive(Clone, Copy)]
+struct EpochLayout {
+    dmers_in_k: usize,
+    epoch_size: usize,
+    epoch_count: usize,
+}
+
+/// A dmer's occurrence count in the candidate window.
+trait WindowCount: Copy + PartialEq + core::ops::AddAssign + core::ops::SubAssign + From<u8> {}
+impl WindowCount for u16 {}
+impl WindowCount for u32 {}
+
+/// Pick a segment per epoch visit until `dict_size` bytes are filled, and
+/// return them as the dictionary.
+fn select_segments<C: WindowCount>(
+    sample: &[u8],
+    dict_size: usize,
+    f: u32,
+    d: usize,
+    freqs: &mut [u32],
+    layout: EpochLayout,
+) -> Result<Vec<u8>, TableTooLarge> {
+    let EpochLayout {
+        dmers_in_k,
+        epoch_size,
+        epoch_count,
+    } = layout;
+    let zero = C::from(0);
+    let one = C::from(1);
+    // Per-window dmer occurrence counts (upstream zstd `segmentFreqs`).
+    let mut segment_freqs = zeroed_counts::<C>(1usize << f)?;
     // Fill from the back (upstream zstd layout) so the best segments sit at the end
     // of the dictionary and get referenced with the smallest offsets.
     let mut out = vec![0u8; dict_size];
@@ -162,15 +253,15 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
         let mut active_score = 0u64;
         while active_end < epoch_end {
             let idx = hash_dmer_index(sample, active_end, f, d);
-            if segment_freqs[idx] == 0 {
+            if segment_freqs[idx] == zero {
                 active_score += u64::from(freqs[idx]);
             }
             active_end += 1;
-            segment_freqs[idx] += 1;
+            segment_freqs[idx] += one;
             if active_end - active_begin == dmers_in_k + 1 {
                 let del = hash_dmer_index(sample, active_begin, f, d);
-                segment_freqs[del] -= 1;
-                if segment_freqs[del] == 0 {
+                segment_freqs[del] -= one;
+                if segment_freqs[del] == zero {
                     active_score -= u64::from(freqs[del]);
                 }
                 active_begin += 1;
@@ -184,7 +275,7 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
         // Reset the window counts for the next epoch.
         while active_begin < epoch_end {
             let del = hash_dmer_index(sample, active_begin, f, d);
-            segment_freqs[del] -= 1;
+            segment_freqs[del] -= one;
             active_begin += 1;
         }
         // Zero the chosen segment's frequencies: its dmers are covered.
@@ -213,7 +304,7 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
     }
 
     out.drain(..tail);
-    out
+    Ok(out)
 }
 
 fn coverage_score(dict: &[u8], eval: &[u8], d: usize, accel: usize) -> usize {
@@ -239,7 +330,11 @@ fn coverage_score(dict: &[u8], eval: &[u8], d: usize, accel: usize) -> usize {
     hits
 }
 
-pub fn train_fastcover_raw(sample: &[u8], dict_size: usize, params: FastCoverParams) -> Vec<u8> {
+pub fn train_fastcover_raw(
+    sample: &[u8],
+    dict_size: usize,
+    params: FastCoverParams,
+) -> Result<Vec<u8>, TableTooLarge> {
     build_raw_dict(sample, dict_size, params)
 }
 
@@ -251,7 +346,7 @@ pub fn optimize_fastcover_raw(
     d_candidates: &[usize],
     f_candidates: &[u32],
     k_values: &[usize],
-) -> (Vec<u8>, FastCoverTuned) {
+) -> Result<(Vec<u8>, FastCoverTuned), TableTooLarge> {
     let d_values = if d_candidates.is_empty() {
         DEFAULT_D_CANDIDATES
     } else {
@@ -275,12 +370,12 @@ pub fn optimize_fastcover_raw(
             f: f_values[0],
             accel,
         });
-        let mut dict = build_raw_dict(sample, dict_size, params);
+        let mut dict = build_raw_dict(sample, dict_size, params)?;
         if dict.is_empty() && dict_size > 0 {
             let take = sample.len().min(dict_size);
             dict.extend_from_slice(&sample[..take]);
         }
-        return (
+        return Ok((
             dict,
             FastCoverTuned {
                 k: params.k,
@@ -289,13 +384,20 @@ pub fn optimize_fastcover_raw(
                 accel: params.accel,
                 score: 0,
             },
-        );
+        ));
     }
 
-    let split = split_point.clamp(0.1, 0.95);
-    let split_idx = ((sample.len() as f64) * split) as usize;
-    let split_idx = split_idx.clamp(1, sample.len().saturating_sub(1));
-    let (train, eval) = sample.split_at(split_idx);
+    // Upstream's split (fastcover.c, `FASTCOVER_ctx_init`): below 1 the corpus
+    // trains on its leading share and is scored on the rest; at 1 it trains
+    // and scores on all of it. A split that is not positive keeps the 0.75
+    // default. The index stays inside the corpus so neither half is empty.
+    let (train, eval) = if split_point >= 1.0 {
+        (sample, sample)
+    } else {
+        let split = if split_point > 0.0 { split_point } else { 0.75 };
+        let split_idx = ((sample.len() as f64) * split) as usize;
+        sample.split_at(split_idx.clamp(1, sample.len() - 1))
+    };
 
     let mut best_dict = Vec::new();
     let mut best = FastCoverTuned {
@@ -310,7 +412,7 @@ pub fn optimize_fastcover_raw(
         for &d in d_values {
             for &k in k_candidates {
                 let params = normalize_fastcover_params(FastCoverParams { k, d, f, accel });
-                let dict = build_raw_dict(train, dict_size, params);
+                let dict = build_raw_dict(train, dict_size, params)?;
                 let score = coverage_score(dict.as_slice(), eval, params.d, params.accel);
                 if best_dict.is_empty() || score > best.score {
                     best.score = score;
@@ -324,7 +426,7 @@ pub fn optimize_fastcover_raw(
         }
     }
 
-    (best_dict, best)
+    Ok((best_dict, best))
 }
 
 #[cfg(test)]

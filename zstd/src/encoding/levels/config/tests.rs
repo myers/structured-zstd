@@ -75,6 +75,79 @@ fn the_estimate_saturates_rather_than_wrapping() {
     );
 }
 
+/// Parameters that override nothing are the level itself, so the estimate for
+/// them is the level's own over every level and source size, with a dictionary
+/// or without; and each knob that resizes what the frame builds moves it.
+/// Both estimates resolve through the path the matcher's reset takes, so a
+/// disagreement here is one of them building something the encoder does not.
+#[test]
+fn the_parameters_estimate_is_the_levels_until_a_knob_resizes_the_frame() {
+    use crate::encoding::{CompressionParameters, DictionarySizes, Strategy};
+    for level in -7..=22 {
+        for source in [None, Some(4 << 10), Some(300 << 10), Some(64 << 20)] {
+            for dictionary in [None, Some(DictionarySizes::raw_content(32 << 10))] {
+                let plain = CompressionParameters::builder(CompressionLevel::Level(level))
+                    .build()
+                    .unwrap();
+                assert_eq!(
+                    super::estimated_compression_workspace_bytes_for_parameters(
+                        &plain, source, dictionary
+                    ),
+                    super::estimated_compression_workspace_bytes_for_run(
+                        CompressionLevel::Level(level),
+                        source,
+                        None,
+                        false,
+                        dictionary,
+                    ),
+                    "level {level}, source {source:?}, dictionary {dictionary:?}"
+                );
+            }
+        }
+    }
+
+    let source = Some(32 << 10);
+    let base = CompressionParameters::builder(CompressionLevel::Level(1))
+        .build()
+        .unwrap();
+    let wider = CompressionParameters::builder(CompressionLevel::Level(1))
+        .hash_log(16)
+        .build()
+        .unwrap();
+    let optimal = CompressionParameters::builder(CompressionLevel::Level(1))
+        .strategy(Strategy::Btultra2)
+        .build()
+        .unwrap();
+    let estimate = |p: &CompressionParameters| {
+        super::estimated_compression_workspace_bytes_for_parameters(p, source, None)
+    };
+    assert!(estimate(&wider) > estimate(&base), "a wider hash table");
+    assert!(
+        estimate(&optimal) > estimate(&base),
+        "the optimal parser's tables and scratch"
+    );
+}
+
+/// An override the builder accepts can ask for a table no 32-bit machine can
+/// hold: `hashLog` 30 is four GiB of Fast table. The estimate has to say so
+/// rather than let the shift lose its high bits and report the table as free,
+/// or a memory ceiling weighed against it admits a run that cannot allocate.
+/// On a 64-bit host the figure is the table's; on a 32-bit one it is pinned.
+#[test]
+fn a_table_wider_than_the_address_space_is_not_estimated_as_nothing() {
+    use crate::encoding::CompressionParameters;
+    let wide = CompressionParameters::builder(CompressionLevel::Level(1))
+        .hash_log(30)
+        .build()
+        .unwrap();
+    let estimate = super::estimated_compression_workspace_bytes_for_parameters(&wide, None, None);
+    let table = (4u64 << 30).min(usize::MAX as u64) as usize;
+    assert!(
+        estimate >= table,
+        "a 2^30-entry table is counted, not shifted away: {estimate}"
+    );
+}
+
 /// Regression: a dictionary whose content cannot be indexed by the tagged
 /// attach tables (Fast / Dfast position fields hold at most 2^24 bytes) is
 /// primed in COPY mode, so the frame must run the CDict's verbatim table
@@ -91,8 +164,9 @@ fn oversized_attach_dictionary_resolves_the_copy_geometry() {
             CompressionLevel::Level(level),
             Some(4096),
             sizes,
+            &Default::default(),
         );
-        let cdict = get_cdict_cparams(level, sizes.serialized);
+        let cdict = get_cdict_cparams(level, sizes.serialized, &Default::default());
         let copy = copy_cparams(
             cdict,
             u32::from(
@@ -141,6 +215,49 @@ fn search_log_override_keeps_the_full_depth_for_chain_and_tree() {
         1 << 7,
         "the tree walk budget is 1 << searchLog, not capped by rowLog"
     );
+}
+
+/// `targetLength` is the Fast strategy's step (upstream zstd_fast.c:
+/// `stepSize = targetLength + !targetLength + 1`), so an explicit one moves
+/// the step exactly as the level's own value does, and zero keeps the
+/// default step.
+#[test]
+fn a_target_length_override_sets_the_fast_step() {
+    use crate::encoding::parameters::ParamOverrides;
+    for (target_length, step) in [(8, 9), (1, 2), (0, 2)] {
+        let ov = ParamOverrides {
+            target_length: Some(target_length),
+            ..Default::default()
+        };
+        let mut params = resolve_level_params(CompressionLevel::Level(1), Some(1 << 20));
+        super::apply_param_overrides(&mut params, &ov);
+        assert_eq!(
+            params.fast.expect("level 1 is a Fast row").step_size,
+            step,
+            "targetLength {target_length}"
+        );
+    }
+}
+
+/// A strategy override moves a frame onto another matcher backend, and only
+/// that backend's tables are built: level 22 run as Fast holds the Fast table,
+/// not the hash-chain tables its own row sized. Its estimate is therefore
+/// level 1's at the same window, not the two added together.
+#[test]
+fn a_strategy_override_counts_only_the_backend_it_selects() {
+    use crate::encoding::{CompressionParameters, Strategy};
+    let as_fast = CompressionParameters::builder(CompressionLevel::Level(22))
+        .strategy(Strategy::Fast)
+        .build()
+        .unwrap();
+    let level_one = CompressionParameters::builder(CompressionLevel::Level(1))
+        .window_log(27)
+        .build()
+        .unwrap();
+    let estimate = |p: &CompressionParameters| {
+        super::estimated_compression_workspace_bytes_for_parameters(p, None, None)
+    };
+    assert_eq!(estimate(&as_fast), estimate(&level_one));
 }
 
 /// The parameters the encoder actually runs for a (level, source size) pair

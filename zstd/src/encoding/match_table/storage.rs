@@ -60,18 +60,6 @@ pub(crate) const REBASE_RESET_FLOOR_CEILING: usize = usize::MAX >> 1;
 pub(crate) const MAX_PRIMED_WINDOW_SIZE: usize =
     (u32::MAX as usize - crate::common::MAX_BLOCK_SIZE as usize) / 2;
 
-/// Frame-level overflow gate shared by `MatchTable`,
-/// `DfastMatchGenerator`, and `RowMatchGenerator`.
-///
-/// Each backend owns its own rolling window and `history_abs_start`
-/// cursor but they all hand absolute positions to inner loops that add
-/// small constants without per-iteration overflow checks. This helper
-/// enforces a single contract: the next `data.len()` bytes — together
-/// with the still-resident `window_size` — must leave at least
-/// `STREAM_ABS_HEADROOM` slack below `usize::MAX`. Failing fast here
-/// lets every downstream `abs_pos + N` site stay raw and keeps i686
-/// streams correct. New match-finder backends with their own
-/// `add_data` path must route through this helper.
 /// Whether a table buffer of `capacity` slots is too big to keep for a layout
 /// of `wanted` slots, and should be handed back rather than re-used.
 ///
@@ -90,6 +78,18 @@ pub(crate) fn capacity_is_oversized(capacity: usize, wanted: usize) -> bool {
     capacity / 2 > wanted
 }
 
+/// Frame-level overflow gate shared by `MatchTable`,
+/// `DfastMatchGenerator`, and `RowMatchGenerator`.
+///
+/// Each backend owns its own rolling window and `history_abs_start`
+/// cursor but they all hand absolute positions to inner loops that add
+/// small constants without per-iteration overflow checks. This helper
+/// enforces a single contract: the next `data.len()` bytes, together
+/// with the still-resident `window_size`, must leave at least
+/// `STREAM_ABS_HEADROOM` slack below `usize::MAX`. Failing fast here
+/// lets every downstream `abs_pos + N` site stay raw and keeps i686
+/// streams correct. New match-finder backends with their own
+/// `add_data` path must route through this helper.
 #[inline]
 pub(crate) fn check_stream_abs_headroom(
     history_abs_start: usize,
@@ -261,7 +261,6 @@ pub(crate) struct MatchTable {
     /// (kept the dict bytes + cached dms in place instead of clear + re-prime).
     /// Signals the frame compressor to SKIP `prime_with_dictionary` this frame.
     pub(crate) dict_resident: bool,
-    pub(crate) allow_zero_relative_position: bool,
     /// HC chain-walk depth, mirrored from `HcMatcher::search_depth` during
     /// `configure()`. Stage D moves the BT walker onto this struct, and the
     /// walker macros read the depth from `$table.search_depth` directly so
@@ -337,7 +336,6 @@ impl Clone for MatchTable {
             dictionary_primed_for_frame: self.dictionary_primed_for_frame,
             dictionary_active: self.dictionary_active,
             dict_resident: self.dict_resident,
-            allow_zero_relative_position: self.allow_zero_relative_position,
             search_depth: self.search_depth,
             is_btultra2: self.is_btultra2,
             uses_bt: self.uses_bt,
@@ -380,7 +378,6 @@ impl Clone for MatchTable {
         self.dictionary_primed_for_frame = source.dictionary_primed_for_frame;
         self.dictionary_active = source.dictionary_active;
         self.dict_resident = source.dict_resident;
-        self.allow_zero_relative_position = source.allow_zero_relative_position;
         self.search_depth = source.search_depth;
         self.is_btultra2 = source.is_btultra2;
         self.uses_bt = source.uses_bt;
@@ -511,7 +508,6 @@ impl MatchTable {
             dictionary_primed_for_frame: false,
             dictionary_active: false,
             dict_resident: false,
-            allow_zero_relative_position: false,
             search_depth: 0,
             is_btultra2: false,
             uses_bt: false,
@@ -523,27 +519,21 @@ impl MatchTable {
         }
     }
 
-    /// Cheap precondition check: can the rebase guard for `abs_pos`
-    /// (against the eventual `max_abs_pos`) be skipped because every
-    /// involved position is already trivially representable as a
-    /// `(rel + 1)` u32? The `is_btultra2` flag tweaks the boundary
-    /// rule: BtUltra2 allows `abs_pos == history_abs_start` even when
-    /// `allow_zero_relative_position` is `false`, matching the upstream zstd
-    /// btultra2 seed-pass behaviour.
+    /// Cheap precondition check: can the rebase guard for every position up
+    /// to `max_abs_pos` be skipped because each is already trivially
+    /// representable as a `(rel + 1)` u32?
     #[inline(always)]
-    pub(crate) fn can_skip_rebase_check_at(
-        &self,
-        abs_pos: usize,
-        max_abs_pos: usize,
-        is_btultra2: bool,
-    ) -> bool {
+    pub(crate) fn can_skip_rebase_check(&self, max_abs_pos: usize) -> bool {
         let max_rel_no_rebase = (u32::MAX as usize).saturating_sub(2);
-        self.position_base == 0
-            && self.index_shift == 0
-            && max_abs_pos <= max_rel_no_rebase
-            && (self.allow_zero_relative_position
-                || abs_pos > self.history_abs_start
-                || (is_btultra2 && abs_pos == self.history_abs_start))
+        // `rel = abs - position_base + index_shift`, whatever the encoding a
+        // frame starts from: a reused compressor's carries the previous
+        // frame's. Every position in play lies at or above `position_base`
+        // (it is only ever set to the floor), so the distance cannot
+        // underflow, and the shift is compared against what is left rather
+        // than added, so nothing overflows either.
+        debug_assert!(self.position_base <= max_abs_pos);
+        let distance = max_abs_pos - self.position_base;
+        distance <= max_rel_no_rebase && self.index_shift <= max_rel_no_rebase - distance
     }
 
     /// Decide whether the table needs a cold rebase before `abs_pos`
@@ -553,14 +543,7 @@ impl MatchTable {
     /// returns `true`. Hot path: ~once per byte, so the function is
     /// kept tight and `#[inline]`.
     #[inline]
-    pub(crate) fn needs_rebase(&self, abs_pos: usize, is_btultra2: bool) -> bool {
-        if is_btultra2
-            && !self.allow_zero_relative_position
-            && self.position_base == 0
-            && abs_pos == 0
-        {
-            return false;
-        }
+    pub(crate) fn needs_rebase(&self, abs_pos: usize) -> bool {
         self.relative_position(abs_pos)
             .is_none_or(|relative| relative >= u32::MAX - 1)
     }
@@ -1321,15 +1304,17 @@ impl MatchTable {
     /// outside the current window's representable range. Upstream zstd parity:
     /// matches the `relIdx` arithmetic in `ZSTD_HcFindBestMatch`.
     pub(crate) fn relative_position(&self, abs_pos: usize) -> Option<u32> {
-        let shifted_abs = abs_pos.checked_add(self.index_shift)?;
-        let rel = shifted_abs.checked_sub(self.position_base)?;
+        // The distance from the floor first: the absolute position plus the
+        // shift need not fit a 32-bit word even when the stored index does,
+        // and an overflow here would read as "rebase now".
+        let rel = abs_pos
+            .checked_sub(self.position_base)?
+            .checked_add(self.index_shift)?;
         let rel_u32 = u32::try_from(rel).ok()?;
-        // Upstream zstd parity: raw BT/HC tables use 0 as the empty sentinel, so
-        // the very first absolute position in the first block
-        // (curr == 0) is not a representable candidate index.
-        if !self.allow_zero_relative_position && self.position_base == 0 && rel_u32 == 0 {
-            return None;
-        }
+        // A frame's first position is a candidate like any other, from a fresh
+        // compressor as from a reused one: upstream zstd starts its indices
+        // above its empty sentinel for exactly that (`ZSTD_WINDOW_START_INDEX`,
+        // `zstd_compress_internal.h`), and the `+ 1` below does it here.
         // Positions are stored as (relative_pos + 1), with 0 reserved
         // as the empty sentinel. So the raw relative position itself
         // must stay strictly below u32::MAX.
@@ -1386,9 +1371,9 @@ impl MatchTable {
     pub(crate) fn bt_pair_index_for_abs(&self, abs_pos: usize) -> usize {
         // Hot per-iteration BT walker entry. `abs_pos` is a
         // frame-lifetime absolute stream cursor (capped by
-        // `check_stream_abs_headroom`); `index_shift` is block-local
-        // (`current_len` during the btultra2 seed pass, `0` otherwise).
-        // The result is immediately masked down to the BT ring width
+        // `check_stream_abs_headroom`); `index_shift` is the offset the
+        // btultra2 seed pass leaves behind, which a reused compressor carries
+        // into later frames until a rebase clears it. The result is immediately masked down to the BT ring width
         // by `& bt_mask()`, so what matters here is only the modulo-
         // ring identity `(a + b) mod m == ((a mod 2^bits) + (b mod
         // 2^bits)) mod m` for `m | 2^bits`: `wrapping_add` preserves
@@ -1415,11 +1400,16 @@ impl MatchTable {
         if stored == HC_EMPTY {
             return None;
         }
-        let shifted = position_base + (stored as usize - 1);
-        if shifted < index_shift {
+        // Subtract before adding: on a 32-bit build the floor reaches half the
+        // address space while a stored index reaches `u32::MAX`, so their sum
+        // does not fit the word. An entry below the shift decodes below
+        // `position_base`, which is at or under the window floor, so it is
+        // rejected here rather than by the window check.
+        let relative = stored as usize - 1;
+        if relative < index_shift {
             return None;
         }
-        Some(shifted - index_shift)
+        Some(position_base + (relative - index_shift))
     }
 
     /// Reset the per-frame portion of the storage for the next
@@ -1491,7 +1481,6 @@ impl MatchTable {
         self.borrowed_input = None;
         self.borrowed_block = None;
         self.dictionary_primed_for_frame = false;
-        self.allow_zero_relative_position = false;
         if let Some(region) = reborrow_region {
             // Keep `[0, region)` (the dict); drop the previous frame's input.
             self.history.truncate(region);
@@ -2263,9 +2252,8 @@ impl MatchTable {
             self.skip_insert_until_abs = self.history_abs_start;
         }
         let mut update_abs = self.skip_insert_until_abs;
-        let is_btultra2 = self.is_btultra2;
         while update_abs < abs_pos {
-            if !self.can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2) {
+            if !self.can_skip_rebase_check(abs_pos) {
                 self.maybe_rebase_positions(update_abs);
             }
             let forward = unsafe {
@@ -2300,9 +2288,8 @@ impl MatchTable {
             self.skip_insert_until_abs = self.history_abs_start;
         }
         let mut update_abs = self.skip_insert_until_abs;
-        let is_btultra2 = self.is_btultra2;
         while update_abs < abs_pos {
-            if !self.can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2) {
+            if !self.can_skip_rebase_check(abs_pos) {
                 self.maybe_rebase_positions(update_abs);
             }
             // SAFETY: same NEON umbrella; direct call inlines the BT-walk body.
@@ -2339,9 +2326,8 @@ impl MatchTable {
             self.skip_insert_until_abs = self.history_abs_start;
         }
         let mut update_abs = self.skip_insert_until_abs;
-        let is_btultra2 = self.is_btultra2;
         while update_abs < abs_pos {
-            if !self.can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2) {
+            if !self.can_skip_rebase_check(abs_pos) {
                 self.maybe_rebase_positions(update_abs);
             }
             let forward =
@@ -2377,9 +2363,8 @@ impl MatchTable {
             self.skip_insert_until_abs = self.history_abs_start;
         }
         let mut update_abs = self.skip_insert_until_abs;
-        let is_btultra2 = self.is_btultra2;
         while update_abs < abs_pos {
-            if !self.can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2) {
+            if !self.can_skip_rebase_check(abs_pos) {
                 self.maybe_rebase_positions(update_abs);
             }
             let forward = unsafe {
@@ -2409,9 +2394,8 @@ impl MatchTable {
             self.skip_insert_until_abs = self.history_abs_start;
         }
         let mut update_abs = self.skip_insert_until_abs;
-        let is_btultra2 = self.is_btultra2;
         while update_abs < abs_pos {
-            if !self.can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2) {
+            if !self.can_skip_rebase_check(abs_pos) {
                 self.maybe_rebase_positions(update_abs);
             }
             let forward =
@@ -2430,11 +2414,10 @@ impl MatchTable {
     }
 
     /// Hash3-only fill up to (but not including) `abs_pos`. Rebase
-    /// guard fires only when `can_skip_rebase_check_at` says we can't
+    /// guard fires only when `can_skip_rebase_check` says we can't
     /// trivially skip — the fast path is a tight loop over `hash3_table`
     /// writes.
     pub(crate) fn update_hash3_until(&mut self, abs_pos: usize) {
-        let is_btultra2 = self.is_btultra2;
         if self.next_to_update3 < self.history_abs_start {
             self.next_to_update3 = self.history_abs_start;
         }
@@ -2454,7 +2437,7 @@ impl MatchTable {
             return;
         }
         while self.next_to_update3 < abs_pos {
-            if !self.can_skip_rebase_check_at(self.next_to_update3, abs_pos, is_btultra2) {
+            if !self.can_skip_rebase_check(abs_pos) {
                 self.maybe_rebase_positions(self.next_to_update3);
             }
             self.insert_hash3_only_no_rebase(self.next_to_update3);
@@ -2470,15 +2453,10 @@ impl MatchTable {
     /// Returns `false` when a precondition does not hold, leaving the cursor
     /// untouched for the caller's general loop.
     ///
-    /// The guard `can_skip_rebase_check_at` asks four things, and only one of
-    /// them moves with the cursor: an untranslated table (`position_base` and
-    /// `index_shift` both zero), a target inside the no-rebase range, and the
-    /// cursor being past `history_abs_start`. The first three are settled
-    /// here; the last is true for every position after the first, so the fast
-    /// loop starts one past it and the boundary position is left to the
-    /// general path. A cursor above `history_abs_start` also cannot be the
-    /// unrepresentable zero relative position, so the stored index is the
-    /// cursor itself and needs no `Option`.
+    /// The guard `can_skip_rebase_check` asks for a target whose stored
+    /// index is representable, which holds for every position below it too,
+    /// so it is settled here once and the stored index is the cursor plus a
+    /// hoisted offset, with no `Option`.
     fn fill_hash3_hoisted(&mut self, abs_pos: usize) -> bool {
         // The slice holds no borrow, so the table write can take `&mut self`
         // (the same reborrow the collect body uses).
@@ -2517,20 +2495,13 @@ impl MatchTable {
         concat_len: usize,
         abs_pos: usize,
     ) -> bool {
-        // `can_skip_rebase_check_at`'s position-independent conjuncts.
-        let max_rel_no_rebase = (u32::MAX as usize).saturating_sub(2);
-        if self.hash3_log == 0
-            || self.position_base != 0
-            || self.index_shift != 0
-            || abs_pos > max_rel_no_rebase
-        {
+        if self.hash3_log == 0 || !self.can_skip_rebase_check(abs_pos) {
             return false;
         }
         let history_abs_start = self.history_abs_start;
         let start = self.next_to_update3;
-        if start <= history_abs_start {
-            // The boundary position needs the `allow_zero` / btultra2 clause,
-            // and it is one position: let the general loop have it.
+        if start < history_abs_start {
+            // Below the live history: the general loop clamps it first.
             return false;
         }
         let hash3_log = self.hash3_log;
@@ -2540,6 +2511,10 @@ impl MatchTable {
         // `abs_pos`.
         let last_insertable = history_abs_start + concat_len.saturating_sub(3);
         let end = abs_pos.min(last_insertable);
+        // `rel = cursor - position_base + index_shift`. Wrapping arithmetic is
+        // exact here: the true value is in range (the gate above), so the sum
+        // modulo the word size is that value.
+        let offset = self.index_shift.wrapping_sub(self.position_base);
         let table = self.hash3_table_mut();
         debug_assert_eq!(table.len(), 1usize << hash3_log);
         let table_ptr = table.as_mut_ptr();
@@ -2552,8 +2527,9 @@ impl MatchTable {
             debug_assert!(hash < 1usize << hash3_log);
             // SAFETY: the hash is masked to `hash3_log` bits and the table
             // holds `1 << hash3_log` slots (asserted above); `cursor` is below
-            // `abs_pos <= u32::MAX - 2`, so `cursor + 1` fits.
-            unsafe { *table_ptr.add(hash) = cursor as u32 + 1 };
+            // `abs_pos`, whose stored index is at most `u32::MAX - 2`, so
+            // `rel + 1` fits.
+            unsafe { *table_ptr.add(hash) = cursor.wrapping_add(offset) as u32 + 1 };
         }
         self.next_to_update3 = abs_pos;
         true
@@ -2565,8 +2541,7 @@ impl MatchTable {
     /// "no rebase needed" branch.
     #[inline]
     pub(crate) fn maybe_rebase_positions(&mut self, abs_pos: usize) {
-        let is_btultra2 = self.is_btultra2;
-        if self.needs_rebase(abs_pos, is_btultra2) {
+        if self.needs_rebase(abs_pos) {
             self.rebase_positions_cold(abs_pos);
         }
     }
@@ -2614,8 +2589,8 @@ impl MatchTable {
     /// `(rel + 1)`-representability check on both ends of the range decides
     /// whether the whole span fits without a rebase. The check is monotone
     /// in `pos` (rebase only fires as the relative position approaches
-    /// `u32::MAX`, or at the reserved stream-origin `rel == 0`), so when
-    /// neither end needs a rebase no interior position can either, and the
+    /// `u32::MAX`), so when neither end needs a rebase no interior position
+    /// can either, and the
     /// fill runs as a tight loop with raw `(pos - position_base)` index
     /// arithmetic and hoisted base pointers. This mirrors the upstream zstd's
     /// once-per-block `ZSTD_window_correctOverflow` followed by an
@@ -2624,12 +2599,10 @@ impl MatchTable {
     /// rebase is required the cold per-position path runs unchanged.
     pub(crate) fn insert_positions(&mut self, start: usize, end: usize) {
         if start < end {
-            let is_btultra2 = self.is_btultra2;
-            if self.needs_rebase(start, is_btultra2) || self.needs_rebase(end - 1, is_btultra2) {
+            if self.needs_rebase(start) || self.needs_rebase(end - 1) {
                 // Cold path: at least one position in the range needs a
                 // rebase. Defer to the guarded per-position insert, which
-                // rebases exactly when each position requires it (including
-                // the reserved `rel == 0` stream-origin skip).
+                // rebases exactly when each position requires it.
                 for pos in start..end {
                     self.insert_position(pos);
                 }
@@ -2670,8 +2643,8 @@ impl MatchTable {
     }
 
     /// Tight hash/chain fill for `[start, end)` when the caller has already
-    /// proven every position is `(rel + 1)`-representable (so no rebase and
-    /// no `rel == 0` skip can occur). Equivalent to looping
+    /// proven every position is `(rel + 1)`-representable (so no rebase can
+    /// occur). Equivalent to looping
     /// [`Self::insert_position_no_rebase`], but with the table base pointers
     /// and config hoisted out of the loop and the relative position derived
     /// by a raw subtraction instead of the checked `relative_position`
@@ -2715,9 +2688,10 @@ impl MatchTable {
         // `ip++ / idx++` fill rather than recomputing them from `pos`.
         let mut src = unsafe { concat_ptr.add(start - history_abs_start) };
         // `rel` cannot reach `u32::MAX` because the caller proved
-        // `!needs_rebase(end - 1)`; `wrapping_add` keeps the overflow branch
-        // off this per-byte hot loop.
-        let mut rel = (start + index_shift - position_base) as u32;
+        // `!needs_rebase(end - 1)`, and the `wrapping_add` below keeps the
+        // overflow branch off this per-byte hot loop. The distance from the
+        // floor comes first so the sum stays in range on a 32-bit word.
+        let mut rel = (start - position_base + index_shift) as u32;
         for _ in start..hashable_end {
             // SAFETY: every `src` in `[start, hashable_end)` is at least 4
             // bytes from the end of `history`, so the unaligned 4-byte read is
@@ -3073,7 +3047,6 @@ impl MatchTable {
     pub(crate) fn begin_rebase(&mut self) {
         self.position_base = self.history_abs_start;
         self.index_shift = 0;
-        self.allow_zero_relative_position = true;
         // One buffer holds all three regions, so one fill clears them.
         self.tables.fill(HC_EMPTY);
     }

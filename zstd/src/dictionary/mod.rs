@@ -78,6 +78,8 @@ pub struct FastCoverOptions {
     pub accel: usize,
     pub k: usize,
     pub d: usize,
+    /// Width of the dmer frequency table in bits, `1..=31`; its memory grows
+    /// as `2^f`. A value outside the range is brought to the nearest end.
     pub f: u32,
     pub k_candidates: Vec<usize>,
     pub d_candidates: Vec<usize>,
@@ -194,6 +196,9 @@ pub fn create_raw_dict_from_dir<P: AsRef<Path>, W: io::Write>(
 /// the dictionary. The provided reader need not be buffered, but callers should avoid
 /// sources too large to fit comfortably in memory.
 ///
+/// A corpus already in memory trains without this copy through
+/// [`create_raw_dict_from_slice`].
+///
 /// # API note
 /// This public API returns `io::Result<()>` and propagates source/output I/O failures.
 pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
@@ -208,7 +213,36 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     let prealloc = source_size.min(MAX_TRAINING_PREALLOC_BYTES);
     let mut all = Vec::with_capacity(prealloc);
     source.read_to_end(&mut all)?;
-    if all.is_empty() {
+    create_raw_dict_from_slice(&all, output, dict_size)
+}
+
+/// Create a "raw content" dictionary of at most `dict_size` bytes from a
+/// corpus already in memory, writing it to `output`.
+///
+/// The same training as [`create_raw_dict_from_source`], reading `source` in
+/// place: a caller that holds the samples anyway does not pay for a second
+/// copy of them.
+///
+/// # Errors
+/// Returns the error `output` reports while the dictionary is written.
+///
+/// # Examples
+/// ```
+/// use structured_zstd::dictionary::create_raw_dict_from_slice;
+///
+/// let corpus: Vec<u8> = (0..20_000u32)
+///     .flat_map(|i| format!("record {} value {}\n", i % 100, i % 7).into_bytes())
+///     .collect();
+/// let mut dict = Vec::new();
+/// create_raw_dict_from_slice(&corpus, &mut dict, 4096).unwrap();
+/// assert!(!dict.is_empty() && dict.len() <= 4096);
+/// ```
+pub fn create_raw_dict_from_slice<W: io::Write>(
+    all: &[u8],
+    output: &mut W,
+    dict_size: usize,
+) -> io::Result<()> {
+    if dict_size == 0 || all.is_empty() {
         return Ok(());
     }
 
@@ -231,7 +265,7 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     let mut sample_size = source_size / sample_scale;
     sample_size = usize::max(sample_size, usize::min(source_size, 16));
     vprintln!("create_dict: creating {sample_size} byte sample of collection");
-    let mut sample_reader = all.as_slice();
+    let mut sample_reader = all;
     let collection_sample = create_sample(&mut sample_reader, sample_size);
 
     // A collection of segments to be used in the final dictionary.
@@ -532,13 +566,14 @@ pub fn finalize_raw_dict(
     Ok(out)
 }
 
-/// Train a raw FastCOVER dictionary from a source stream.
+/// Train a raw FastCOVER dictionary from a source stream. A frequency table
+/// wider than memory allows is an `OutOfMemory` error.
 fn train_fastcover_internal(
     sample: &[u8],
     dict_size: usize,
     options: &FastCoverOptions,
-) -> (Vec<u8>, FastCoverTuned) {
-    if options.optimize {
+) -> io::Result<(Vec<u8>, FastCoverTuned)> {
+    let trained = if options.optimize {
         fastcover::optimize_fastcover_raw(
             sample,
             dict_size,
@@ -555,15 +590,30 @@ fn train_fastcover_internal(
             f: options.f,
             accel: options.accel,
         });
-        (
-            fastcover::train_fastcover_raw(sample, dict_size, params),
-            FastCoverTuned {
-                k: params.k,
-                d: params.d,
-                f: params.f,
-                accel: params.accel,
-                score: 0,
-            },
+        fastcover::train_fastcover_raw(sample, dict_size, params).map(|dict| {
+            (
+                dict,
+                FastCoverTuned {
+                    k: params.k,
+                    d: params.d,
+                    f: params.f,
+                    accel: params.accel,
+                    score: 0,
+                },
+            )
+        })
+    };
+    trained.map_err(io::Error::from)
+}
+
+impl From<fastcover::TableTooLarge> for io::Error {
+    fn from(table: fastcover::TableTooLarge) -> Self {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!(
+                "a FastCOVER table of {} entries does not fit in memory; use a smaller f",
+                table.entries
+            ),
         )
     }
 }
@@ -580,7 +630,7 @@ pub fn train_fastcover_raw_from_slice(
             "source stream is empty",
         ));
     }
-    let (dict, tuned) = train_fastcover_internal(sample, dict_size, options);
+    let (dict, tuned) = train_fastcover_internal(sample, dict_size, options)?;
     if dict.is_empty() && dict_size > 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -688,7 +738,8 @@ pub(crate) fn dict_roundtrip_fixture() -> (
             f: 20,
             accel: 1,
         },
-    );
+    )
+    .expect("a 2^20 table fits");
     let finalized = finalize_raw_dict(
         raw.as_slice(),
         sample.as_slice(),
