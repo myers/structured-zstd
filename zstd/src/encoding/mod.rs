@@ -392,6 +392,58 @@ impl DictionarySizes {
     }
 }
 
+/// Bytes below which a frame is still about its dictionary rather than about
+/// its own content (upstream `ZSTD_USE_CDICT_PARAMS_SRCSIZE_CUTOFF`).
+const DICTIONARY_DESCRIBES_FRAME_BELOW: u64 = 128 * 1024;
+/// Multiple of the dictionary's content below which the same holds however
+/// large both are (upstream `ZSTD_USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER`).
+const DICTIONARY_DESCRIBES_FRAME_MULTIPLE: u64 = 6;
+
+/// Whether a dictionary of `dict_content` bytes still describes a frame over
+/// `src_size` bytes (`None` = not yet known), so that the shape it was prepared
+/// with is the frame's too.
+///
+/// A source under 128 KiB, or under six times the dictionary, is about the
+/// dictionary: the tables it was prepared with are the right ones and can be
+/// searched in place. Past that the frame is about its own content, and a shape
+/// chosen for a dictionary undersizes it. A frame of unknown size keeps the
+/// dictionary's shape, having nothing better to go on. Upstream weighs the same
+/// three things at `ZSTD_compressBegin_internal` (zstd_compress.c:5254).
+///
+/// A size of `u64::MAX` is the encoder's "unknown" sentinel, not a source of
+/// that many bytes, and counts as unknown here too.
+///
+/// This is the codec's rule, exported so that every surface in front of it
+/// (the C ABI included) asks rather than re-deciding.
+///
+/// # Examples
+/// ```
+/// use structured_zstd::encoding::dictionary_describes_frame;
+///
+/// // A few kilobytes against a 4 KiB dictionary: about the dictionary.
+/// assert!(dictionary_describes_frame(4096, Some(8192)));
+/// // A megabyte against the same: about itself.
+/// assert!(!dictionary_describes_frame(4096, Some(1 << 20)));
+/// // Unknown, so there is nothing better than the dictionary's own shape.
+/// assert!(dictionary_describes_frame(4096, None));
+/// assert!(dictionary_describes_frame(4096, Some(u64::MAX)));
+/// ```
+pub fn dictionary_describes_frame(dict_content: usize, src_size: Option<u64>) -> bool {
+    if dict_content == 0 {
+        return false;
+    }
+    let Some(src) = src_size.filter(|size| *size != crate::encoding::cparams::CONTENTSIZE_UNKNOWN)
+    else {
+        return true;
+    };
+    // Asked as a division rather than `src < dict * 6`: this is public, so the
+    // dictionary is whatever the caller names, and six times a large one does
+    // not fit the type. For integers the two are the same question, and a
+    // division of a `u64` by a constant cannot overflow.
+    src < DICTIONARY_DESCRIBES_FRAME_BELOW
+        || src / DICTIONARY_DESCRIBES_FRAME_MULTIPLE < dict_content as u64
+}
+
 /// Trait used by the encoder that users can use to extend the matching facilities with their own algorithm
 /// making their own tradeoffs between runtime, memory usage and compression ratio
 ///
@@ -578,3 +630,5 @@ pub enum Sequence<'data> {
 
 #[cfg(test)]
 mod compress_bound_tests;
+#[cfg(test)]
+mod tests;

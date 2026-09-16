@@ -30,8 +30,10 @@ pub(crate) const ZSTD_DCT_AUTO: c_int = 0;
 pub(crate) const ZSTD_DCT_RAW_CONTENT: c_int = 1;
 pub(crate) const ZSTD_DCT_FULL_DICT: c_int = 2;
 
-/// `ZSTD_dictMagicNumber` little-endian prefix of a serialized dictionary.
-const DICT_MAGIC: u32 = 0xEC30_A437;
+/// `ZSTD_dictMagicNumber` little-endian prefix of a serialized dictionary,
+/// read off the codec's own magic rather than re-declared, so the two cannot
+/// disagree about what a dictionary looks like.
+const DICT_MAGIC: u32 = u32::from_le_bytes(codec::decoding::DICTIONARY_MAGIC);
 
 /// Synthetic non-zero ID for raw-content dictionaries. The encoder attach
 /// path requires a non-zero ID, but raw-content frames never put it on the
@@ -188,22 +190,64 @@ fn encode_raw_content(dict: &[u8], content_type: c_int) -> Result<bool, ZSTD_Err
     }
 }
 
+/// Whether `cdict`'s own compression parameters still describe a frame over
+/// `src_size` bytes (`None` = not yet known), and so drive it.
+///
+/// The size question is the codec's
+/// ([`codec::encoding::dictionary_describes_frame`]); this only adds what the
+/// codec cannot see, that a `CDict` built through the advanced constructor
+/// carries explicit parameters rather than a level of its own and so always
+/// drives the frame (upstream marks it `ZSTD_NO_CLEVEL`, zstd_compress.c:5636,
+/// and reads it back at :5254 and :5837).
+pub(crate) fn cdict_params_describe_frame(cdict: &ZSTD_CDict, src_size: Option<u64>) -> bool {
+    cdict.params.is_some()
+        || codec::encoding::dictionary_describes_frame(cdict.dict.content_size(), src_size)
+}
+
 impl ZSTD_CCtx {
-    /// The explicit parameters the next frame runs under, `None` for its
-    /// level's own tuning: a referenced CDict's win over the sticky knobs
-    /// (upstream rule), which are resolved (and can reject) only when they
-    /// drive the frame, so an unsupported sticky combination cannot break a
-    /// valid `RefCDict` path.
-    pub(crate) fn frame_parameters(&self) -> Result<Option<CompressionParameters>, ZSTD_ErrorCode> {
-        match &self.attached_dict {
+    /// Whether a referenced CDict's own compression parameters drive the next
+    /// frame over `src_size` bytes (`None` = not yet known).
+    ///
+    /// Upstream `ZSTD_compressBegin_internal` (zstd_compress.c:5254) takes them
+    /// while the frame is still about the dictionary: a source under 128 KiB,
+    /// under six times the dictionary content, or of unknown size. Past that
+    /// the context is reset from the parameters the caller asked for and the
+    /// dictionary is loaded into those tables, so a caller who sets a level
+    /// next to a CDict of another one gets the level they set.
+    ///
+    /// A CDict built through the advanced constructor is the exception and
+    /// always wins: it carries explicit parameters rather than a level of its
+    /// own, which upstream marks with `ZSTD_NO_CLEVEL` (zstd_compress.c:5636)
+    /// and reads back at the same branch.
+    fn cdict_params_drive_frame(&self, src_size: Option<u64>) -> bool {
+        let CCtxDictAttach::RefCDict { cdict, .. } = &self.attached_dict else {
+            return false;
+        };
+        // SAFETY: C contract — live CDict (see `CCtxDictAttach::prepared`).
+        cdict_params_describe_frame(unsafe { &**cdict }, src_size)
+    }
+
+    /// The explicit parameters the next frame over `src_size` bytes runs under,
+    /// `None` for its level's own tuning: a referenced CDict's win over the
+    /// sticky knobs while [`Self::cdict_params_drive_frame`] holds, and the
+    /// sticky ones are resolved (and can reject) only when they drive the
+    /// frame, so an unsupported sticky combination cannot break a valid
+    /// `RefCDict` path that never reads them.
+    pub(crate) fn frame_parameters(
+        &self,
+        src_size: Option<u64>,
+    ) -> Result<Option<CompressionParameters>, ZSTD_ErrorCode> {
+        if self.cdict_params_drive_frame(src_size) {
             // SAFETY: C contract — live CDict (see `CCtxDictAttach::prepared`).
-            CCtxDictAttach::RefCDict { cdict, .. } => Ok(unsafe { &**cdict }.params),
-            _ => self
-                .params
-                .resolve()
-                .map(Some)
-                .ok_or(ZSTD_ErrorCode::ZSTD_error_parameter_combination_unsupported),
+            let CCtxDictAttach::RefCDict { cdict, .. } = &self.attached_dict else {
+                unreachable!("only a referenced CDict drives a frame's parameters")
+            };
+            return Ok(unsafe { &**cdict }.params);
         }
+        self.params
+            .resolve()
+            .map(Some)
+            .ok_or(ZSTD_ErrorCode::ZSTD_error_parameter_combination_unsupported)
     }
 
     /// Identity of the attached dictionary for the compressors that hold it
@@ -217,15 +261,19 @@ impl ZSTD_CCtx {
         }
     }
 
-    /// The compression level frames must use under the current attach:
-    /// a referenced CDict's parameters win over the context's sticky level
-    /// (upstream rule); every other attach keeps the context level.
-    pub(crate) fn attach_level(&self) -> c_int {
-        match &self.attached_dict {
+    /// The compression level the next frame over `src_size` bytes must use
+    /// under the current attach: a referenced CDict's level wins over the
+    /// context's sticky one while [`Self::cdict_params_drive_frame`] holds;
+    /// every other attach, and a source past that, keeps the context level.
+    pub(crate) fn attach_level(&self, src_size: Option<u64>) -> c_int {
+        if self.cdict_params_drive_frame(src_size) {
             // SAFETY: C contract — live CDict (see `CCtxDictAttach::prepared`).
-            CCtxDictAttach::RefCDict { cdict, .. } => unsafe { &**cdict }.level,
-            _ => self.params.level,
+            let CCtxDictAttach::RefCDict { cdict, .. } = &self.attached_dict else {
+                unreachable!("only a referenced CDict drives a frame's level")
+            };
+            return unsafe { &**cdict }.level;
         }
+        self.params.level
     }
 
     /// Drop a single-use prefix after the frame that consumed it started.

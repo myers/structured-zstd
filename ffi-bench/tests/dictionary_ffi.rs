@@ -123,6 +123,63 @@ fn dict_frames_decode_with_c_across_levels_and_reuse() {
     }
 }
 
+/// A source far larger than its dictionary must be no larger than the
+/// reference's frame, on the shape this codec keeps for it.
+///
+/// The reference stops lending a dictionary its shape once the source outgrows
+/// it (`ZSTD_compressBegin_internal`, zstd_compress.c:5254) and resolves the
+/// frame's own instead. This codec keeps the dictionary's, deliberately: doing
+/// it the reference's way was measured at five to ten times the time for the
+/// same bytes. So the two sides reach a megabyte of content through differently
+/// shaped tables, and what this pins is that ours does not pay for that in
+/// ratio.
+#[test]
+fn a_source_far_larger_than_its_dictionary_is_no_larger_than_the_reference() {
+    use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
+
+    let dict_bytes = repeated_log_lines(8 * 1024);
+    let samples: Vec<&[u8]> = dict_bytes.chunks(256).collect();
+    let dict = zstd::dict::from_samples(&samples, dict_bytes.len() / 8)
+        .expect("dictionary should train from the log-line samples");
+    // Past both cutoffs: over 128 KiB and over six times the dictionary.
+    let payload = repeated_log_lines(1 << 20);
+    assert!(payload.len() > 6 * dict.len());
+
+    for level in [1i32, 3, 5] {
+        let mut cctx: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(level));
+        cctx.set_dictionary_id_flag(false);
+        cctx.set_dictionary(
+            structured_zstd::decoding::Dictionary::from_serialized_or_raw_content(dict.as_slice())
+                .expect("dictionary parses"),
+        )
+        .expect("attach dict");
+        cctx.set_source_size_hint(payload.len() as u64);
+        let ours = cctx.compress_independent_frame(&payload);
+
+        let mut reference = zstd::bulk::Compressor::with_dictionary(level, dict.as_slice())
+            .expect("reference accepts the dictionary");
+        let theirs = reference
+            .compress(&payload)
+            .expect("reference compresses the payload");
+
+        assert!(
+            ours.len() <= theirs.len(),
+            "level {level}: {} bytes against the reference's {}",
+            ours.len(),
+            theirs.len(),
+        );
+
+        // And it decodes there, dictionary and all.
+        let mut decoder = zstd::bulk::Decompressor::with_dictionary(dict.as_slice())
+            .expect("reference accepts the dictionary for decoding");
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder
+            .decompress_to_buffer(ours.as_slice(), &mut decoded)
+            .expect("the reference decodes our frame");
+        assert_eq!(decoded, payload);
+    }
+}
+
 /// A dictionary frame on the optimal band must not come out LARGER than the
 /// reference's, on input the dictionary describes well.
 ///

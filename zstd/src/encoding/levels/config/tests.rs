@@ -6,6 +6,42 @@ use crate::encoding::CompressionLevel;
 use crate::encoding::cparams::get_cparams;
 use crate::encoding::strategy::{SearchMethod, StrategyTag};
 
+/// A dictionary lends the frame its shape however large the source is.
+///
+/// Upstream stops doing that once the source outgrows the dictionary and
+/// resolves the frame's own instead (zstd_compress.c:5264). That was measured
+/// and rejected: on a 1 MiB source with a 3 KB dictionary, resolving the
+/// frame's own shape cost 5.30 ms at level 9 against 0.51 ms for the prepared
+/// shape, for the same 246 bytes out, while the reference itself takes 1.37 ms
+/// and 1243 bytes there. So the shape stays the dictionary's whatever the
+/// source, and this pins that a source far past upstream's cutoff still
+/// resolves through the same path as one under it.
+#[test]
+fn a_dictionary_lends_its_shape_whatever_the_source_size() {
+    let level = CompressionLevel::Level(9);
+    let sizes = crate::encoding::DictionarySizes::raw_content(4096);
+    let overrides = crate::encoding::parameters::ParamOverrides::default();
+
+    // Either side of the size at which upstream would switch (128 KiB, or six
+    // times the dictionary).
+    let (small, _) =
+        super::resolve_level_params_with_dict(level, Some(8 * 1024), sizes, &overrides);
+    let (large, _) =
+        super::resolve_level_params_with_dict(level, Some(4 * 1024 * 1024), sizes, &overrides);
+
+    // Same dictionary, same shape: the source moves the window, never the
+    // strategy or the parse the dictionary was prepared with.
+    assert_eq!(small.strategy_tag, large.strategy_tag);
+    assert_eq!(small.search, large.search);
+    assert_eq!(small.lazy_depth, large.lazy_depth);
+    assert!(
+        large.window_log >= small.window_log,
+        "the window still follows the source: {} against {}",
+        large.window_log,
+        small.window_log
+    );
+}
+
 /// The estimate is a budget figure, so it answers for whatever it is asked —
 /// including a window log no encoder would accept. Shifting by one is undefined
 /// past the width of the type, so an unbounded value turns a question about

@@ -16,8 +16,9 @@ use crate::context::{ZSTD_CCtx, ZSTD_DCtx};
 use crate::error::{ZSTD_ErrorCode, code_for_decoder_error, encode};
 use crate::params::CONTENTSIZE_UNKNOWN;
 
-/// `ZSTD_BLOCKSIZE_MAX`: 128 KiB, the recommended streaming input granule.
-const BLOCK_SIZE_MAX: usize = 128 * 1024;
+/// `ZSTD_BLOCKSIZE_MAX`, the recommended streaming input granule. The codec's
+/// block maximum, named rather than re-declared.
+const BLOCK_SIZE_MAX: usize = codec::MAX_BLOCK_SIZE as usize;
 
 /// `ZSTD_inBuffer` — ABI mirror: `{ const void* src; size_t size; size_t pos }`.
 #[repr(C)]
@@ -144,8 +145,14 @@ impl ZSTD_CCtx {
             return Ok(());
         }
         let params = self.params;
-        let frame_params = self.frame_parameters()?;
-        let level = self.attach_level();
+        // A stream knows its size only if the caller pledged one; without a
+        // pledge the frame is of unknown size, which is where a referenced
+        // CDict's own parameters are the better guess (upstream reads
+        // `pledgedSrcSize` at the same branch).
+        let src_size = (params.pledged_src_size != crate::params::CONTENTSIZE_UNKNOWN)
+            .then_some(params.pledged_src_size);
+        let frame_params = self.frame_parameters(src_size)?;
+        let level = self.attach_level(src_size);
         let serial = self.attach_serial();
         let suppress_id = self.attach_suppresses_dict_id();
         let ZSTD_CCtx {

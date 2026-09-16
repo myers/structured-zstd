@@ -39,10 +39,11 @@ pub(crate) fn next_dict_serial() -> u64 {
     DICT_SERIAL.fetch_add(1, Ordering::Relaxed)
 }
 
-/// `ZSTD_dictMagicNumber` (`zstd.h`). A serialized zstd dictionary begins with
-/// this little-endian magic; bytes `[4..8]` hold the dictionary ID. Raw-content
-/// dictionaries carry no magic and report ID 0.
-const DICT_MAGIC: u32 = 0xEC30_A437;
+/// `ZSTD_dictMagicNumber` (`zstd.h`): a serialized zstd dictionary begins with
+/// this little-endian magic and bytes `[4..8]` hold the dictionary ID, while
+/// raw-content dictionaries carry no magic and report ID 0. Read off the
+/// codec's own magic rather than re-declared, so the two cannot disagree.
+const DICT_MAGIC: u32 = u32::from_le_bytes(codec::decoding::DICTIONARY_MAGIC);
 
 /// Parse the dictionary ID from a serialized dictionary header, or `0` for a
 /// raw-content dictionary (no magic) / too-short buffer. Matches
