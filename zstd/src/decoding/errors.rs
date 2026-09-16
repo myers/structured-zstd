@@ -265,6 +265,25 @@ pub enum DecompressBlockError {
     SequencesHeaderParseError(SequencesHeaderParseError),
     DecodeSequenceError(DecodeSequenceError),
     ExecuteSequencesError(ExecuteSequencesError),
+    /// The block's literals, or its whole output, run past the block maximum
+    /// (RFC 8878 3.1.1.2.4, `Block_Maximum_Size`): `size` bytes where
+    /// `maximum` is the most a block of this frame may produce, the smaller of
+    /// its window and 128 KiB.
+    ExpandsPastBlockMaximum {
+        size: usize,
+        maximum: usize,
+    },
+    /// A block with no sequences whose literals do not fit a fixed-capacity
+    /// backend: `requested` bytes at `tail` against `capacity`. The block is
+    /// within the block maximum, so this says the caller's slice is short, and
+    /// the frame decoder turns it into `TargetTooSmall` (or a content-size
+    /// mismatch for a frame that declared one). Growable backends grow instead
+    /// and never produce it.
+    LiteralsOutputOverflow {
+        tail: usize,
+        requested: usize,
+        capacity: usize,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -302,6 +321,18 @@ impl core::fmt::Display for DecompressBlockError {
             DecompressBlockError::SequencesHeaderParseError(e) => write!(f, "{e:?}"),
             DecompressBlockError::DecodeSequenceError(e) => write!(f, "{e:?}"),
             DecompressBlockError::ExecuteSequencesError(e) => write!(f, "{e:?}"),
+            DecompressBlockError::ExpandsPastBlockMaximum { size, maximum } => write!(
+                f,
+                "Block expands to {size} bytes, past this frame's maximum of {maximum}"
+            ),
+            DecompressBlockError::LiteralsOutputOverflow {
+                tail,
+                requested,
+                capacity,
+            } => write!(
+                f,
+                "Literals would write past the output buffer: tail={tail}, requested={requested}, capacity={capacity}"
+            ),
         }
     }
 }

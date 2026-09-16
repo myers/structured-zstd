@@ -84,7 +84,6 @@ fn decode_symbol_and_advance_scalar_matches_manual_transition() {
 
     let mut decoder = HuffmanDecoder {
         table: &table,
-        kernel: HuffmanDecodeKernel::Scalar,
         state: initial_state,
     };
     let mut br =
@@ -95,23 +94,79 @@ fn decode_symbol_and_advance_scalar_matches_manual_transition() {
     assert_eq!(decoder.state, expected_state);
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// The state advance is the kernel's own instruction (`bzhi` where the tier
+/// has it, the table's mask elsewhere) and every tier must agree bit for bit,
+/// since the stream they decode does not know which one ran. Every kernel the
+/// dispatcher can select on this build runs here, not just the first one.
+///
+/// The state starts nonzero and the entry decodes fewer bits than the table's
+/// width, so the masked value is nonzero too: a kernel that masked wrongly
+/// would show it.
 #[test]
-fn select_x86_kernel_ordering_is_stable() {
-    assert_eq!(
-        select_x86_huffman_decode_kernel(true, true, true, true, true, true),
-        HuffmanDecodeKernel::X86Vbmi2
-    );
-    assert_eq!(
-        select_x86_huffman_decode_kernel(false, false, false, false, true, true),
-        HuffmanDecodeKernel::X86Avx2
-    );
-    assert_eq!(
-        select_x86_huffman_decode_kernel(false, false, false, false, true, false),
-        HuffmanDecodeKernel::X86Bmi2
-    );
-    assert_eq!(
-        select_x86_huffman_decode_kernel(false, false, false, false, false, true),
-        HuffmanDecodeKernel::Scalar
-    );
+fn every_kernel_advances_the_state_alike() {
+    let mut table = test_table();
+    // State 3 decoding one bit leaves `(3 << 1) & 0b11 == 0b10` behind, so the
+    // mask has something to keep and a kernel that masked wrongly would show.
+    table.packed_decode[3] = u16::from(b'D') | (1u16 << 8);
+    let source = [0b10101010, 0b01010101];
+    const START: u64 = 3;
+
+    let mut scalar = HuffmanDecoder::new(&table);
+    scalar.state = START;
+    let mut scalar_br = BitReaderReversed::<crate::cpu_kernel::ScalarKernel>::new(&source);
+    let scalar_symbol = scalar.decode_symbol_and_advance(&mut scalar_br);
+    assert_ne!(scalar.state, 0, "the masked state must be nonzero");
+
+    /// Run one kernel over the same bits from the same state and compare.
+    macro_rules! same_as_scalar {
+        ($kernel:ty) => {{
+            let mut decoder = HuffmanDecoder::new(&table);
+            decoder.state = START;
+            let mut reader = BitReaderReversed::<$kernel>::new(&source);
+            assert_eq!(
+                decoder.decode_symbol_and_advance(&mut reader),
+                scalar_symbol,
+                "{} decoded another symbol",
+                stringify!($kernel)
+            );
+            assert_eq!(
+                decoder.state,
+                scalar.state,
+                "{} advanced the state differently",
+                stringify!($kernel)
+            );
+        }};
+    }
+
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-bmi2"
+    ))]
+    if std::arch::is_x86_feature_detected!("bmi2") {
+        same_as_scalar!(crate::cpu_kernel::Bmi2Kernel);
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("bmi2") {
+        same_as_scalar!(crate::cpu_kernel::Avx2Kernel);
+    }
+    // The same predicate the kernel selection uses, in full: the tier mixes
+    // VBMI2 with AVX2 widths and BMI2 masking, so a CPU that offers VBMI2 while
+    // masking any of the rest must not reach this monomorph. It would decode
+    // through instructions it does not have.
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
+    if std::arch::is_x86_feature_detected!("avx512vbmi2")
+        && std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512vl")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("bmi2")
+        && std::arch::is_x86_feature_detected!("avx2")
+    {
+        same_as_scalar!(crate::cpu_kernel::Vbmi2Kernel);
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
+    same_as_scalar!(crate::cpu_kernel::NeonKernel);
+    #[cfg(all(target_arch = "aarch64", feature = "kernel-sve", feature = "std"))]
+    if std::arch::is_aarch64_feature_detected!("sve") {
+        same_as_scalar!(crate::cpu_kernel::SveKernel);
+    }
 }

@@ -113,6 +113,14 @@ pub(crate) trait BufferBackend: Sized {
     /// const: the dispatch-site branch folds away per backend.
     const INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER: bool = true;
 
+    /// Whether a write can fail for want of room. `false` for the growable
+    /// backends, which allocate instead: their write sites take the infallible
+    /// path and the fallible arm is dead-eliminated, keeping the code the
+    /// optimiser sees over a hot block body unchanged. `UserSliceBackend`
+    /// overrides it, because the caller's slice cannot grow and a write past it
+    /// is an error to report rather than an assert to trip.
+    const FIXED_CAPACITY: bool = false;
+
     /// Upstream zstd's `ZSTD_execSequence` body
     /// (zstd_decompress_block.c:1008-1105). Writes `lit_length` bytes
     /// from `lit_src` at the current tail, then writes `match_length`
@@ -356,6 +364,12 @@ pub(crate) trait BufferBackend: Sized {
     /// `push`/`repeat` path grows through `try_reserve`). Default no-op for
     /// fixed-capacity backends (`UserSliceBackend`), which are already bounded.
     fn set_max_capacity(&mut self, _max_capacity: usize) {}
+
+    /// Live byte count the frame's decode tops out at (window plus one
+    /// block), which amortized growth stops at instead of doubling past it.
+    /// Only `RingBuffer` grows by doubling across a whole window; the flat
+    /// backends are sized once per frame and take this no-op.
+    fn set_growth_limit(&mut self, _growth_limit: usize) {}
 
     /// Live byte count: bytes between the logical head and tail.
     fn len(&self) -> usize;

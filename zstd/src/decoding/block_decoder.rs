@@ -6,7 +6,9 @@ use super::super::blocks::sequence_section::SequencesHeader;
 use super::literals_section_decoder::{LiteralsView, decode_literals_zerocopy};
 use super::sequence_section_decoder::decode_and_execute_sequences;
 use crate::common::MAX_BLOCK_SIZE;
-use crate::cpu_kernel::{CpuKernelTag, detect_cpu_kernel};
+use crate::cpu_kernel::CpuKernelTag;
+#[cfg(any(test, feature = "bench-internals"))]
+use crate::cpu_kernel::detect_cpu_kernel;
 use crate::decoding::errors::DecodeSequenceError;
 use crate::decoding::errors::{
     BlockHeaderReadError, BlockSizeError, BlockTypeError, DecodeBlockContentError,
@@ -33,12 +35,85 @@ enum DecoderState {
     Failed, //TODO put "self.internal_state = DecoderState::Failed;" everywhere an unresolvable error occurs
 }
 
-/// Create a new [BlockDecoder].
+/// The most a block of a frame with `window_size` may produce: the smaller of
+/// the window and 128 KiB (RFC 8878 3.1.1.2.4), which upstream keeps per frame
+/// as `blockSizeMax`. A single-segment frame's window is its content size, so
+/// such a frame's blocks are bounded by the content as well.
+#[inline]
+pub(crate) fn block_maximum(window_size: usize) -> usize {
+    window_size.min(MAX_BLOCK_SIZE as usize)
+}
+
+/// A Raw or RLE block states its output in its header, so it is held to the
+/// frame's block maximum before anything is written, as upstream checks `rSize`
+/// against `blockSizeMax` in `ZSTD_decompressContinue`. A compressed block's
+/// output is only known as it decodes, and is checked there.
+#[inline]
+fn block_fits_the_maximum(
+    header: &BlockHeader,
+    window_size: usize,
+) -> Result<(), DecodeBlockContentError> {
+    let size = header.decompressed_size as usize;
+    let maximum = block_maximum(window_size);
+    if size > maximum {
+        return Err(DecodeBlockContentError::DecompressBlockError(
+            DecompressBlockError::ExpandsPastBlockMaximum { size, maximum },
+        ));
+    }
+    Ok(())
+}
+
+/// A block with no sequences: its literals ARE its output. Out of line, so the
+/// per-block body keeps the shape the sequence executor is laid out around.
+///
+/// A growable backend allocates rather than refusing, so its write cannot fail
+/// and takes the infallible path; the compile-time const folds the other arm
+/// away. A fixed-capacity backend reports a short target, where the infallible
+/// write would assert.
+///
+/// No per-block ceiling is armed for this write, and none is needed. The
+/// ceiling bounds SEQUENCE writes, which is why it is armed beside the
+/// sequence reserve; the write here goes through `try_extend`, whose bound is
+/// the caller's slice. Arming the previous block's ceiling over it would
+/// REJECT valid frames: a small block leaves the ceiling near its own output,
+/// and a following literal-only block of a whole block maximum would exceed it
+/// while the slice still had room. The literals were already held to the block
+/// maximum where their section was parsed, so this write cannot exceed it
+/// either.
+#[inline(never)]
+fn write_literals_only<B: super::buffer_backend::BufferBackend>(
+    buffer: &mut crate::decoding::decode_buffer::DecodeBuffer<B>,
+    literals: &[u8],
+) -> Result<(), DecompressBlockError> {
+    if !B::FIXED_CAPACITY {
+        buffer.push(literals);
+        return Ok(());
+    }
+    buffer
+        .try_push(literals)
+        .map_err(|overflow| DecompressBlockError::LiteralsOutputOverflow {
+            tail: overflow.tail,
+            requested: overflow.requested,
+            capacity: overflow.capacity,
+        })
+}
+
+/// Create a new [BlockDecoder], detecting the CPU kernel. Detection belongs at
+/// the decoder's entry, so the decode paths take [`with_kernel`] instead; this
+/// is for callers that decode a block in isolation.
+#[cfg(any(test, feature = "bench-internals"))]
 pub fn new() -> BlockDecoder {
+    with_kernel(detect_cpu_kernel())
+}
+
+/// Create a new [BlockDecoder] over a kernel the caller already resolved. A
+/// decoder that builds one per call (a chunked decode does) detects once and
+/// passes the tag here, rather than reading the detection cache every time.
+pub(crate) fn with_kernel(kernel: CpuKernelTag) -> BlockDecoder {
     BlockDecoder {
         internal_state: DecoderState::ReadyToDecodeNextHeader,
         header_buffer: [0u8; 3],
-        kernel: detect_cpu_kernel(),
+        kernel,
     }
 }
 
@@ -94,8 +169,9 @@ impl BlockDecoder {
                 // path. Advance ONLY after the write succeeds, matching
                 // the Raw arm's split_at-then-try_push-then-advance shape.
                 let fill = source[0];
-                workspace
-                    .split()
+                let parts = workspace.split();
+                block_fits_the_maximum(header, parts.buffer.window_size)?;
+                parts
                     .buffer
                     .try_extend_and_fill(fill, header.decompressed_size as usize)
                     .map_err(|_| DecodeBlockContentError::BackendOverflow { step: block_type })?;
@@ -120,8 +196,9 @@ impl BlockDecoder {
                 // `UserSliceBackend` when the Raw payload would push
                 // past the caller's output slice. Growable backends
                 // grow on demand and always succeed.
-                workspace
-                    .split()
+                let parts = workspace.split();
+                block_fits_the_maximum(header, parts.buffer.window_size)?;
+                parts
                     .buffer
                     .try_push(payload)
                     .map_err(|_| DecodeBlockContentError::BackendOverflow { step: block_type })?;
@@ -174,8 +251,9 @@ impl BlockDecoder {
                         source: err,
                     }
                 })?;
-                workspace
-                    .split()
+                let parts = workspace.split();
+                block_fits_the_maximum(header, parts.buffer.window_size)?;
+                parts
                     .buffer
                     .extend_and_fill(buf[0], header.decompressed_size as usize);
 
@@ -189,8 +267,9 @@ impl BlockDecoder {
                 // borrow-by-reference indirection. (Both io shims provide a
                 // blanket `Read for &mut T`, so `&mut source` would also
                 // compile; the by-value form is just cleaner here.)
-                workspace
-                    .split()
+                let parts = workspace.split();
+                block_fits_the_maximum(header, parts.buffer.window_size)?;
+                parts
                     .buffer
                     .extend_from_reader(source, header.decompressed_size as usize)
                     .map_err(|err| DecodeBlockContentError::ReadError {
@@ -313,8 +392,26 @@ impl BlockDecoder {
         raw: &[u8],
         dict: Option<&'d crate::decoding::dictionary::Dictionary>,
     ) -> Result<(), DecompressBlockError> {
+        // A block produces at most its frame's block maximum, its literals and
+        // its matches together: the smaller of the window and 128 KiB (RFC 8878
+        // 3.1.1.2.4), as upstream derives it once per frame
+        // (`zstd_decompress.c`: `blockSizeMax = MIN(windowSize,
+        // ZSTD_BLOCKSIZE_MAX)`). Upstream bounds both halves by the same
+        // `oend`: the literals up front (`litSize > blockSizeMax` is corruption
+        // in `ZSTD_decodeLiteralsBlock`) and every write after. Sequence writes
+        // stop at the per-block ceiling; the literals are checked here and the
+        // whole block after it decodes, which catches literals left over after
+        // the last sequence.
+        let block_maximum = block_maximum(buffer.window_size);
+        let len_before = buffer.len();
         let mut section = LiteralsSection::new();
         let bytes_in_literals_header = section.parse_from_header(raw)?;
+        if section.regenerated_size as usize > block_maximum {
+            return Err(DecompressBlockError::ExpandsPastBlockMaximum {
+                size: section.regenerated_size as usize,
+                maximum: block_maximum,
+            });
+        }
         let raw = &raw[bytes_in_literals_header as usize..];
         vprintln!(
             "Found {} literalssection with regenerated size: {}, and compressed size: {:?}",
@@ -400,6 +497,22 @@ impl BlockDecoder {
             // (immutable view into block_content_buffer) can coexist
             // with the mutable borrows on the FSE / decode-buffer /
             // offset-hist fields.
+            // Room for this block's output, and the ceiling that bounds it.
+            // Exact growth: the reservation is a no-op while the frame-entry
+            // window reservation covers it, and on the frame's last block (a
+            // tail worth a fraction of a block) the amortized policy would
+            // DOUBLE a window-sized buffer. The ceiling is what stops a
+            // malformed block's sequences from growing the buffer past
+            // `len + block_maximum` (a decompression-bomb OOM on the growable
+            // RingBuffer); `DecodeBuffer::repeat` rejects the crossing match.
+            // Both belong here, where the block maximum is already in hand: the
+            // arithmetic then stays out of the per-kernel sequence monomorphs.
+            // The reservation stops at what the frame has left to produce; the
+            // ceiling stays the block maximum, since it decides whether a block
+            // is malformed and a frame that outruns its declared size is caught
+            // by the size check instead, which says so.
+            buffer.reserve_for_block(block_maximum);
+            buffer.set_block_output_ceiling(block_maximum);
             decode_and_execute_sequences(
                 &seq_section,
                 raw,
@@ -418,9 +531,25 @@ impl BlockDecoder {
                     },
                 ));
             }
-            buffer.push(literals_view);
+            // The literals ARE this block's output, and their length was held
+            // to the block maximum above, so the post-block check below has
+            // nothing left to say: hand the write over and return its result.
+            // A tail call rather than `?` on purpose. Carrying the fallible
+            // write's error path through this body cost 9.9% of cycles on a
+            // 1 MiB level-19 stream while issuing 0.6% FEWER instructions: the
+            // sequence executor it calls is laid out around this body.
+            return write_literals_only(buffer, literals_view);
         }
 
+        // Nothing drains the buffer inside a block, so the growth of its live
+        // length is this block's output.
+        let produced = buffer.len() - len_before;
+        if produced > block_maximum {
+            return Err(DecompressBlockError::ExpandsPastBlockMaximum {
+                size: produced,
+                maximum: block_maximum,
+            });
+        }
         Ok(())
     }
 

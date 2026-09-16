@@ -48,6 +48,10 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     /// without that flag ever being set.
     #[cfg(feature = "hash")]
     hash_dirty: bool,
+    /// See [`DecodeBuffer::set_declared_content`]. Last on purpose: the fields
+    /// above are read per sequence, and moving them would shift the layout the
+    /// decode monolith is built around.
+    declared_content: Option<u64>,
 }
 
 /// Rollback token produced by [`DecodeBuffer::checkpoint`].
@@ -74,6 +78,18 @@ pub(crate) struct DecodeBufferCheckpoint {
 
 impl<B: BufferBackend> Read for DecodeBuffer<B> {
     fn read(&mut self, target: &mut [u8]) -> Result<usize, Error> {
+        self.read_reporting_pending(target).map(|(read, _)| read)
+    }
+}
+
+impl<B: BufferBackend> DecodeBuffer<B> {
+    /// [`Read::read`], also reporting how many drainable bytes (past the
+    /// window) `target` had no room for, from the one length query the read
+    /// makes anyway.
+    pub(crate) fn read_reporting_pending(
+        &mut self,
+        target: &mut [u8],
+    ) -> Result<(usize, usize), Error> {
         let max_amount = self.can_drain_to_window_size().unwrap_or(0);
         let amount = max_amount.min(target.len());
 
@@ -83,15 +99,29 @@ impl<B: BufferBackend> Read for DecodeBuffer<B> {
             written += buf.len();
             (buf.len(), Ok(()))
         })?;
-        Ok(amount)
+        Ok((amount, max_amount - amount))
     }
+}
+
+/// Live bytes a frame with `window_size` holds at most while its output is
+/// drained as it is produced: the window plus the block being decoded into it.
+/// Upstream sizes its stream buffer the same way (`ZSTD_decodingBufferSize_min`).
+/// A window so large the sum does not fit sets no limit at all.
+fn peak_buffered_len(window_size: usize) -> usize {
+    let block = window_size.min(crate::common::MAX_BLOCK_SIZE as usize);
+    // Saturating on purpose: `usize::MAX` is the "no limit" value of the
+    // growth limit, which is exactly what a sum past it should mean.
+    window_size.saturating_add(block)
 }
 
 impl<B: BufferBackend> DecodeBuffer<B> {
     pub fn new(window_size: usize) -> DecodeBuffer<B> {
+        let mut buffer = B::new();
+        buffer.set_growth_limit(peak_buffered_len(window_size));
         DecodeBuffer {
-            buffer: B::new(),
+            buffer,
             window_size,
+            declared_content: None,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
@@ -116,9 +146,11 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// it issues vanish in the per-frame reset noise.
     pub fn from_backend(mut buffer: B, window_size: usize) -> DecodeBuffer<B> {
         buffer.clear();
+        buffer.set_growth_limit(peak_buffered_len(window_size));
         DecodeBuffer {
             buffer,
             window_size,
+            declared_content: None,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
@@ -127,6 +159,16 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             #[cfg(feature = "hash")]
             hash_dirty: false,
         }
+    }
+
+    /// Infallible append, for a backend that grows rather than refusing
+    /// ([`BufferBackend::FIXED_CAPACITY`] `== false`). On a fixed-capacity
+    /// backend the write asserts where a short target must be reported, so
+    /// those paths take [`Self::try_push`].
+    #[inline]
+    pub fn push(&mut self, data: &[u8]) {
+        self.buffer.extend(data);
+        self.total_output_counter += data.len() as u64;
     }
 
     /// Enable or disable the drain-time XXH64 pass. Set by the frame layer
@@ -171,9 +213,47 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.buffer.set_max_capacity(ceiling);
     }
 
+    /// What the frame says it will produce in total, when it says so. The
+    /// per-block reservation asks for no more than what is left of it: a frame
+    /// declaring less than a block cannot produce one, and reserving a whole
+    /// block for it leaves the ring mostly unused for the frame's lifetime.
+    /// `None` for a frame of unknown size, where a block is all we know.
+    #[inline]
+    pub(crate) fn set_declared_content(&mut self, content_size: Option<u64>) {
+        self.declared_content = content_size;
+    }
+
+    /// Room for one block's output: its maximum, or what the frame has left to
+    /// produce when it declared a size. A frame declaring less than a block
+    /// cannot produce one, and reserving a whole block for it leaves the buffer
+    /// mostly unused for the frame's lifetime.
+    #[inline]
+    pub(crate) fn reserve_for_block(&mut self, block_maximum: usize) {
+        let room = match self.remaining_declared() {
+            Some(left) => block_maximum.min(left),
+            None => block_maximum,
+        };
+        self.reserve_exact(room);
+    }
+
+    /// Bytes the frame may still produce, for a frame that declared a size.
+    #[inline]
+    pub(crate) fn remaining_declared(&self) -> Option<usize> {
+        self.declared_content.map(|declared| {
+            // Saturating on purpose: a frame that has produced more than it
+            // declared is malformed, and the size check that rejects it runs
+            // where the block finishes. The answer here is just "nothing left
+            // worth reserving for".
+            let left = declared.saturating_sub(self.total_output_counter);
+            usize::try_from(left).unwrap_or(usize::MAX)
+        })
+    }
+
     pub fn reset(&mut self, window_size: usize) {
         self.window_size = window_size;
+        self.declared_content = None;
         self.buffer.clear();
+        self.buffer.set_growth_limit(peak_buffered_len(window_size));
         // No reserve here: capacity decisions are pushed up to the frame
         // layer. Direct-decode frames (`run_direct_decode`) write through
         // `UserSliceBackend` and never touch this buffer, so a long-lived
@@ -308,6 +388,14 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.buffer.reserve_exact(amount);
     }
 
+    /// Lower the live byte count growth stops at, for a frame that knows it
+    /// holds less than a window plus a block (its declared content is
+    /// smaller). `reset` sets the window-derived limit for every frame.
+    #[inline]
+    pub(crate) fn set_growth_limit(&mut self, growth_limit: usize) {
+        self.buffer.set_growth_limit(growth_limit);
+    }
+
     /// Mutable backend handle. Lets the inline sequence executor
     /// write straight into the backend's physical storage; the
     /// `tail()` cursor on the backend is the authoritative output
@@ -360,12 +448,6 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.buffer.extend_from_reader(read, fill_length)?;
         self.total_output_counter += fill_length as u64;
         Ok(())
-    }
-
-    #[inline]
-    pub fn push(&mut self, data: &[u8]) {
-        self.buffer.extend(data);
-        self.total_output_counter += data.len() as u64;
     }
 
     /// Add `n` to the cumulative produced-byte counter for output produced

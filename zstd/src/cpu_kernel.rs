@@ -61,6 +61,25 @@ pub trait CpuKernel: Copy + 'static {
     /// per-stream table builders pin to `n <= MAX_*_BITS` at
     /// construction time; no per-call wrapper assert runs.
     fn mask_lower_bits(value: u64, n: u8) -> u64;
+
+    /// Split the low `n1 + n2 + n3` bits of `packed` into three fields, the
+    /// highest first. The FSE sequence decoder reads its three state updates
+    /// this way, once per sequence.
+    ///
+    /// The default is three [`Self::mask_lower_bits`]; a kernel whose hardware
+    /// extracts them in one instruction overrides it. Every implementation
+    /// returns the same three values, so which one ran is invisible to the
+    /// stream being decoded.
+    ///
+    /// Precondition: `n1 + n2 + n3 <= 64`, as for `mask_lower_bits`.
+    #[inline(always)]
+    fn extract_triple(packed: u64, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
+        (
+            Self::mask_lower_bits(packed.wrapping_shr(u32::from(n3) + u32::from(n2)), n1),
+            Self::mask_lower_bits(packed.wrapping_shr(u32::from(n3)), n2),
+            Self::mask_lower_bits(packed, n3),
+        )
+    }
 }
 
 /// Scalar fallback — portable, no SIMD or BMI2 intrinsics. Selected
@@ -68,18 +87,28 @@ pub trait CpuKernel: Copy + 'static {
 #[derive(Copy, Clone, Default)]
 pub struct ScalarKernel;
 
+/// `BIT_MASK[n]` is the low `n` bits set for `n` in `0..=64`, and all bits for
+/// anything past that (a width the formats cannot ask for).
+///
+/// A table rather than `u64::MAX >> (64 - n)`: the shift form needs a guard for
+/// `n == 0`, since a 64-bit shift is undefined, and that guard is a branch or a
+/// `cmov` on every field of every sequence. Indexed by a `u8`, and sized for
+/// every `u8`, so the load carries no bounds check either. The widths in use
+/// are small, so the hot part is the first few cache lines of it.
+pub(crate) const BIT_MASK: [u64; 256] = {
+    let mut table = [u64::MAX; 256];
+    let mut i: usize = 0;
+    while i < 64 {
+        table[i] = (1u64 << i) - 1;
+        i += 1;
+    }
+    table
+};
+
 impl CpuKernel for ScalarKernel {
     #[inline(always)]
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
-        // `checked_shr` returns `None` for shift counts >= 64, which
-        // happens exactly when `n == 0` (`64 - 0 = 64`). Mapping
-        // both that case and the invalid `n > 64` underflow to 0
-        // gives the mathematically-correct empty mask for n=0 and
-        // a safe-ish fallback for the invalid range.
-        let mask = u64::MAX
-            .checked_shr(64u32.wrapping_sub(n as u32))
-            .unwrap_or(0);
-        value & mask
+        value & BIT_MASK[n as usize]
     }
 }
 
@@ -90,16 +119,24 @@ impl CpuKernel for ScalarKernel {
 // FSE/HUF paths. A dedicated `Sse2Kernel` lands when `copy_chunk` moves onto
 // the trait.
 
-/// x86_64 BMI2-only kernel: `_bzhi_u64` for mask_lower_bits. Selected
-/// when the CPU has BMI2 but not the AVX2 SIMD width to upgrade to
-/// the Avx2 kernel. Treated as a stepping stone between Sse2 and
-/// Avx2 on hardware that has BMI2 but not AVX2 (rare in practice but
-/// matches upstream zstd's gating).
-#[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
+/// BMI2-only kernel: `bzhi` for mask_lower_bits. Selected when the CPU has
+/// BMI2 but not the AVX2 SIMD width to upgrade to the Avx2 kernel. Treated as
+/// a stepping stone between Sse2 and Avx2 on hardware that has BMI2 but not
+/// AVX2 (rare in practice but matches upstream zstd's gating). Present on
+/// 32-bit x86 as well as x86_64: the instruction is there, only its width
+/// differs, and without this tier a 32-bit build would decode on the scalar
+/// bodies whatever the CPU offers.
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-bmi2"
+))]
 #[derive(Copy, Clone, Default)]
 pub(crate) struct Bmi2Kernel;
 
-#[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-bmi2"
+))]
 impl CpuKernel for Bmi2Kernel {
     #[inline(always)]
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
@@ -197,7 +234,10 @@ impl CpuKernel for SveKernel {
 /// same shared body. With `#[inline]` LLVM inlines the call into
 /// any caller that itself has BMI2 in scope; outside that scope the
 /// target_feature boundary is preserved.
-#[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-bmi2"
+))]
 #[target_feature(enable = "bmi2")]
 #[inline]
 unsafe fn mask_lower_bits_bmi2_impl(value: u64, n: u8) -> u64 {
@@ -207,7 +247,25 @@ unsafe fn mask_lower_bits_bmi2_impl(value: u64, n: u8) -> u64 {
     // already covers it). SAFETY: caller selected a kernel whose
     // CpuKernelTag was resolved after `is_x86_feature_detected!("bmi2")`
     // returned true, so the BMI2 instruction set is available.
-    core::arch::x86_64::_bzhi_u64(value, n as u32)
+    #[cfg(target_arch = "x86_64")]
+    {
+        core::arch::x86_64::_bzhi_u64(value, n as u32)
+    }
+    // 32-bit x86 has `bzhi` on 32-bit registers only. Widths up to 32 take one
+    // instruction on the low half; wider ones keep the low 32 bits whole and
+    // apply it to the high half, which is what a 64-bit `bzhi` does in one go.
+    #[cfg(target_arch = "x86")]
+    {
+        use core::arch::x86::_bzhi_u32;
+        if n >= 64 {
+            return value;
+        }
+        if n <= 32 {
+            return u64::from(_bzhi_u32(value as u32, u32::from(n)));
+        }
+        let high = _bzhi_u32((value >> 32) as u32, u32::from(n) - 32);
+        (value & u64::from(u32::MAX)) | (u64::from(high) << 32)
+    }
 }
 
 /// Pure boolean-input variant of the x86 kernel-tag selection. Both the
@@ -267,7 +325,12 @@ pub(crate) enum CpuKernelTag {
     Scalar,
     #[cfg(all(target_arch = "x86_64", feature = "kernel-sse"))]
     Sse2,
-    #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
+    /// Reachable on 32-bit x86 as well: `bzhi` is there, and without the tier
+    /// such a build would decode on the scalar bodies whatever the CPU offers.
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-bmi2"
+    ))]
     Bmi2,
     #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
     Avx2,
@@ -317,6 +380,20 @@ fn detect_cpu_kernel_uncached() -> CpuKernelTag {
             cfg!(feature = "kernel-sse") && is_x86_feature_detected!("sse2"),
         );
     }
+    // 32-bit x86 carries only the BMI2 tier: the wider tiers' kernels and
+    // their `target_feature` bodies are x86_64-only, so there is nothing
+    // above `bzhi` to select here.
+    #[cfg(target_arch = "x86")]
+    {
+        #[cfg(feature = "kernel-bmi2")]
+        {
+            use std::arch::is_x86_feature_detected;
+            if is_x86_feature_detected!("bmi2") {
+                return CpuKernelTag::Bmi2;
+            }
+        }
+        return CpuKernelTag::Scalar;
+    }
     #[cfg(target_arch = "aarch64")]
     {
         #[cfg(any(feature = "kernel-sve", feature = "kernel-neon"))]
@@ -357,6 +434,13 @@ pub(crate) fn detect_cpu_kernel() -> CpuKernelTag {
             cfg!(target_feature = "sse2"),
         );
     }
+    #[cfg(target_arch = "x86")]
+    {
+        #[cfg(all(feature = "kernel-bmi2", target_feature = "bmi2"))]
+        {
+            return CpuKernelTag::Bmi2;
+        }
+    }
     #[cfg(target_arch = "aarch64")]
     {
         #[cfg(all(feature = "kernel-sve", target_feature = "sve"))]
@@ -382,7 +466,10 @@ impl CpuKernelTag {
             CpuKernelTag::Scalar => "scalar",
             #[cfg(all(target_arch = "x86_64", feature = "kernel-sse"))]
             CpuKernelTag::Sse2 => "sse2",
-            #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
+            #[cfg(all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                feature = "kernel-bmi2"
+            ))]
             CpuKernelTag::Bmi2 => "bmi2",
             #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
             CpuKernelTag::Avx2 => "avx2",

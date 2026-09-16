@@ -6,7 +6,6 @@ use crate::bit_io::BitReaderReversed;
 use crate::blocks::sequence_section::{
     MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
 };
-use crate::common::MAX_BLOCK_SIZE;
 use crate::cpu_kernel::CpuKernelTag;
 use crate::decoding::errors::{DecodeSequenceError, DecompressBlockError, ExecuteSequencesError};
 use crate::decoding::sequence_execution::do_offset_history;
@@ -85,7 +84,7 @@ pub(crate) struct SeqStreamSetup<'src, 'fse, K: crate::cpu_kernel::CpuKernel> {
 /// if the block's mode bytes call for it, skips the start-of-stream
 /// padding, initialises the LL/OF/ML decoder states, reserves the
 /// block's output capacity AND arms the per-block output ceiling (the
-/// decompression-bomb guard that bounds growth at `len + MAX_BLOCK_SIZE`),
+/// decompression-bomb guard that bounds growth at `len + block_maximum`),
 /// and computes the long-pipeline gate.
 ///
 /// Centralising this is what keeps the ceiling (and every other
@@ -159,18 +158,10 @@ where
         "sequence section update bits exceed 56-bit budget"
     );
 
-    // Exact growth: this worst-case pre-block reservation is a no-op while
-    // the frame-entry window reservation covers it, and on the frame's LAST
-    // block (where the remaining content is smaller than a full block) the
-    // amortized policy would DOUBLE the window-sized buffer for a tail
-    // worth a fraction of a block. The ring backend keeps its own
-    // amortized growth via the trait default.
-    buffer.reserve_exact(MAX_BLOCK_SIZE as usize);
-    // Arm the per-block output ceiling so a malformed / adversarial block
-    // whose sequences over-produce cannot grow the buffer past
-    // `len + MAX_BLOCK_SIZE` (a decompression-bomb OOM on the growable
-    // RingBuffer); `DecodeBuffer::repeat` rejects the crossing match.
-    buffer.set_block_output_ceiling(MAX_BLOCK_SIZE as usize);
+    // The block's output room is reserved and its ceiling armed by the block
+    // decoder before it calls in: that is where the frame's block maximum is
+    // known, and keeping the arithmetic out of this body keeps it out of the
+    // per-kernel monomorphs this function is inlined into.
     let old_buffer_size = buffer.len();
     let num_sequences = section.num_sequences as usize;
 
@@ -297,6 +288,20 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
                 dict,
             )
         }
+        // 32-bit x86 reaches the BMI2 tier for the entropy tables (the HUF
+        // state advance takes `bzhi` through `K`), but the sequence monolith
+        // has no 32-bit body: its `target_feature` modules are x86_64-only.
+        // The portable walk is what runs here until one exists.
+        #[cfg(all(target_arch = "x86", feature = "kernel-bmi2"))]
+        CpuKernelTag::Bmi2 => super::seq_decoder_scalar::decode_and_execute_sequences_scalar::<B>(
+            section,
+            source,
+            fse,
+            buffer,
+            offset_hist,
+            literals_buffer,
+            dict,
+        ),
         #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
         CpuKernelTag::Bmi2 => {
             // SAFETY: `detect_cpu_kernel()` only returns Bmi2 when
@@ -607,7 +612,7 @@ pub(crate) fn decode_and_execute_sequences_impl<
     if remaining != 0 {
         // try_restore_checkpoint succeeds when no reallocation happened
         // between the checkpoint and now (the common case: upfront
-        // reserve(MAX_BLOCK_SIZE) covers a well-formed block). When a
+        // reserve of the block maximum covers a well-formed block). When a
         // malformed block decodes past that bound, reserve_amortized
         // fires and compacts the ring buffer — the captured tail is no
         // longer meaningful and the rollback is skipped. Either way the
@@ -639,6 +644,15 @@ pub(crate) fn decode_and_execute_sequences_impl<
     // as `OutputBufferOverflow` instead of panicking via the per-call
     // `assert!` inside `BufferBackend::extend`. Growable backends
     // (FlatBuf, RingBuffer) accept the write infallibly.
+    //
+    // The per-block ceiling is NOT re-checked here on purpose. It bounds the
+    // match writes, whose length a malformed block controls; these bytes are
+    // literals, and the whole literals section was held to the block maximum
+    // where it was parsed, so the ceiling would find nothing the parse did not
+    // already reject. Reserving against it would be worse than redundant: on
+    // the direct path the ceiling is relative to the block that armed it, so a
+    // valid frame whose blocks differ in size would start failing. The block's
+    // total output is checked once it has decoded.
     if lit_cur < literals_buffer_len {
         let rest = &literals_buffer[lit_cur..];
         buffer.try_push(rest).map_err(ExecuteSequencesError::from)?;
@@ -1003,8 +1017,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_avx2<
 /// pipeline already issued a PREFETCH_L1 ADVANCE iterations earlier).
 /// The per-call `buffer.reserve(match_length)` is preserved by that
 /// variant — required for memory safety against malformed inputs whose
-/// `match_length` exceeds the upfront `reserve(MAX_BLOCK_SIZE)`
-/// headroom.
+/// `match_length` exceeds the upfront block-maximum headroom.
 #[inline(always)]
 #[allow(dead_code)] // live on aarch64 + tests only; see decode_and_execute_sequences_impl
 pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
@@ -1128,7 +1141,7 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
         //   decode produces baseline values starting at 3 for ml
         //   codes 0..3, so `seq.ml >= 3` for any valid sequence).
         //   The wildcopy helpers assert this in debug builds.
-        // - Caller's upfront `reserve(MAX_BLOCK_SIZE)` plus the
+        // - Caller's upfront block-maximum reserve plus the
         //   `WILDCOPY_OVERLENGTH = 32` slack on the user slice
         //   guarantees the writable tail has room for
         //   `lit_length + match_length + 15` (max wildcopy
