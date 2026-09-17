@@ -136,9 +136,17 @@ where
     // resolve to the shared dictionary's table (zero-copy) on axes still
     // in `Dict` mode, else the locally-built table. `maybe_update_fse_tables`
     // above has already flipped any rebuilt axis to `Local`.
-    let mut ll_dec = SeqFSEDecoder::new(fse.ll_table(dict));
-    let mut ml_dec = SeqFSEDecoder::new(fse.ml_table(dict));
-    let mut of_dec = SeqFSEDecoder::new(fse.of_table(dict));
+    //
+    // Resolve each axis ONCE: a `Predefined` axis answers out of a `OnceLock`,
+    // so a second call for `accuracy_log` below would repeat that synchronised
+    // load per block.
+    let ll_src = fse.ll_table(dict);
+    let ml_src = fse.ml_table(dict);
+    let of_src = fse.of_table(dict);
+
+    let mut ll_dec = SeqFSEDecoder::new(ll_src);
+    let mut ml_dec = SeqFSEDecoder::new(ml_src);
+    let mut of_dec = SeqFSEDecoder::new(of_src);
 
     ll_dec
         .init_state(&mut br)
@@ -150,9 +158,7 @@ where
         .init_state(&mut br)
         .map_err(DecodeSequenceError::from)?;
 
-    let max_update_bits = fse.ll_table(dict).accuracy_log
-        + fse.ml_table(dict).accuracy_log
-        + fse.of_table(dict).accuracy_log;
+    let max_update_bits = ll_src.accuracy_log + ml_src.accuracy_log + of_src.accuracy_log;
     debug_assert!(
         max_update_bits <= 56,
         "sequence section update bits exceed 56-bit budget"
@@ -1491,10 +1497,10 @@ pub(crate) fn maybe_update_fse_tables(
         }
         ModeType::Predefined => {
             vprintln!("Use predefined ll table");
-            // Default LL distribution → cached table memcpy.
+            // Default LL distribution → read the cached table in place.
             #[cfg(feature = "std")]
             {
-                scratch.literal_lengths.reinit_from(predefined_ll_table());
+                scratch.mark_ll_predefined(predefined_ll_table());
             }
             #[cfg(not(feature = "std"))]
             {
@@ -1505,6 +1511,7 @@ pub(crate) fn maybe_update_fse_tables(
                 scratch
                     .literal_lengths
                     .enrich_with_packed_seq_meta(&LL_META);
+                scratch.mark_ll_local();
             }
         }
         ModeType::Repeat => {
@@ -1512,9 +1519,10 @@ pub(crate) fn maybe_update_fse_tables(
             /* Nothing to do — cached enriched values stay valid. */
         }
     };
-    // Copy-on-write "write" step: any non-Repeat rebuild wrote the local
-    // table, so the axis no longer reads the shared dictionary's.
-    if !matches!(ll_mode, ModeType::Repeat) {
+    // Copy-on-write "write" step: an FSE / RLE rebuild wrote the local table,
+    // so the axis no longer reads the shared dictionary's. Predefined mode
+    // sets its own source in its arm, Repeat keeps whatever the axis had.
+    if matches!(ll_mode, ModeType::FSECompressed | ModeType::RLE) {
         scratch.mark_ll_local();
     }
 
@@ -1553,12 +1561,15 @@ pub(crate) fn maybe_update_fse_tables(
         }
         ModeType::Predefined => {
             vprintln!("Use predefined of table");
-            // Default OF distribution → cached table + cached long-share.
+            // Default OF distribution → cached table read in place. The share
+            // is taken from the constant rather than from the cache: reading it
+            // there would probe the `OnceLock` on a path that otherwise never
+            // touches the table, and the pipeline gate would then pay two
+            // probes per block for this one axis.
             #[cfg(feature = "std")]
             {
-                let (cached, long_share) = predefined_of_table();
-                scratch.offsets.reinit_from(cached);
-                scratch.offsets_long_share = long_share;
+                scratch.mark_of_predefined(predefined_of_table().0);
+                scratch.offsets_long_share = PREDEFINED_OF_LONG_SHARE;
             }
             #[cfg(not(feature = "std"))]
             {
@@ -1567,6 +1578,7 @@ pub(crate) fn maybe_update_fse_tables(
                     .build_from_probabilities(OF_DEFAULT_ACC_LOG, &OFFSET_DEFAULT_DISTRIBUTION)?;
                 scratch.offsets.enrich_for_offsets();
                 scratch.offsets_long_share = compute_offsets_long_share(&scratch.offsets);
+                scratch.mark_of_local();
             }
         }
         ModeType::Repeat => {
@@ -1574,7 +1586,7 @@ pub(crate) fn maybe_update_fse_tables(
             /* Nothing to do — cached enriched values stay valid. */
         }
     };
-    if !matches!(of_mode, ModeType::Repeat) {
+    if matches!(of_mode, ModeType::FSECompressed | ModeType::RLE) {
         scratch.mark_of_local();
     }
 
@@ -1609,10 +1621,10 @@ pub(crate) fn maybe_update_fse_tables(
         }
         ModeType::Predefined => {
             vprintln!("Use predefined ml table");
-            // Default ML distribution → cached table memcpy.
+            // Default ML distribution → read the cached table in place.
             #[cfg(feature = "std")]
             {
-                scratch.match_lengths.reinit_from(predefined_ml_table());
+                scratch.mark_ml_predefined(predefined_ml_table());
             }
             #[cfg(not(feature = "std"))]
             {
@@ -1621,6 +1633,7 @@ pub(crate) fn maybe_update_fse_tables(
                     &MATCH_LENGTH_DEFAULT_DISTRIBUTION,
                 )?;
                 scratch.match_lengths.enrich_with_packed_seq_meta(&ML_META);
+                scratch.mark_ml_local();
             }
         }
         ModeType::Repeat => {
@@ -1628,7 +1641,7 @@ pub(crate) fn maybe_update_fse_tables(
             /* Nothing to do — cached enriched values stay valid. */
         }
     };
-    if !matches!(ml_mode, ModeType::Repeat) {
+    if matches!(ml_mode, ModeType::FSECompressed | ModeType::RLE) {
         scratch.mark_ml_local();
     }
 
@@ -1691,45 +1704,55 @@ const LITERALS_LENGTH_DEFAULT_DISTRIBUTION: [i32; 36] = [
 // handle the cache primitive directly without a fallible-init
 // shim.
 #[cfg(feature = "std")]
-fn predefined_ll_table() -> &'static crate::fse::SeqFSETable {
+pub(crate) fn predefined_ll_table() -> &'static crate::fse::SeqFSETable {
+    use super::scratch::AlignedFSETable;
     use std::sync::OnceLock;
-    static CACHED: OnceLock<crate::fse::SeqFSETable> = OnceLock::new();
+    static CACHED: OnceLock<AlignedFSETable> = OnceLock::new();
     CACHED.get_or_init(|| {
         let mut t = crate::fse::SeqFSETable::new(MAX_LITERAL_LENGTH_CODE);
         t.build_from_probabilities(LL_DEFAULT_ACC_LOG, &LITERALS_LENGTH_DEFAULT_DISTRIBUTION)
             .expect("LITERALS_LENGTH_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
         t.enrich_with_packed_seq_meta(&LL_META);
-        t
+        t.into()
     })
 }
 
 #[cfg(feature = "std")]
-fn predefined_ml_table() -> &'static crate::fse::SeqFSETable {
+pub(crate) fn predefined_ml_table() -> &'static crate::fse::SeqFSETable {
+    use super::scratch::AlignedFSETable;
     use std::sync::OnceLock;
-    static CACHED: OnceLock<crate::fse::SeqFSETable> = OnceLock::new();
+    static CACHED: OnceLock<AlignedFSETable> = OnceLock::new();
     CACHED.get_or_init(|| {
         let mut t = crate::fse::SeqFSETable::new(MAX_MATCH_LENGTH_CODE);
         t.build_from_probabilities(ML_DEFAULT_ACC_LOG, &MATCH_LENGTH_DEFAULT_DISTRIBUTION)
             .expect("MATCH_LENGTH_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
         t.enrich_with_packed_seq_meta(&ML_META);
-        t
+        t.into()
     })
 }
 
 #[cfg(feature = "std")]
-fn predefined_of_table() -> (&'static crate::fse::SeqFSETable, u32) {
+pub(crate) fn predefined_of_table() -> (&'static crate::fse::SeqFSETable, u32) {
+    use super::scratch::AlignedFSETable;
     use std::sync::OnceLock;
-    static CACHED: OnceLock<(crate::fse::SeqFSETable, u32)> = OnceLock::new();
+    static CACHED: OnceLock<(AlignedFSETable, u32)> = OnceLock::new();
     let cache = CACHED.get_or_init(|| {
         let mut t = crate::fse::SeqFSETable::new(MAX_OFFSET_CODE);
         t.build_from_probabilities(OF_DEFAULT_ACC_LOG, &OFFSET_DEFAULT_DISTRIBUTION)
             .expect("OFFSET_DEFAULT_DISTRIBUTION is a static RFC 8878 constant");
         t.enrich_for_offsets();
         let share = compute_offsets_long_share(&t);
-        (t, share)
+        (t.into(), share)
     });
     (&cache.0, cache.1)
 }
+
+/// Long-offset share of the predefined offsets table. That table is built from
+/// a distribution fixed by the format, so the share it yields is fixed too, and
+/// naming it here keeps the Predefined arm from resolving the cached table just
+/// to read one number. A test pins it against the builder.
+#[cfg(feature = "std")]
+const PREDEFINED_OF_LONG_SHARE: u32 = 48;
 
 // The default Match Length decoding table uses an accuracy logarithm of 6 bits.
 const ML_DEFAULT_ACC_LOG: u8 = 6;

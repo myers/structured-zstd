@@ -21,8 +21,16 @@ BENCH_TARGET_TRIPLE="${STRUCTURED_ZSTD_BENCH_TRIPLE:-}"
 BENCH_TARGET_ID="$BENCH_TARGET_LABEL"
 
 BENCH_RAW_FILE="$(mktemp -t structured-zstd-bench-raw.XXXXXX)"
-trap 'rm -f "$BENCH_RAW_FILE"' EXIT
+# Criterion's data directory, read back after the run for the raw per-sample
+# timings. The printed point estimate is a central statistic over a sample
+# distribution that scheduler interference skews to the right (interference
+# only ever ADDS time to a sample), so it sits above the true cost by however
+# much of the tail it absorbed and moves several percent between runs of
+# identical code. The per-sample minimum is the interference-free figure.
+BENCH_CRITERION_HOME="$(mktemp -d -t structured-zstd-bench-crit.XXXXXX)"
+trap 'rm -rf "$BENCH_RAW_FILE" "$BENCH_CRITERION_HOME"' EXIT
 
+export CRITERION_HOME="$BENCH_CRITERION_HOME"
 export STRUCTURED_ZSTD_EMIT_REPORT=1
 # CI matrix splits build (per target) from execution (per target × level):
 # the `bench-build` job hands the compiled criterion binary to every
@@ -35,13 +43,15 @@ if [ -n "${STRUCTURED_ZSTD_BENCH_BIN:-}" ]; then
     exit 2
   fi
   echo "Running pre-built bench binary: $STRUCTURED_ZSTD_BENCH_BIN" >&2
-  "$STRUCTURED_ZSTD_BENCH_BIN" --bench --output-format bencher | tee "$BENCH_RAW_FILE"
+  # `--noplot`: the run needs criterion's sample DATA, and nothing downstream
+  # reads its rendered reports, so rendering them is work no one consumes.
+  "$STRUCTURED_ZSTD_BENCH_BIN" --bench --output-format bencher --noplot | tee "$BENCH_RAW_FILE"
 else
   BENCH_CMD=(cargo bench --bench compare_ffi -p ffi-bench)
   if [ -n "$BENCH_TARGET_TRIPLE" ]; then
     BENCH_CMD+=(--target "$BENCH_TARGET_TRIPLE")
   fi
-  "${BENCH_CMD[@]}" -- --output-format bencher | tee "$BENCH_RAW_FILE"
+  "${BENCH_CMD[@]}" -- --output-format bencher --noplot | tee "$BENCH_RAW_FILE"
 fi
 
 # Memory bench (compare_ffi_memory) runs separately when its binary is
@@ -72,6 +82,7 @@ fi
 echo "Parsing results..." >&2
 
 BENCH_RAW_FILE="$BENCH_RAW_FILE" \
+BENCH_CRITERION_HOME="$BENCH_CRITERION_HOME" \
 BENCH_TARGET_LABEL="$BENCH_TARGET_LABEL" \
 BENCH_TARGET_TRIPLE="$BENCH_TARGET_TRIPLE" \
 BENCH_TARGET_ID="$BENCH_TARGET_ID" \
@@ -82,6 +93,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from collections import defaultdict
+from pathlib import Path
 
 BENCH_RE = re.compile(r"test (\S+)\s+\.\.\. bench:\s+([\d,]+) ns/iter")
 REPORT_RE = re.compile(
@@ -130,6 +142,61 @@ def markdown_table_escape(value):
     escaped = escaped.replace(">", "&gt;")
     escaped = escaped.replace("%", "&#37;")
     return escaped.replace("\n", "<br>")
+
+def load_criterion_samples(root):
+    """Raw per-sample timings criterion recorded for this run, by benchmark id.
+
+    Criterion writes them whatever the output format is, and each directory's
+    `benchmark.json` carries the same `full_id` the bencher line prints, so the
+    two join directly. `new/` is this run; `base/` is the previous one and is
+    deliberately not read.
+
+    Per-sample time is `times[i] / iters[i]`. The minimum over the samples is
+    the figure to report: a sample can only be made SLOWER by interference, so
+    the lower edge is the cost of the code and everything above it is the
+    machine. Measured on an idle host over six runs of one binary, the minimum
+    of the Rust arm reproduces within 0.20% where its mean moves 1.54%, and it
+    is the value that agrees with a standalone timing loop over the same code.
+
+    It does not make every ratio that stable, and is not meant to. A ratio also
+    carries whole-distribution shifts of either arm (one run in six moved the
+    libzstd arm up 5% at every quantile, minimum included), which no choice of
+    statistic can remove. Dropping the interference tail is what this buys;
+    the `sample_ns` spread emitted per cell is what makes the rest visible
+    instead of silently folded into a single number.
+    """
+    index = {}
+    if not root:
+        return index
+    base = Path(root)
+    if not base.is_dir():
+        return index
+    for meta_path in base.glob("**/new/benchmark.json"):
+        sample_path = meta_path.with_name("sample.json")
+        if not sample_path.is_file():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text())
+            sample = json.loads(sample_path.read_text())
+            full_id = meta["full_id"]
+            iters = sample["iters"]
+            times = sample["times"]
+        except (OSError, ValueError, KeyError):
+            continue
+        per_iter = sorted(t / i for t, i in zip(times, iters) if i > 0)
+        if not per_iter:
+            continue
+        # Sample counts are even (10 or 30), so the median averages the two
+        # middle values rather than taking the upper one.
+        mid = len(per_iter) // 2
+        index[full_id] = {
+            "min_ns": per_iter[0],
+            "median_ns": (per_iter[(len(per_iter) - 1) // 2] + per_iter[mid]) / 2,
+            "max_ns": per_iter[-1],
+            "samples": len(per_iter),
+        }
+    return index
+
 
 def _read_sysfs(path):
     try:
@@ -226,6 +293,8 @@ timing_rows = []
 scenario_input_bytes = {}
 scenario_training_bytes = {}
 raw_path = os.environ["BENCH_RAW_FILE"]
+criterion_samples = load_criterion_samples(os.environ.get("BENCH_CRITERION_HOME"))
+benchmarks_without_samples = []
 bench_target_label = os.environ.get("BENCH_TARGET_LABEL", "host")
 bench_target_triple = os.environ.get("BENCH_TARGET_TRIPLE", "")
 bench_target_id = os.environ.get("BENCH_TARGET_ID", bench_target_label)
@@ -389,7 +458,18 @@ with open(raw_path) as f:
         bench_match = BENCH_RE.match(line)
         if bench_match:
             name = bench_match.group(1)
-            ns = int(bench_match.group(2).replace(",", ""))
+            # The bencher line only enumerates which benchmarks ran and at what
+            # central estimate; the reported figure comes from the raw samples.
+            sample = criterion_samples.get(name)
+            if sample is None:
+                # No substitute is used, not even for this one row. A ratio
+                # pairs two implementations, so falling back on one side would
+                # divide a central estimate by the other side's minimum, and
+                # those differ by several percent: it would manufacture a delta
+                # out of nothing. The run fails below instead.
+                benchmarks_without_samples.append(name)
+                continue
+            ns = sample["min_ns"]
             ms = ns / 1_000_000
             timings.append((name, ms))
             parsed = parse_benchmark_name(name)
@@ -403,6 +483,7 @@ with open(raw_path) as f:
                 "implementation": normalize_impl(parsed["implementation"]),
                 "target": bench_target_id,
                 "ms_per_iter": ms,
+                "sample_ns": sample,
             })
             continue
 
@@ -531,6 +612,19 @@ with open(raw_path) as f:
                 "status": classify_speed_delta(delta),
             })
             scenario_training_bytes[scenario] = int(training_bytes)
+
+if benchmarks_without_samples:
+    # Either CRITERION_HOME did not reach the bench binary, or criterion wrote
+    # nothing for these. Reporting the run anyway would mean publishing figures
+    # on two different estimators, so stop and say which ones are missing.
+    print(
+        f"ERROR: {len(benchmarks_without_samples)} benchmark(s) have no "
+        "criterion sample data under "
+        f"BENCH_CRITERION_HOME={os.environ.get('BENCH_CRITERION_HOME')!r}: "
+        f"{', '.join(sorted(benchmarks_without_samples)[:10])}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 if timing_point_count == 0:
     print("ERROR: No benchmark timings parsed from compare_ffi output.", file=sys.stderr)
@@ -665,6 +759,7 @@ for row in timing_rows:
     speed_index[key][impl] = {
         "name": row["name"],
         "ms_per_iter": row["ms_per_iter"],
+        "sample_ns": row["sample_ns"],
     }
 
 delta_rows = []
@@ -700,6 +795,10 @@ for key in all_keys:
             "benchmark_name": impl_row["name"],
             "ms_per_iter": ms_value,
             "bytes_per_sec": bps_value,
+            # Spread of the raw samples behind `ms_per_iter` (which is
+            # `min_ns`). A move smaller than the gap between min and median is
+            # this cell's own noise, not a change in the code.
+            "sample_ns": impl_row["sample_ns"],
         }
 
     rust_timing = speed_series.get("rust")
@@ -823,6 +922,12 @@ for row in delta_rows:
                 "delta_ratio": speed_delta,
                 "delta_percent": (speed_delta - 1.0) * 100.0,
                 "status_band": row["speed"]["status"],
+                # Both sides' raw sample spread, so a reader can tell a real
+                # move from this cell's own measurement noise. Values are
+                # per-iteration nanoseconds; `min_ns` is what the throughput
+                # above was computed from.
+                "rust_sample_ns": row["speed"]["series"].get("rust", {}).get("sample_ns"),
+                "ffi_sample_ns": row["speed"]["series"].get("ffi", {}).get("sample_ns"),
                 "interpretation": "delta>1 means Rust faster than FFI",
             }
         )
@@ -1056,12 +1161,21 @@ lines.extend([
     "",
     "## Timing Metrics",
     "",
-    "| Benchmark | ms/iter |",
-    "| --- | ---: |",
+    "The reported time is the minimum over criterion's samples: interference "
+    "can only make a sample slower, so the lower edge is the cost of the code. "
+    "The median and maximum say how much tail the machine added on this run, "
+    "which is the scale below which a difference between runs means nothing.",
+    "",
+    "| Benchmark | ms/iter (min) | median ns | max ns |",
+    "| --- | ---: | ---: | ---: |",
 ])
 
 for name, ms in sorted(timings):
-    lines.append(f"| `{name}` | {ms:.3f} |")
+    # Guaranteed present: a benchmark without samples fails the run above.
+    spread = criterion_samples[name]
+    lines.append(
+        f"| `{name}` | {ms:.3f} | {spread['median_ns']:.1f} | {spread['max_ns']:.1f} |"
+    )
 
 with open("benchmark-report.md", "w") as f:
     f.write("\n".join(lines) + "\n")
