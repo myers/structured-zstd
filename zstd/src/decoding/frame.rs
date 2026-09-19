@@ -8,7 +8,6 @@ pub fn read_frame_header(mut r: impl Read) -> Result<(FrameHeader, u8), ReadFram
     let mut buf = [0u8; 4];
 
     r.read_exact(&mut buf).map_err(err::MagicNumberReadError)?;
-    let mut bytes_read = 4;
     let magic_num = u32::from_le_bytes(buf);
 
     // Skippable frames have a magic number in this interval
@@ -25,6 +24,36 @@ pub fn read_frame_header(mut r: impl Read) -> Result<(FrameHeader, u8), ReadFram
     if magic_num != MAGIC_NUM {
         return Err(ReadFrameHeaderError::BadMagicNumber(magic_num));
     }
+
+    read_frame_header_body(r, 4)
+}
+
+/// Read a frame header from a stream that has had its 4-byte magic
+/// number stripped — the format libzstd emits when configured with
+/// `ZSTD_f_zstd1_magicless`. The reader's first byte must be the
+/// `Frame_Header_Descriptor`.
+///
+/// OpenZFS uses this format on disk: each block carries an 8-byte
+/// `zfs_zstdhdr_t` (compressed length + level/version word) followed
+/// by a magicless zstd frame, omitting the 4 bytes of magic to save
+/// space. See `module/zstd/zfs_zstd.c` upstream for the encoder side.
+///
+/// The [`ReadFrameHeaderError::SkipFrame`] path does not apply here —
+/// skippable frames are identified by their magic number, which is
+/// absent. All other errors mirror [`read_frame_header`].
+pub fn read_frame_header_magicless(
+    r: impl Read,
+) -> Result<(FrameHeader, u8), ReadFrameHeaderError> {
+    read_frame_header_body(r, 0)
+}
+
+fn read_frame_header_body(
+    mut r: impl Read,
+    initial_bytes_read: usize,
+) -> Result<(FrameHeader, u8), ReadFrameHeaderError> {
+    use ReadFrameHeaderError as err;
+    let mut buf = [0u8; 4];
+    let mut bytes_read = initial_bytes_read;
 
     r.read_exact(&mut buf[0..1])
         .map_err(err::FrameDescriptorReadError)?;

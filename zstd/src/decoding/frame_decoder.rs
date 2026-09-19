@@ -100,7 +100,20 @@ impl FrameDecoderState {
     /// Pre-allocates the decode buffer to `window_size` so the first block
     /// does not trigger incremental growth from zero capacity.
     pub fn new(source: impl Read) -> Result<FrameDecoderState, FrameDecoderError> {
-        let (frame, header_size) = frame::read_frame_header(source)?;
+        Self::from_header(frame::read_frame_header(source)?)
+    }
+
+    /// Like [`FrameDecoderState::new`], but for a frame whose 4-byte
+    /// magic number has been stripped (the `ZSTD_f_zstd1_magicless`
+    /// format, used by OpenZFS on disk). The reader's first byte must
+    /// be the `Frame_Header_Descriptor`.
+    pub fn new_magicless(source: impl Read) -> Result<FrameDecoderState, FrameDecoderError> {
+        Self::from_header(frame::read_frame_header_magicless(source)?)
+    }
+
+    fn from_header(
+        (frame, header_size): (frame::FrameHeader, u8),
+    ) -> Result<FrameDecoderState, FrameDecoderError> {
         let window_size = frame.window_size()?;
 
         if window_size > MAXIMUM_ALLOWED_WINDOW_SIZE {
@@ -128,7 +141,18 @@ impl FrameDecoderState {
     /// additional frame-level reservation is needed here. Further buffer
     /// growth during decoding is performed on demand by the active block path.
     pub fn reset(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
-        let (frame_header, header_size) = frame::read_frame_header(source)?;
+        self.reset_from_header(frame::read_frame_header(source)?)
+    }
+
+    /// Like [`FrameDecoderState::reset`], but for a magicless frame.
+    pub fn reset_magicless(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
+        self.reset_from_header(frame::read_frame_header_magicless(source)?)
+    }
+
+    fn reset_from_header(
+        &mut self,
+        (frame_header, header_size): (frame::FrameHeader, u8),
+    ) -> Result<(), FrameDecoderError> {
         let window_size = frame_header.window_size()?;
 
         if window_size > MAXIMUM_ALLOWED_WINDOW_SIZE {
@@ -203,6 +227,16 @@ impl FrameDecoder {
         self.reset(source)
     }
 
+    /// Like [`FrameDecoder::init`], but for a frame stored without the
+    /// 4-byte magic number (the `ZSTD_f_zstd1_magicless` format used
+    /// by OpenZFS on disk). The reader's first byte must be the
+    /// `Frame_Header_Descriptor`.
+    ///
+    /// equivalent to [`FrameDecoder::reset_magicless`].
+    pub fn init_magicless(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
+        self.reset_magicless(source)
+    }
+
     /// Initialize the decoder for a new frame using a pre-parsed dictionary handle.
     ///
     /// If the frame header has a dictionary ID, this validates it against
@@ -229,6 +263,24 @@ impl FrameDecoder {
         self.reset_with_dict_handle(source, dict)
     }
 
+    /// Like [`FrameDecoder::reset`], but for a magicless frame.
+    pub fn reset_magicless(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
+        match &mut self.state {
+            Some(s) => s.reset_magicless(source)?,
+            None => self.state = Some(FrameDecoderState::new_magicless(source)?),
+        }
+        // Magicless frames are only used in contexts that don't ship
+        // dictionaries through the frame header (notably ZFS), so the
+        // dictionary-resolution path is unnecessary; surface a
+        // best-effort error if a header somehow carries an id we don't
+        // know about, matching `reset`'s behavior.
+        let dict_id = self
+            .state
+            .as_ref()
+            .and_then(|state| state.frame_header.dictionary_id());
+        self.resolve_dictionary(dict_id)
+    }
+
     /// reset() will allocate all needed buffers if it is the first time this decoder is used
     /// else they just reset these buffers with not further allocations
     ///
@@ -236,7 +288,6 @@ impl FrameDecoder {
     ///
     /// equivalent to init()
     pub fn reset(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
-        use FrameDecoderError as err;
         let dict_id = match &mut self.state {
             Some(s) => {
                 s.reset(source)?;
@@ -249,6 +300,11 @@ impl FrameDecoder {
                     .and_then(|state| state.frame_header.dictionary_id())
             }
         };
+        self.resolve_dictionary(dict_id)
+    }
+
+    fn resolve_dictionary(&mut self, dict_id: Option<u32>) -> Result<(), FrameDecoderError> {
+        use FrameDecoderError as err;
         if let Some(dict_id) = dict_id {
             let state = self.state.as_mut().expect("state initialized");
             let owned_dicts = &self.owned_dicts;
@@ -694,6 +750,21 @@ impl FrameDecoder {
         output: &mut [u8],
     ) -> Result<usize, FrameDecoderError> {
         self.decode_all_impl(input, output, |this, src| this.init(src))
+    }
+
+    /// Like [`FrameDecoder::decode_all`], but for one or more frames
+    /// stored without the 4-byte zstd magic number — the
+    /// `ZSTD_f_zstd1_magicless` format used by OpenZFS on disk.
+    ///
+    /// Skippable frames are not supported in this mode: skippability
+    /// is identified by the magic number, which is absent. `input`
+    /// must contain magicless zstd frames back-to-back.
+    pub fn decode_all_magicless(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, FrameDecoderError> {
+        self.decode_all_impl(input, output, |this, src| this.init_magicless(src))
     }
 
     /// Decode multiple frames into the output slice using a pre-parsed dictionary handle.
