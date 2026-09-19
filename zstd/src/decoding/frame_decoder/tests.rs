@@ -3444,3 +3444,34 @@ fn frame_decoder_stays_small_enough_for_a_kernel_stack() {
     assert!(state <= BUDGET, "FrameDecoderState is {state} B inline");
     assert!(scratch <= BUDGET, "DecoderScratch is {scratch} B inline");
 }
+
+/// The boxed FSE tables must show up in the reported context size. They are
+/// ~12 KiB that moved from inline to the heap when `fse` became a `Box`, and
+/// a C caller budgets against this figure, so leaving them uncounted
+/// under-reports the decoder by more than the rest of a fresh scratch
+/// combined. Pins both owners: the decode scratch and a dictionary.
+#[test]
+fn boxed_fse_tables_are_reported_as_heap() {
+    use crate::decoding::Dictionary;
+    use crate::decoding::scratch::{DecoderScratch, FSEScratch};
+
+    let boxed = core::mem::size_of::<FSEScratch>();
+    assert!(
+        boxed > 4 * 1024,
+        "expected the FSE tables to be the bulk of the charge, got {boxed} B"
+    );
+
+    let scratch: DecoderScratch = DecoderScratch::new(1024);
+    assert!(
+        scratch.workspace_bytes() >= boxed,
+        "workspace_bytes() = {} omits the {boxed} B boxed FSE tables",
+        scratch.workspace_bytes()
+    );
+
+    let dict = Dictionary::from_raw_content(1, alloc::vec![0u8; 64]).expect("dictionary");
+    assert!(
+        dict.heap_bytes() >= boxed,
+        "Dictionary::heap_bytes() = {} omits the {boxed} B boxed FSE tables",
+        dict.heap_bytes()
+    );
+}

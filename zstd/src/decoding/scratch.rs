@@ -170,11 +170,16 @@ impl<B: BufferBackend> DecoderScratch<B> {
     /// per-block literal and block-content buffers and the entropy tables. The
     /// window dominates and scales with the frame; the rest are bounded by the
     /// block maximum and the entropy alphabet.
+    ///
+    /// `fse` is a `Box`, so its fixed-size decode arrays are heap bytes rather
+    /// than inline in this struct: charge `size_of` for the boxed value on top
+    /// of the build-scratch vectors `FSEScratch::heap_bytes` sums.
     pub fn workspace_bytes(&self) -> usize {
         self.buffer.capacity()
             + self.literals_buffer.capacity()
             + self.block_content_buffer.capacity()
             + self.huf.heap_bytes()
+            + core::mem::size_of::<FSEScratch>()
             + self.fse.heap_bytes()
     }
 
@@ -465,9 +470,11 @@ pub struct FSEScratch {
 
 impl FSEScratch {
     /// Heap bytes owned by the three locally-built sequence FSE tables
-    /// (LL/ML/OF). The fixed-size decode arrays are inline (counted by
-    /// `size_of`); this sums their build-scratch vectors. `Dict`-sourced
-    /// tables read a shared handle and are not owned here.
+    /// (LL/ML/OF): this sums their build-scratch vectors. The fixed-size
+    /// decode arrays are part of `size_of::<FSEScratch>()` and so are NOT
+    /// counted here; every owner holds this struct in a `Box`, so each
+    /// charges that `size_of` itself. `Dict`-sourced tables read a shared
+    /// handle and are not owned here.
     pub fn heap_bytes(&self) -> usize {
         self.offsets.heap_bytes()
             + self.literal_lengths.heap_bytes()
