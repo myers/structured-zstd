@@ -25,6 +25,15 @@ pub struct DecoderScratch {
     pub literals_buffer: Vec<u8>,
     pub sequences: Vec<Sequence>,
     pub block_content_buffer: Vec<u8>,
+    /// Staging buffer for the Raw and RLE block paths.
+    ///
+    /// Both of those paths used to read into a `[u8; 128 * 1024]` local in
+    /// `BlockDecoder::decode_block_content`, which put a 128 KiB array in that
+    /// function's stack frame.  That is fine on a large userspace stack and
+    /// fatal on a small kernel one (Asterinas gives a task 32 KiB), so the
+    /// staging area lives on the heap here instead.  Contents are not carried
+    /// between blocks; only the allocation is reused.
+    pub raw_batch_buffer: Vec<u8>,
 }
 
 impl DecoderScratch {
@@ -47,6 +56,7 @@ impl DecoderScratch {
             block_content_buffer: Vec::new(),
             literals_buffer: Vec::new(),
             sequences: Vec::new(),
+            raw_batch_buffer: Vec::new(),
         }
     }
 
@@ -55,6 +65,7 @@ impl DecoderScratch {
         self.literals_buffer.clear();
         self.sequences.clear();
         self.block_content_buffer.clear();
+        self.raw_batch_buffer.clear();
 
         self.buffer.reset(window_size);
 

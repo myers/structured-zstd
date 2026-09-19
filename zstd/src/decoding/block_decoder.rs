@@ -60,11 +60,21 @@ impl BlockDecoder {
         match block_type {
             BlockType::RLE => {
                 const BATCH_SIZE: usize = 512;
-                let mut buf = [0u8; BATCH_SIZE];
+                // The staging buffer lives in `workspace` (on the heap), not in
+                // this frame.  `workspace.raw_batch_buffer` and
+                // `workspace.buffer` are disjoint fields, so they are borrowed
+                // separately below rather than through `workspace`.
+                let DecoderScratch {
+                    raw_batch_buffer: buf,
+                    buffer: out,
+                    ..
+                } = workspace;
+                buf.clear();
+                buf.resize(BATCH_SIZE, 0);
                 let full_reads = header.decompressed_size / BATCH_SIZE as u32;
                 let single_read_size = header.decompressed_size % BATCH_SIZE as u32;
 
-                workspace.buffer.reserve(header.decompressed_size as usize);
+                out.reserve(header.decompressed_size as usize);
 
                 source.read_exact(&mut buf[0..1]).map_err(|err| {
                     DecodeBlockContentError::ReadError {
@@ -79,20 +89,29 @@ impl BlockDecoder {
                 }
 
                 for _ in 0..full_reads {
-                    workspace.buffer.push(&buf[..]);
+                    out.push(&buf[..]);
                 }
                 let smaller = &mut buf[..single_read_size as usize];
-                workspace.buffer.push(smaller);
+                out.push(smaller);
 
                 Ok(1)
             }
             BlockType::Raw => {
                 const BATCH_SIZE: usize = 128 * 1024;
-                let mut buf = [0u8; BATCH_SIZE];
+                // Same as the RLE arm: a 128 KiB `[u8; BATCH_SIZE]` local here
+                // would be a 128 KiB stack frame, which does not fit a kernel
+                // task stack.  Stage through the heap buffer in `workspace`.
+                let DecoderScratch {
+                    raw_batch_buffer: buf,
+                    buffer: out,
+                    ..
+                } = workspace;
+                buf.clear();
+                buf.resize(BATCH_SIZE, 0);
                 let full_reads = header.decompressed_size / BATCH_SIZE as u32;
                 let single_read_size = header.decompressed_size % BATCH_SIZE as u32;
 
-                workspace.buffer.reserve(header.decompressed_size as usize);
+                out.reserve(header.decompressed_size as usize);
 
                 for _ in 0..full_reads {
                     source.read_exact(&mut buf[..]).map_err(|err| {
@@ -101,7 +120,7 @@ impl BlockDecoder {
                             source: err,
                         }
                     })?;
-                    workspace.buffer.push(&buf[..]);
+                    out.push(&buf[..]);
                 }
 
                 let smaller = &mut buf[..single_read_size as usize];
@@ -111,7 +130,7 @@ impl BlockDecoder {
                         step: block_type,
                         source: err,
                     })?;
-                workspace.buffer.push(smaller);
+                out.push(smaller);
 
                 self.internal_state = DecoderState::ReadyToDecodeNextHeader;
                 Ok(u64::from(header.decompressed_size))
