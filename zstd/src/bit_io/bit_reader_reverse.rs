@@ -78,12 +78,16 @@ fn detect_triple_extract_dispatch() -> TripleExtractDispatch {
 
     // AMD Zen1/Zen2 execute PEXT/PDEP through a slow microcode path.
     // Keep scalar extraction there and enable PEXT on Intel and newer AMD.
-    let leaf0 = __cpuid(0);
+    // SAFETY: x86_64 CPUID is universally available on x86_64; the bmi2
+    // detection above is independent of CPUID safety. Both calls read
+    // architectural registers and have no preconditions on x86_64.
+    let leaf0 = unsafe { __cpuid(0) };
     let mut vendor = [0u8; 12];
     vendor[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
     vendor[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());
     vendor[8..12].copy_from_slice(&leaf0.ecx.to_le_bytes());
-    let eax = __cpuid(1).eax;
+    // SAFETY: same as above.
+    let eax = unsafe { __cpuid(1) }.eax;
     let base_family = (eax >> 8) & 0xF;
     let ext_family = (eax >> 20) & 0xFF;
     let family = if base_family == 0xF {
