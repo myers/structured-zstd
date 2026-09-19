@@ -11,12 +11,12 @@ use alloc::vec::Vec;
 use core::arch::aarch64::{
     __crc32d, uint8x16_t, vceqq_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8,
 };
-#[cfg(target_arch = "x86")]
+#[cfg(all(target_feature = "sse2", target_arch = "x86"))]
 use core::arch::x86::{
     __m128i, __m256i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm256_cmpeq_epi8,
     _mm256_loadu_si256, _mm256_movemask_epi8,
 };
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_feature = "sse2", target_arch = "x86_64"))]
 use core::arch::x86_64::{
     __m128i, __m256i, _mm_cmpeq_epi8, _mm_crc32_u64, _mm_loadu_si128, _mm_movemask_epi8,
     _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
@@ -32,7 +32,7 @@ use super::blocks::encode_offset_with_history;
 use super::incompressible::{block_looks_incompressible, block_looks_incompressible_strict};
 #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
 use std::arch::is_aarch64_feature_detected;
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(feature = "std", target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
 use std::arch::is_x86_feature_detected;
 #[cfg(feature = "std")]
 use std::sync::OnceLock;
@@ -80,7 +80,7 @@ const MAX_HC_SEARCH_DEPTH: usize = 32;
 #[repr(u8)]
 enum HashMixKernel {
     Scalar = 0,
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_feature = "sse2", target_arch = "x86_64"))]
     X86Sse42 = 1,
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     Aarch64Crc = 2,
@@ -90,7 +90,7 @@ enum HashMixKernel {
 fn hash_mix_u64_with_kernel(value: u64, kernel: HashMixKernel) -> u64 {
     match kernel {
         HashMixKernel::Scalar => value.wrapping_mul(HASH_MIX_PRIME),
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_feature = "sse2", target_arch = "x86_64"))]
         HashMixKernel::X86Sse42 => {
             // SAFETY: runtime/static detection selected this kernel.
             unsafe { hash_mix_u64_sse42(value) }
@@ -105,7 +105,7 @@ fn hash_mix_u64_with_kernel(value: u64, kernel: HashMixKernel) -> u64 {
 
 #[inline(always)]
 fn detect_hash_mix_kernel() -> HashMixKernel {
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", target_feature = "sse2", target_arch = "x86_64"))]
     if is_x86_feature_detected!("sse4.2") {
         return HashMixKernel::X86Sse42;
     }
@@ -115,7 +115,7 @@ fn detect_hash_mix_kernel() -> HashMixKernel {
         return HashMixKernel::Aarch64Crc;
     }
 
-    #[cfg(all(not(feature = "std"), target_arch = "x86_64"))]
+    #[cfg(all(not(feature = "std"), target_feature = "sse2", target_arch = "x86_64"))]
     if cfg!(target_feature = "sse4.2") {
         return HashMixKernel::X86Sse42;
     }
@@ -132,7 +132,7 @@ fn detect_hash_mix_kernel() -> HashMixKernel {
     HashMixKernel::Scalar
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_feature = "sse2", target_arch = "x86_64"))]
 #[target_feature(enable = "sse4.2")]
 unsafe fn hash_mix_u64_sse42(value: u64) -> u64 {
     let crc = _mm_crc32_u64(0, value);
@@ -152,9 +152,9 @@ unsafe fn hash_mix_u64_crc(value: u64) -> u64 {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum PrefixKernel {
     Scalar,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     X86Sse2,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     X86Avx2,
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     Aarch64Neon,
@@ -990,7 +990,7 @@ pub(crate) struct MatchGenerator {
 }
 
 impl MatchGenerator {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     #[inline(always)]
     const fn select_x86_prefix_kernel(has_avx2: bool, has_sse2: bool) -> PrefixKernel {
         if has_avx2 {
@@ -1007,7 +1007,7 @@ impl MatchGenerator {
     fn detect_prefix_kernel() -> PrefixKernel {
         static KERNEL: OnceLock<PrefixKernel> = OnceLock::new();
         *KERNEL.get_or_init(|| {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
             {
                 let kernel = Self::select_x86_prefix_kernel(
                     is_x86_feature_detected!("avx2"),
@@ -1030,7 +1030,7 @@ impl MatchGenerator {
     #[cfg(not(feature = "std"))]
     #[inline(always)]
     fn detect_prefix_kernel() -> PrefixKernel {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
         {
             let kernel = Self::select_x86_prefix_kernel(
                 cfg!(target_feature = "avx2"),
@@ -1205,11 +1205,11 @@ impl MatchGenerator {
         let rhs = b.as_ptr();
 
         match Self::detect_prefix_kernel() {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
             PrefixKernel::X86Avx2 => {
                 off = unsafe { Self::prefix_len_simd_avx2(lhs, rhs, max) };
             }
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
             PrefixKernel::X86Sse2 => {
                 off = unsafe { Self::prefix_len_simd_sse2(lhs, rhs, max) };
             }
@@ -1242,7 +1242,7 @@ impl MatchGenerator {
             .count()
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     #[target_feature(enable = "sse2")]
     unsafe fn prefix_len_simd_sse2(lhs: *const u8, rhs: *const u8, max: usize) -> usize {
         let mut off = 0usize;
@@ -1259,7 +1259,7 @@ impl MatchGenerator {
         off
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     #[target_feature(enable = "avx2")]
     unsafe fn prefix_len_simd_avx2(lhs: *const u8, rhs: *const u8, max: usize) -> usize {
         let mut off = 0usize;
@@ -4304,7 +4304,7 @@ fn row_repcode_returns_none_when_position_too_close_to_history_end() {
     assert!(matcher.repcode_candidate(4, 1).is_none());
 }
 
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(all(feature = "std", target_feature = "sse2", target_arch = "x86_64"))]
 #[test]
 fn hash_mix_sse42_path_is_available_and_matches_accelerated_impl_when_supported() {
     if !is_x86_feature_detected!("sse4.2") {
@@ -4318,7 +4318,7 @@ fn hash_mix_sse42_path_is_available_and_matches_accelerated_impl_when_supported(
     assert_eq!(hash_mix_u64_with_kernel(v, kernel), accelerated);
 }
 
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(all(feature = "std", target_feature = "sse2", target_arch = "x86_64"))]
 #[test]
 fn hash_mix_scalar_path_can_be_forced_for_coverage_and_matches_formula() {
     let v = 0x0123_4567_89AB_CDEFu64;

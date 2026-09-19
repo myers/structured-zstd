@@ -8,19 +8,19 @@ use alloc::vec::Vec;
 use core::arch::aarch64::{vandq_u32, vdupq_n_u32, vld1q_u32, vshrq_n_u32, vst1q_u32};
 #[cfg(target_arch = "aarch64")]
 use core::arch::asm;
-#[cfg(target_arch = "x86")]
+#[cfg(all(target_feature = "sse2", target_arch = "x86"))]
 use core::arch::x86::{
     _bzhi_u32, _mm_cvtsi128_si32, _mm_i32gather_epi32, _mm_maskz_compress_epi8, _mm_set_epi32,
     _mm_srli_si128,
 };
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_feature = "sse2", target_arch = "x86_64"))]
 use core::arch::x86_64::{
     _bzhi_u64, _mm_cvtsi128_si32, _mm_i32gather_epi32, _mm_maskz_compress_epi8, _mm_set_epi32,
     _mm_srli_si128,
 };
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 use std::arch::is_aarch64_feature_detected;
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(feature = "std", target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
 use std::arch::is_x86_feature_detected;
 #[cfg(feature = "std")]
 use std::sync::OnceLock;
@@ -31,11 +31,11 @@ pub(crate) const MAX_MAX_NUM_BITS: u8 = 11;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum HuffmanDecodeKernel {
     Scalar,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     X86Bmi2,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     X86Avx2,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     X86Vbmi2,
     #[cfg(target_arch = "aarch64")]
     Aarch64Neon,
@@ -43,7 +43,7 @@ pub(crate) enum HuffmanDecodeKernel {
     Aarch64Sve,
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
 #[inline(always)]
 const fn select_x86_huffman_decode_kernel(
     has_avx512vbmi2: bool,
@@ -70,7 +70,7 @@ const fn select_x86_huffman_decode_kernel(
 pub(crate) fn detect_huffman_decode_kernel() -> HuffmanDecodeKernel {
     static KERNEL: OnceLock<HuffmanDecodeKernel> = OnceLock::new();
     *KERNEL.get_or_init(|| {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
         {
             let kernel = select_x86_huffman_decode_kernel(
                 is_x86_feature_detected!("avx512vbmi2"),
@@ -100,7 +100,7 @@ pub(crate) fn detect_huffman_decode_kernel() -> HuffmanDecodeKernel {
 #[cfg(not(feature = "std"))]
 #[inline(always)]
 pub(crate) fn detect_huffman_decode_kernel() -> HuffmanDecodeKernel {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     {
         let kernel = select_x86_huffman_decode_kernel(
             cfg!(target_feature = "avx512vbmi2"),
@@ -196,7 +196,7 @@ impl<'t> HuffmanDecoder<'t> {
     pub fn decode_symbol_and_advance(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         match self.kernel {
             HuffmanDecodeKernel::Scalar => self.decode_symbol_and_advance_scalar(br),
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
             HuffmanDecodeKernel::X86Bmi2
             | HuffmanDecodeKernel::X86Avx2
             | HuffmanDecodeKernel::X86Vbmi2 => {
@@ -220,7 +220,7 @@ impl<'t> HuffmanDecoder<'t> {
     pub(crate) fn advance_state_by_bits(&mut self, br: &mut BitReaderReversed<'_>, num_bits: u8) {
         let new_bits = br.get_bits(num_bits);
         match self.kernel {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
             HuffmanDecodeKernel::X86Bmi2
             | HuffmanDecodeKernel::X86Avx2
             | HuffmanDecodeKernel::X86Vbmi2 => {
@@ -292,12 +292,12 @@ impl<'t> HuffmanDecoder<'t> {
         kernel: HuffmanDecodeKernel,
     ) -> ([u8; 4], [u8; 4]) {
         match kernel {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
             HuffmanDecodeKernel::X86Vbmi2 => {
                 // SAFETY: VBMI2 kernel is selected only after runtime/static feature checks.
                 unsafe { Self::decode4_symbols_and_num_bits_vbmi2(decoders) }
             }
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
             HuffmanDecodeKernel::X86Avx2 => {
                 // SAFETY: AVX2 kernel is selected only after runtime/static feature checks.
                 unsafe { Self::decode4_symbols_and_num_bits_avx2(decoders) }
@@ -332,7 +332,7 @@ impl<'t> HuffmanDecoder<'t> {
         (symbols, num_bits)
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     #[target_feature(enable = "avx512vbmi2,avx512f,avx512vl,avx512bw")]
     unsafe fn decode4_symbols_and_num_bits_vbmi2(
         decoders: &[HuffmanDecoder<'_>; 4],
@@ -359,7 +359,7 @@ impl<'t> HuffmanDecoder<'t> {
         )
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     #[target_feature(enable = "avx2")]
     unsafe fn decode4_symbols_and_num_bits_avx2(
         decoders: &[HuffmanDecoder<'_>; 4],
@@ -490,7 +490,7 @@ impl<'t> HuffmanDecoder<'t> {
         entry.symbol
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     #[target_feature(enable = "bmi2")]
     unsafe fn decode_symbol_and_advance_x86_bmi2(&mut self, br: &mut BitReaderReversed<'_>) -> u8 {
         let entry = self.table.decode[self.state as usize];
@@ -499,14 +499,14 @@ impl<'t> HuffmanDecoder<'t> {
         entry.symbol
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     #[target_feature(enable = "bmi2")]
     unsafe fn advance_state_x86_bmi2(&self, num_bits: u8, new_bits: u64) -> u64 {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(target_feature = "sse2", target_arch = "x86_64"))]
         {
             _bzhi_u64(self.state << num_bits, u32::from(self.table.max_num_bits)) | new_bits
         }
-        #[cfg(target_arch = "x86")]
+        #[cfg(all(target_feature = "sse2", target_arch = "x86"))]
         {
             let shifted = ((self.state << num_bits) & u64::from(u32::MAX)) as u32;
             u64::from(_bzhi_u32(shifted, u32::from(self.table.max_num_bits))) | new_bits
@@ -1027,7 +1027,7 @@ mod tests {
         assert_eq!(bits, [1, 2, 1, 2]);
     }
 
-    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(all(feature = "std", target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn bmi2_advance_matches_scalar_formula_when_available() {
         if !std::arch::is_x86_feature_detected!("bmi2") {
@@ -1048,7 +1048,7 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(all(feature = "std", target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn decode4_avx2_matches_scalar_when_available() {
         if !std::arch::is_x86_feature_detected!("avx2") {
@@ -1106,7 +1106,7 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(all(feature = "std", target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn decode4_vbmi2_matches_scalar_when_available() {
         if !(std::arch::is_x86_feature_detected!("avx512vbmi2")
@@ -1169,7 +1169,7 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn select_x86_kernel_ordering_is_stable() {
         assert_eq!(
@@ -1190,7 +1190,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn decode4_mixed_tables_falls_back_in_release() {
         let table_a = test_table();
@@ -1229,7 +1229,7 @@ mod tests {
         assert_eq!(bits, [1, 2, 2, 2]);
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn decode4_mixed_kernels_falls_back_in_release() {
         let table = test_table();

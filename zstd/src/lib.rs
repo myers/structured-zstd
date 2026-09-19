@@ -38,6 +38,14 @@ pub mod decoding;
 #[cfg(feature = "dict_builder")]
 #[cfg_attr(docsrs, doc(cfg(feature = "dict_builder")))]
 pub mod dictionary;
+// The encoder is gated on `std` because
+// `encoding/blocks/compressed.rs` uses `f64::log2` in its FSE
+// table-selection cost model, and `core` has no float transcendentals.
+// Consumers that only decode (e.g. a `no_std` kernel reading zstd
+// blocks off disk) therefore do not need to carry the encoder at all.
+// This gate removes code that such a build never calls; it cannot
+// affect codec output.
+#[cfg(feature = "std")]
 pub mod encoding;
 mod histogram;
 

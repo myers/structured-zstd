@@ -1,16 +1,16 @@
-#[cfg(target_arch = "x86")]
+#[cfg(all(target_feature = "sse2", target_arch = "x86"))]
 use core::arch::x86::{
     __m128i, __m256i, __m512i, _mm_loadu_si128, _mm_storeu_si128, _mm256_loadu_si256,
     _mm256_storeu_si256, _mm512_loadu_si512, _mm512_storeu_si512,
 };
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_feature = "sse2", target_arch = "x86_64"))]
 use core::arch::x86_64::{
     __m128i, __m256i, __m512i, _mm_loadu_si128, _mm_storeu_si128, _mm256_loadu_si256,
     _mm256_storeu_si256, _mm512_loadu_si512, _mm512_storeu_si512,
 };
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(feature = "std", target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
 use std::arch::is_x86_feature_detected;
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(feature = "std", target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
 use std::sync::OnceLock;
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -99,7 +99,7 @@ fn scalar_strategy() -> CopyStrategy {
 
 #[inline(always)]
 fn copy_strategy(copy_at_least: usize) -> CopyStrategy {
-    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(all(feature = "std", target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     {
         let caps = detect_x86_caps();
         if caps.avx512f && copy_at_least >= 64 {
@@ -123,7 +123,7 @@ fn copy_strategy(copy_at_least: usize) -> CopyStrategy {
         scalar_strategy()
     }
 
-    #[cfg(all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(all(not(feature = "std"), target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     {
         if cfg!(target_feature = "avx512f") && copy_at_least >= 64 {
             return CopyStrategy {
@@ -159,8 +159,8 @@ fn copy_strategy(copy_at_least: usize) -> CopyStrategy {
     }
 
     #[cfg(not(any(
-        all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")),
-        all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")),
+        all(feature = "std", target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")),
+        all(not(feature = "std"), target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")),
         all(target_arch = "aarch64", target_feature = "neon")
     )))]
     {
@@ -188,7 +188,7 @@ unsafe fn copy_scalar(mut src: *const u8, mut dst: *mut u8, len: usize) {
     }
 }
 
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(feature = "std", target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
 #[derive(Clone, Copy)]
 struct X86Caps {
     avx512f: bool,
@@ -196,7 +196,7 @@ struct X86Caps {
     sse2: bool,
 }
 
-#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg(all(feature = "std", target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
 #[inline(always)]
 fn detect_x86_caps() -> X86Caps {
     static CAPS: OnceLock<X86Caps> = OnceLock::new();
@@ -207,7 +207,7 @@ fn detect_x86_caps() -> X86Caps {
     })
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
 #[target_feature(enable = "sse2")]
 unsafe fn copy_sse2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     let end = unsafe { src.add(len) };
@@ -221,7 +221,7 @@ unsafe fn copy_sse2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     }
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
 #[target_feature(enable = "avx2")]
 unsafe fn copy_avx2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     let end = unsafe { src.add(len) };
@@ -235,7 +235,7 @@ unsafe fn copy_avx2(mut src: *const u8, mut dst: *mut u8, len: usize) {
     }
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
 #[target_feature(enable = "avx512f")]
 unsafe fn copy_avx512(mut src: *const u8, mut dst: *mut u8, len: usize) {
     let end = unsafe { src.add(len) };
@@ -299,14 +299,14 @@ mod tests {
         assert_eq!(dst, src);
     }
 
-    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(all(feature = "std", target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn copy_strategy_uses_scalar_chunk_for_sub_sse_sizes() {
         let strategy = copy_strategy(15);
         assert_eq!(strategy.chunk, core::mem::size_of::<usize>());
     }
 
-    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(all(feature = "std", target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn copy_sse2_copies_full_chunk_when_available() {
         if !std::arch::is_x86_feature_detected!("sse2") {
@@ -318,7 +318,7 @@ mod tests {
         assert_eq!(dst, src);
     }
 
-    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(all(feature = "std", target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn copy_avx2_copies_full_chunk_when_available() {
         if !std::arch::is_x86_feature_detected!("avx2") {
@@ -330,7 +330,7 @@ mod tests {
         assert_eq!(dst, src);
     }
 
-    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(all(feature = "std", target_feature = "sse2", any(target_arch = "x86", target_arch = "x86_64")))]
     #[test]
     fn copy_avx512_copies_full_chunk_when_available() {
         if !std::arch::is_x86_feature_detected!("avx512f") {
