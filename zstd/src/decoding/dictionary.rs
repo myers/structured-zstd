@@ -73,10 +73,15 @@ pub const MAGIC_NUM: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
 
 impl Dictionary {
     /// Heap bytes owned by this dictionary: the content plus the parsed
-    /// entropy tables' heap (the fixed-size FSE decode arrays are inline,
-    /// counted by `size_of::<Dictionary>()`).
+    /// entropy tables' heap. `fse` is a `Box`, so the fixed-size FSE decode
+    /// arrays are heap bytes rather than inline in `size_of::<Dictionary>()`;
+    /// charge that `size_of` here so a caller budgeting against the reported
+    /// figure sees them.
     pub fn heap_bytes(&self) -> usize {
-        self.dict_content.capacity() + self.fse.heap_bytes() + self.huf.heap_bytes()
+        self.dict_content.capacity()
+            + core::mem::size_of::<FSEScratch>()
+            + self.fse.heap_bytes()
+            + self.huf.heap_bytes()
     }
 
     /// Build a dictionary from raw content bytes (without entropy table sections).
