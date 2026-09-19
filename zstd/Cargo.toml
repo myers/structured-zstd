@@ -233,3 +233,12 @@ rustc-dep-of-std = ["dep:compiler_builtins", "dep:core", "dep:alloc"]
 # the non-published `ffi-bench` crate (they link the C `zstd` bindings); their
 # source files remain under `benches/`, `tests/`, and `examples/` here and are
 # referenced from `../ffi-bench/Cargo.toml` via `path`.
+
+# Registered explicitly because `autotests = false` (see the note above).
+# Covers the magicless frame format (`ZSTD_f_zstd1_magicless`), which the
+# decoder supports via `FrameDecoder::set_magicless` but which no unit test
+# under `src/` exercises end to end.
+[[test]]
+name = "magicless"
+path = "tests/magicless.rs"
+required-features = ["std"]
