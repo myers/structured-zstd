@@ -22,6 +22,7 @@ use super::match_generator::{
     ROW_EMPTY_SLOT, ROW_HASH_BITS, ROW_HASH_KEY_LEN, ROW_LOG, ROW_MIN_MATCH_LEN, ROW_SEARCH_DEPTH,
     ROW_TAG_BITS, ROW_TARGET_LEN,
 };
+use super::workspace::{HistoryBuf, RetiredHistory, Table, Workspace, region_bytes};
 
 /// Upstream zstd lazy-parse bounds (`zstd_lazy.c`): the row parse stops
 /// `8 + ZSTD_ROW_HASH_CACHE_SIZE` bytes before the block end, a miss steps
@@ -2324,18 +2325,14 @@ pub(crate) struct RowMatchGenerator {
     pub(crate) max_window_size: usize,
     /// Per-committed-block lengths of the live window, mirroring the
     /// `HashChain` backend's `chunk_lens`. The block bytes themselves live
-    /// only in the contiguous `history` mirror; the input buffers are handed
-    /// straight back to the caller's pool in `add_data` rather than retained
-    /// here. Retaining them (the old `VecDeque<Vec<u8>>`) held a full
-    /// `block_capacity`-sized buffer per committed block, which on a heavily
-    /// pre-split frame ballooned the window to many times the live byte count.
+    /// only in the contiguous `history` mirror.
     pub(crate) chunk_lens: VecDeque<usize>,
     pub(crate) window_size: usize,
-    /// Bytes at the tail of `history` read but not yet claimed by a block
-    /// (in-place ingest). Zero on the staged path. Explicit rather than derived
-    /// from `window_size`, since a primed dictionary also lives in `history`.
+    /// Bytes at the tail of `history` read but not yet claimed by a block.
+    /// Explicit rather than derived from `window_size`, since a primed
+    /// dictionary also lives in `history`.
     pub(crate) uncommitted_len: usize,
-    pub(crate) history: Vec<u8>,
+    pub(crate) history: HistoryBuf,
     pub(crate) history_start: usize,
     pub(crate) history_abs_start: usize,
     pub(crate) offset_hist: [u32; 3],
@@ -2412,8 +2409,12 @@ pub(crate) struct RowMatchGenerator {
     /// positions, in chain / tree mode the hash table followed by the chain
     /// table at `hc_split`. One allocation per compressor instead of three
     /// keeps the allocator seeing a single size class, which is what decides
-    /// whether the tables keep their pages between frames.
-    pub(crate) tables: Vec<u32>,
+    /// whether the tables keep their pages between frames. In the context's
+    /// workspace when a context drives the matcher.
+    pub(crate) tables: Table<u32>,
+    /// Set by [`Self::bind_tables`] when the tables were laid out anew and so
+    /// hold nothing an earlier frame wrote; read and cleared by [`Self::reset`].
+    tables_fresh: bool,
     /// Start of the chain / tree table inside [`Self::tables`]; the hash table
     /// occupies everything before it. Zero in row mode, where the buffer holds
     /// row positions followed by the two byte tables.
@@ -2442,7 +2443,7 @@ pub(crate) struct RowMatchGenerator {
     // footprint vs the upstream zstd-parity `U32` layout. `ROW_EMPTY_SLOT == u32::MAX`
     // is the empty sentinel, so every stored position must stay strictly below
     // it. On a long stream the cumulative absolute cursor would cross `u32::MAX`
-    // even while the live window is bounded; `add_data` rebases the coordinate
+    // even while the live window is bounded; `commit_block` rebases the coordinate
     // origin down to the oldest live byte before that happens (see
     // [`Self::rebase_positions`]), keeping positions representable without
     // capping frame length. The tags and the slot cursors live in the byte
@@ -2485,6 +2486,11 @@ pub(crate) struct RowMatchGenerator {
     /// them instead of being handed the dictionary again. The frame compressor
     /// reads this to skip the re-commit entirely.
     dict_resident: bool,
+    /// Set by [`Self::retire_history`] ahead of a layout and taken by the next
+    /// [`Self::reset`], which would otherwise read the floor off a history
+    /// already cut down to what it keeps. `kept` is the dictionary prefix
+    /// before the reset checks its tables, which only the layout settles.
+    retired: Option<RetiredHistory>,
 }
 
 impl RowMatchGenerator {
@@ -2494,13 +2500,14 @@ impl RowMatchGenerator {
             chunk_lens: VecDeque::new(),
             window_size: 0,
             uncommitted_len: 0,
-            history: Vec::new(),
+            history: HistoryBuf::new(),
             history_start: 0,
             history_abs_start: 0,
             offset_hist: [1, 4, 8],
             finder: LazyFinder::Rows,
             hc_chain_log: ROW_HASH_BITS,
-            tables: Vec::new(),
+            tables: Table::empty(),
+            tables_fresh: false,
             hc_split: 0,
             hc_layout: LazyFinder::Chain,
             loaded_dict_end: 0,
@@ -2528,7 +2535,32 @@ impl RowMatchGenerator {
             borrowed_input: None,
             borrowed_block: None,
             borrowed_extent: 0,
+            retired: None,
         }
+    }
+
+    /// Becomes `snapshot`, copying its tables, history and chunk-length queue
+    /// into the buffers this matcher already holds (the first two in a
+    /// context's workspace) instead of cloning them into new allocations. The
+    /// buffers are lent out of `snapshot` for the clone of the rest and put
+    /// back.
+    pub(crate) fn restore_snapshot(&mut self, snapshot: &mut Self) {
+        let snapshot_tables = core::mem::take(&mut snapshot.tables);
+        let snapshot_history = core::mem::take(&mut snapshot.history);
+        let snapshot_chunks = core::mem::take(&mut snapshot.chunk_lens);
+        let mut tables = core::mem::take(&mut self.tables);
+        let mut history = core::mem::take(&mut self.history);
+        let mut chunks = core::mem::take(&mut self.chunk_lens);
+        tables.clone_from(&snapshot_tables);
+        history.clone_from(&snapshot_history);
+        chunks.clone_from(&snapshot_chunks);
+        *self = snapshot.clone();
+        self.tables = tables;
+        self.history = history;
+        self.chunk_lens = chunks;
+        snapshot.tables = snapshot_tables;
+        snapshot.history = snapshot_history;
+        snapshot.chunk_lens = snapshot_chunks;
     }
 
     /// Heap bytes this matcher owns: history, the row head/position/tag tables,
@@ -2536,11 +2568,12 @@ impl RowMatchGenerator {
     pub(crate) fn heap_size(&self) -> usize {
         let u32_sz = core::mem::size_of::<u32>();
         self.chunk_lens.capacity() * core::mem::size_of::<usize>()
-            + self.history.capacity()
-            // One buffer for whichever finder is live: the row positions with
-            // the cursors and tags in its byte tail, or the chain / tree hash
-            // and link tables.
-            + self.tables.capacity() * u32_sz
+            // The history and one buffer for whichever finder is live (the row
+            // positions with the cursors and tags in its byte tail, or the
+            // chain / tree hash and link tables), each counted here only when
+            // it is not in a context's workspace.
+            + self.history.owned_bytes()
+            + self.tables.owned_bytes()
             + self.dict.table().map_or(0, |t| {
                 t.heads.capacity()
                     + t.positions.capacity() * u32_sz
@@ -2618,8 +2651,9 @@ impl RowMatchGenerator {
         if self.row_hash_log != row_hash_log {
             self.row_hash_log = row_hash_log;
             // One buffer carries the positions and the two byte tables, so
-            // clearing it drops all three; `ensure_tables` re-lays them out.
-            self.tables.clear();
+            // dropping it drops all three; they are laid out again at the new
+            // width.
+            self.tables = Table::empty();
             self.hc_split = 0;
             self.rows_len = 0;
             self.heads_len = 0;
@@ -2692,17 +2726,16 @@ impl RowMatchGenerator {
         self.dict_plan = plan;
     }
 
-    pub(crate) fn reset(&mut self) {
-        // Floor-advance reset (same shape as the dfast/HC backends): instead
-        // of re-zeroing the row tables per frame (a multi-MiB memset that
-        // dominated small/medium-frame encode), advance the absolute
-        // coordinate floor past everything ever inserted. Stale entries all
-        // hold positions below the new floor, so the probes' existing
-        // `candidate_pos < self.history_abs_start` window check rejects them
-        // without any clearing — the upstream zstd's persistent-index design. Stale
-        // TAGS can still produce the occasional false mask hit whose
-        // candidate then fails the window check; the upstream zstd's tag table
-        // persists across frames with the same behaviour.
+    /// Settles, ahead of the next frame's layout, what [`Self::reset`] can keep
+    /// of the history, and drops the rest, so the layout sizes the room for and
+    /// carries over only that. Once per frame; the reset takes the result.
+    pub(crate) fn retire_history(&mut self) {
+        if self.retired.is_none() {
+            self.retired = Some(self.retire());
+        }
+    }
+
+    fn retire(&mut self) -> RetiredHistory {
         // Bytes an abandoned frame ingested but never claimed are not part of
         // the next frame, and they must not count towards the floor advance.
         // Dropped first because every tail-relative bound subtracts this count
@@ -2715,6 +2748,37 @@ impl RowMatchGenerator {
         let next_floor = self.history_abs_start
             + (self.history.len() - self.history_start).max(self.borrowed_extent);
         self.borrowed_extent = 0;
+        // The dictionary prefix a re-borrow would keep; the reset still asks
+        // whether the tables it is indexed in survived the layout.
+        let kept = if self.dict.is_primed()
+            && self.history_start == 0
+            && next_floor <= REBASE_RESET_FLOOR_CEILING
+        {
+            let r = self.dict.region_len();
+            (r > 0 && self.history.len() >= r).then_some(r)
+        } else {
+            None
+        };
+        // Keep `[0, region)`, drop what the previous frame put after it.
+        self.history.truncate(kept.unwrap_or(0));
+        RetiredHistory { next_floor, kept }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        // Floor-advance reset (same shape as the dfast/HC backends): instead
+        // of re-zeroing the row tables per frame (a multi-MiB memset that
+        // dominated small/medium-frame encode), advance the absolute
+        // coordinate floor past everything ever inserted. Stale entries all
+        // hold positions below the new floor, so the probes' existing
+        // `candidate_pos < self.history_abs_start` window check rejects them
+        // without any clearing — the upstream zstd's persistent-index design. Stale
+        // TAGS can still produce the occasional false mask hit whose
+        // candidate then fails the window check; the upstream zstd's tag table
+        // persists across frames with the same behaviour.
+        let RetiredHistory {
+            next_floor,
+            kept: resident_dict,
+        } = self.retired.take().unwrap_or_else(|| self.retire());
         self.offset_hist = [1, 4, 8];
         // Re-borrow, the shape the dfast and Fast backends already have: a
         // dictionary frame keeps its bytes resident at the front of history
@@ -2727,19 +2791,12 @@ impl RowMatchGenerator {
         // The floor advance below still rejects the previous frame's INPUT, and
         // the dictionary's own matches come from `self.dict`, whose positions
         // are dictionary-relative and so bypass the floor.
-        let reborrow_region = if self.dict.is_primed()
-            && self.history_start == 0
-            && next_floor <= REBASE_RESET_FLOOR_CEILING
-            && !self.tables.is_empty()
-        {
-            let r = self.dict.region_len();
-            (r > 0 && self.history.len() >= r).then_some(r)
-        } else {
-            None
-        };
+        // Tables that hold what earlier frames indexed; freshly laid-out ones
+        // are empty, as a matcher that has not allocated them yet would be.
+        let tables_allocated = !self.tables.is_empty() && !self.tables_fresh;
+        self.tables_fresh = false;
+        let reborrow_region = resident_dict.filter(|_| tables_allocated);
         if let Some(region) = reborrow_region {
-            // Keep `[0, region)`, drop what the previous frame put after it.
-            self.history.truncate(region);
             self.window_size = region;
         } else {
             self.window_size = 0;
@@ -2753,14 +2810,17 @@ impl RowMatchGenerator {
         // `set_borrowed_window` after this reset.
         self.borrowed_input = None;
         self.borrowed_block = None;
-        let tables_allocated = !self.tables.is_empty();
         if next_floor <= REBASE_RESET_FLOOR_CEILING && tables_allocated {
             self.history_abs_start = next_floor;
+        } else if !tables_allocated {
+            // Nothing is indexed: fresh tables are already empty, so only the
+            // coordinate space restarts.
+            self.history_abs_start = 0;
         } else {
             // Bounded fallback: rewind the coordinate space and zero the
             // tables so the absolute cursor cannot climb without bound
             // (mirrors dfast; the u32 packing is separately kept in range
-            // by `rebase_positions` in `add_data`).
+            // by `rebase_positions` in `commit_block`).
             self.history_abs_start = 0;
             // The shared buffer holds whichever finder's tables are live, so
             // it takes that finder's empty sentinel.
@@ -2784,8 +2844,6 @@ impl RowMatchGenerator {
         // starts at the frame start with no dictionary (a dictionary frame
         // primes these right after).
         self.lazy_reps = None;
-        // Block buffers are returned to the caller's pool per block in
-        // `add_data`, so there is nothing window-side to recycle here.
         self.chunk_lens.clear();
         let Some(region) = reborrow_region else {
             self.lazy_next_to_update = self.history_abs_start;
@@ -2840,16 +2898,14 @@ impl RowMatchGenerator {
             ..self.history.len() - self.uncommitted_len]
     }
 
-    /// Phase 1 of in-place ingest: `fill` writes the next block STRAIGHT into
-    /// the tail of `history` rather than into a scratch `Vec` that
-    /// [`Self::add_data`] then copies in. See `MatchTable::fill_uncommitted`
-    /// for the two-phase rationale; the bytes only join the window once
+    /// Phase 1 of ingest: `fill` writes the next block STRAIGHT into the tail
+    /// of `history`. The bytes only join the window once
     /// [`Self::commit_block`] claims them, so the pre-split remainder stays
     /// where it is and heads the next block at no copy cost.
     pub(crate) fn fill_uncommitted(
         &mut self,
         capacity: usize,
-        fill: impl FnOnce(&mut Vec<u8>) -> (usize, bool),
+        fill: impl FnOnce(&mut HistoryBuf) -> (usize, bool),
     ) -> (usize, bool) {
         // Count the bytes already carried, not just this top-up: `capacity` is
         // `block_capacity - carried` (and zero on the EOF re-inspection), yet
@@ -2877,34 +2933,14 @@ impl RowMatchGenerator {
         (appended, eof)
     }
 
-    /// Size `history` for a whole frame in one allocation instead of letting
-    /// the per-block `reserve` walk a doubling chain. Clamped to the eviction
-    /// ceiling, which is the largest the buffer ever grows anyway.
-    pub(crate) fn reserve_for_frame(&mut self, bytes: usize) {
-        let ceiling = self.max_window_size
-            + (self.max_window_size >> 2)
-            + crate::common::MAX_BLOCK_SIZE as usize;
-        // `bytes` already carries the caller's block-sized slack, sized off the
-        // active block capacity — adding the format maximum here would reserve
-        // ~128 KiB for a frame whose window (and therefore block) is 1 KiB.
-        // Counted on top of what the buffer already holds: a dictionary is
-        // primed into it before this runs, so sizing to the frame alone would
-        // leave the dictionary's bytes to be grown into afterwards.
-        let target = self.history.len().saturating_add(bytes).min(ceiling);
-        if self.history.capacity() < target {
-            self.history.reserve_exact(target - self.history.len());
-        }
-    }
-
     /// Bytes read but not yet claimed by a block.
     pub(crate) fn uncommitted(&self) -> &[u8] {
         &self.history[self.history.len() - self.uncommitted_len..]
     }
 
-    /// Phase 2 of in-place ingest: claim `len` bytes from the head of
-    /// [`Self::uncommitted`] as the next block, running the same coordinate
-    /// rebase, eviction, dict retire and valid-data floor updates
-    /// [`Self::add_data`] performs.
+    /// Phase 2 of ingest: claim `len` bytes from the head of
+    /// [`Self::uncommitted`] as the next block, with the coordinate rebase,
+    /// eviction, dict retire and valid-data floor updates that go with it.
     pub(crate) fn commit_block(&mut self, len: usize) {
         if len == 0 {
             return;
@@ -2918,6 +2954,14 @@ impl RowMatchGenerator {
             "commit_block: {len} exceeds the {} uncommitted bytes",
             self.uncommitted().len(),
         );
+        // Row stores absolute match positions as `u32` (with `u32::MAX` the
+        // empty sentinel). On a long stream the cumulative absolute cursor
+        // crosses the u32 range even while the live window stays bounded, so
+        // rebase the coordinate origin down to the oldest live byte before the
+        // block's positions would overflow. Cold path: fires at most once per
+        // ~4 GiB of stream, and one rebase always suffices because the live
+        // window is far smaller than u32::MAX. `check_stream_abs_headroom` in
+        // `fill_uncommitted` guards the 32-bit-target `usize` overflow.
         if self.history_abs_start + self.window_size + len >= u32::MAX as usize - 1 - BT_IDX_BASE {
             self.rebase_positions();
         }
@@ -2943,74 +2987,11 @@ impl RowMatchGenerator {
         // what is legal there.
         if self.history_start != evicted_from {
             self.dict.invalidate();
-            // Same one-time ceiling as `add_data`: once eviction starts, grow
-            // the mirror linearly to (window + window/4 + one block).
-            let target = self.max_window_size
-                + (self.max_window_size >> 2)
-                + crate::common::MAX_BLOCK_SIZE as usize;
-            if target > self.history.len() && self.history.capacity() < target {
-                self.history.reserve_exact(target - self.history.len());
-            }
-        }
-        if self.low_limit < self.history_abs_start {
-            self.low_limit = self.history_abs_start;
-        }
-        if self.prefix_low < self.low_limit {
-            self.prefix_low = self.low_limit;
-        }
-        // Same position in the sequence as `add_data`: compact AFTER the
-        // eviction that raised `history_start`, so the drain trigger sees the
-        // same state and the buffer evolves identically.
-        self.compact_history();
-        self.window_size += len;
-        self.chunk_lens.push_back(len);
-        self.uncommitted_len -= len;
-    }
-
-    pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
-        assert!(data.len() <= self.max_window_size);
-        super::match_table::storage::check_stream_abs_headroom(
-            self.history_abs_start,
-            self.window_size,
-            data.len(),
-        );
-        // Row stores absolute match positions as `u32` (with `u32::MAX` the
-        // empty sentinel). On a long stream the cumulative absolute cursor
-        // crosses the u32 range even while the live window stays bounded, so
-        // rebase the coordinate origin down to the oldest live byte before the
-        // upcoming block's positions would overflow. Cold path — fires at most
-        // once per ~4 GiB of stream, and one rebase always suffices because the
-        // live window is far smaller than u32::MAX. `check_stream_abs_headroom`
-        // above already guards the 32-bit-target `usize` overflow separately.
-        if self.history_abs_start + self.window_size + data.len()
-            >= u32::MAX as usize - 1 - BT_IDX_BASE
-        {
-            self.rebase_positions();
-        }
-        // Same reach as `commit_block`: a full window stays behind the incoming
-        // block, because the floor is measured from the block's start.
-        let evicted_from = self.history_start;
-        while self.window_size > self.max_window_size {
-            let removed_len = self.chunk_lens.pop_front().unwrap();
-            self.window_size -= removed_len;
-            self.history_start += removed_len;
-            self.history_abs_start += removed_len;
-        }
-        if self.history_start != evicted_from {
-            // Eviction advanced `history_start`, staling the dict row index's
-            // concat positions — drop the attach (dict slid within/out window).
-            // Conditioned on what the eviction DID, not on what adding this
-            // block would need: between the two the dictionary is still whole
-            // and still reachable from the block's first byte.
-            self.dict.invalidate();
-            // Cap the history buffer near the live window instead of letting
-            // the Vec power-of-two double to ~2x window on long streams. Once
-            // eviction starts, reserve exactly (window + window/4 + one block)
-            // so the buffer grows linearly to that ceiling; `compact_history`'s
-            // quarter-window drain then keeps `len` under it, so the Vec never
-            // reallocates again. Only fires in the eviction regime (large
-            // inputs that fill the window) — small frames keep their tight
-            // data-sized buffer untouched.
+            // Cap the history near the live window: once eviction starts, grow
+            // it linearly to (window + window/4 + one block) rather than
+            // doubling; `compact_history`'s quarter-window drain keeps the
+            // length under it. Small frames that never fill the window stay
+            // data-sized.
             let target = self.max_window_size
                 + (self.max_window_size >> 2)
                 + crate::common::MAX_BLOCK_SIZE as usize;
@@ -3022,7 +3003,7 @@ impl RowMatchGenerator {
         // rises with them (upstream `window.lowLimit`: the oldest byte the
         // buffer still holds). The distance-only window floor
         // (`pos - search_window`) can trail the eviction by up to a block, and
-        // the DUBT walks floor on `low_limit` — without this they would
+        // the DUBT walks floor on `low_limit`; without this they would
         // dereference evicted positions that are still inside the advertised
         // window.
         if self.low_limit < self.history_abs_start {
@@ -3031,14 +3012,24 @@ impl RowMatchGenerator {
         if self.prefix_low < self.low_limit {
             self.prefix_low = self.low_limit;
         }
+        // Compact AFTER the eviction that raised `history_start`, so the drain
+        // trigger sees the dead prefix this block's eviction created.
         self.compact_history();
-        let added = data.len();
-        self.history.extend_from_slice(&data);
-        self.window_size += added;
-        self.chunk_lens.push_back(added);
-        // The bytes now live in `history`; return the input buffer to the
-        // caller's pool instead of holding a second copy in the window.
-        reuse_space(data);
+        self.window_size += len;
+        self.chunk_lens.push_back(len);
+        self.uncommitted_len -= len;
+    }
+
+    /// Read `input` in and commit it as one block, the way the driver does
+    /// in two calls.
+    #[cfg(test)]
+    pub(crate) fn commit_input(&mut self, input: impl AsRef<[u8]>) {
+        let input = input.as_ref();
+        self.fill_uncommitted(input.len(), |history| {
+            history.extend_from_slice(input);
+            (input.len(), false)
+        });
+        self.commit_block(input.len());
     }
 
     pub(crate) fn trim_to_window(&mut self) {
@@ -3051,7 +3042,7 @@ impl RowMatchGenerator {
             self.history_start += removed_len;
             self.history_abs_start += removed_len;
         }
-        // Same valid-data floor raise as `add_data`'s eviction loop.
+        // Same valid-data floor raise as `commit_block`'s eviction loop.
         if self.low_limit < self.history_abs_start {
             self.low_limit = self.history_abs_start;
         }
@@ -3062,7 +3053,7 @@ impl RowMatchGenerator {
 
     /// Rebase the absolute coordinate origin down to the oldest live byte so
     /// stored `u32` match positions stay representable on long (multi-GiB)
-    /// streams. Cold path, driven from [`Self::add_data`] when the cursor
+    /// streams. Cold path, driven from [`Self::commit_block`] when the cursor
     /// nears `u32::MAX`. Subtracts the current `history_abs_start` from every
     /// live `row_positions` entry; entries older than the new origin (already
     /// unreachable through the `candidate_pos < history_abs_start` read guard)
@@ -3316,7 +3307,7 @@ impl RowMatchGenerator {
     /// Drop the shared table allocation, for the backend switch that wants the
     /// footprint gone before building the replacement variant.
     pub(crate) fn release_tables(&mut self) {
-        self.tables = Vec::new();
+        self.tables = Table::empty();
         self.hc_split = 0;
         // The cursors and tags lived in the same buffer, so releasing it
         // releases them; their lengths have to say so.
@@ -3446,107 +3437,110 @@ impl RowMatchGenerator {
         self.tables.split_at_mut(self.hc_split)
     }
 
-    pub(crate) fn ensure_tables(&mut self) {
-        let row_count = 1usize << self.row_hash_log;
-        let row_entries = 1usize << self.row_log;
-        // Only the active finder's tables are held: the chain / tree
-        // finders never read the rows (tens of MiB at the btlazy2 levels).
-        let total = if self.finder == LazyFinder::Rows {
-            row_count * row_entries
+    /// The table layout the active finder needs: the buffer length in `u32`s
+    /// and the empty value its leading region takes.
+    ///
+    /// Rows: `row_count * row_entries` positions, then the `row_count` slot
+    /// cursors and as many tags packed into the byte tail. Chain / tree: the
+    /// `1 << hashLog` hash table (the full row hash width, no tag bits), then
+    /// the `1 << chainLog` link table (the tree: two links per node over
+    /// `chainLog - 1` bits). Only the active finder's tables are held; the
+    /// chain / tree finders never read the rows (tens of MiB at the btlazy2
+    /// levels).
+    fn table_layout(&self) -> (usize, u32) {
+        if self.finder == LazyFinder::Rows {
+            let row_count = 1usize << self.row_hash_log;
+            let total = row_count << self.row_log;
+            (total + (row_count + total).div_ceil(4), ROW_EMPTY_SLOT)
         } else {
-            0
-        };
-        // The three row tables share one buffer: `total` positions, then the
-        // `row_count` slot cursors and `total` tags packed into its byte tail.
-        // Held separately they were three allocations of three different size
-        // classes per frame, and a fresh compressor takes them anew for every
-        // frame — the pages of all three then went back to the kernel between
-        // frames, which is what the reference avoids by carving one workspace.
-        let tail_u32 = (row_count + total).div_ceil(4);
-        let want = total + tail_u32;
-        if total == 0 {
-            self.rows_len = 0;
-            self.heads_len = 0;
-            self.tags_len = 0;
-        } else if self.rows_len != total || self.tables.len() != want || self.hc_split != 0 {
-            // Sized to the final width in one step: from an empty buffer
-            // `resize` alone walks a doubling chain whose intermediate steps
-            // the frame allocates and discards. A reused matcher already has
-            // the capacity, so this is a no-op there.
-            if super::match_table::storage::capacity_is_oversized(self.tables.capacity(), want) {
-                // Coming down from the chain / tree finder (or a wider row
-                // layout): `clear` + `resize` would keep that allocation —
-                // tens of MiB at the btlazy2 levels — resident for every later
-                // row frame, which is what the separate vectors released.
-                self.tables = alloc::vec![ROW_EMPTY_SLOT; want];
-            } else {
-                self.tables.clear();
-                self.tables.reserve_exact(want);
-                self.tables.resize(want, ROW_EMPTY_SLOT);
-            }
+            let hash_len = 1usize << (self.row_hash_log + self.row_log);
+            (
+                hash_len + (1usize << self.hc_chain_log),
+                self.hc_empty_slot(),
+            )
+        }
+    }
+
+    /// Records that the buffer, already at the active finder's length with its
+    /// leading region empty, is laid out for that finder: the seams, and for
+    /// rows the zeroed cursors and tags of the byte tail.
+    fn mark_tables_laid_out(&mut self) {
+        if self.finder == LazyFinder::Rows {
+            let row_count = 1usize << self.row_hash_log;
+            let total = row_count << self.row_log;
             self.hc_split = 0;
             self.rows_len = total;
             self.heads_len = row_count;
             self.tags_len = total;
             // The positions want the empty sentinel, the byte tables want
-            // zeroes, and one fill cannot give both: the tail is re-zeroed
-            // after the buffer-wide fill above.
+            // zeroes, and one fill cannot give both: the tail is zeroed after
+            // the buffer-wide fill.
             self.tail_bytes_mut().fill(0);
-        }
-        if self.finder != LazyFinder::Rows {
-            // Chain / tree mode: `hashTable` is `1 << hashLog` wide (the full
-            // row hash width, no tag bits), `chainTable` `1 << chainLog` (the
-            // tree: two links per node over `chainLog - 1` bits). The two
-            // finders use different empty conventions, so tables laid out for
-            // the other one are refilled.
-            let hash_len = 1usize << (self.row_hash_log + self.row_log);
-            let chain_len = 1usize << self.hc_chain_log;
-            let empty = self.hc_empty_slot();
-            let relayout = self.hc_layout != self.finder;
-            // Both tables share the one buffer, so they are sized together:
-            // the hash occupies `[0, hash_len)` and the chain the rest. A
-            // width change on either therefore rewrites both, which costs the
-            // same fill the separate vectors paid and saves an allocation.
-            if self.hc_split != hash_len || self.tables.len() != hash_len + chain_len || relayout {
-                let total = hash_len + chain_len;
-                // A zero sentinel is worth a fresh allocation: the request comes
-                // back as pages the kernel has not had to write, where resizing
-                // writes every element — for a matcher taken fresh per frame
-                // that meant faulting and zeroing the whole table every time.
-                // The chain finder's sentinel is not zero, so it pays the fill
-                // either way and an allocation on top; it keeps the buffer it
-                // has. Either way an oversized one is released, which a level
-                // downgrade needs anyway.
-                if empty == 0
-                    || super::match_table::storage::capacity_is_oversized(
-                        self.tables.capacity(),
-                        total,
-                    )
-                {
-                    self.tables = alloc::vec![empty; total];
-                } else {
-                    self.tables.clear();
-                    self.tables.reserve_exact(total);
-                    self.tables.resize(total, empty);
-                }
-                self.hc_split = hash_len;
-            }
-            self.hc_layout = self.finder;
         } else {
-            // Rows mode never reads the chain / tree tables; a reused
-            // compressor coming back from a btlazy2 level (same Row storage,
-            // no backend swap) must not retain them (tens of MiB) alongside
-            // the live row tables. The row branch above re-sizes the shared
-            // buffer, so nothing to release here beyond the split marker.
-            self.hc_split = 0;
+            self.rows_len = 0;
+            self.heads_len = 0;
+            self.tags_len = 0;
+            self.hc_split = 1usize << (self.row_hash_log + self.row_log);
+            self.hc_layout = self.finder;
         }
     }
 
-    /// Capacity of the shared table buffer, to check that a level downgrade
-    /// hands the oversized allocation back. Test-only.
+    /// Workspace bytes the active finder's tables take.
+    pub(crate) fn tables_workspace_bytes(&self) -> usize {
+        region_bytes::<u32>(self.table_layout().0)
+    }
+
+    /// The part of [`Self::tables_workspace_bytes`] that starts as zeros: all
+    /// of it for the tree, none for the rows and the chain, whose empty slot
+    /// is `ROW_EMPTY_SLOT`.
+    pub(crate) fn zero_table_bytes(&self) -> usize {
+        match self.table_layout() {
+            (len, 0) => region_bytes::<u32>(len),
+            _ => 0,
+        }
+    }
+
+    /// Lays the active finder's tables out in the open `workspace`. Tables
+    /// that continue the previous frame's keep their contents; otherwise they
+    /// start empty and laid out, and the next [`Self::reset`] knows they hold
+    /// nothing an earlier frame indexed.
+    pub(crate) fn bind_tables(&mut self, workspace: &mut Workspace) {
+        let (len, empty) = self.table_layout();
+        let kept = self.tables.bind(workspace, len, empty);
+        self.tables_fresh = !kept;
+        if !kept {
+            self.mark_tables_laid_out();
+        }
+    }
+
+    pub(crate) fn ensure_tables(&mut self) {
+        let (want, empty) = self.table_layout();
+        let laid_out = if self.finder == LazyFinder::Rows {
+            self.rows_len == (1usize << self.row_hash_log) << self.row_log && self.hc_split == 0
+        } else {
+            self.hc_split == 1usize << (self.row_hash_log + self.row_log)
+                && self.hc_layout == self.finder
+        };
+        if laid_out && self.tables.len() == want {
+            return;
+        }
+        // Laid out for another finder or width. The two finders use different
+        // empty conventions, so the whole buffer is refilled; a matcher no
+        // context laid out (driven on its own) allocates it here at the exact
+        // size.
+        if self.tables.len() == want {
+            self.tables.fill(empty);
+        } else {
+            self.tables = Table::owned(alloc::vec![empty; want]);
+        }
+        self.mark_tables_laid_out();
+    }
+
+    /// Length of the shared table buffer, to check that a level downgrade lays
+    /// out only what the new finder reads. Test-only.
     #[cfg(test)]
-    pub(crate) fn tables_capacity(&self) -> usize {
-        self.tables.capacity()
+    pub(crate) fn tables_len(&self) -> usize {
+        self.tables.len()
     }
 
     /// Combined length of the chain / tree tables. Test-only.
@@ -3587,17 +3581,17 @@ impl RowMatchGenerator {
         // Drain the (unreachable) dead prefix once it reaches a quarter window
         // so the buffer stays near `window + window/4` rather than growing to
         // ~2x window before the old full-window trigger fired. Paired with the
-        // one-time `reserve_exact` in `add_data`, this keeps the Vec at a fixed
-        // ~1.25x-window capacity on long streams. The drain memmoves the live
-        // window, so a quarter-window trigger bounds the write amplification
-        // (~4x the eviction stride) while closing most of the peak gap.
-        // Compare against the COMMITTED length: with in-place ingest
-        // `history.len()` also counts bytes no block has claimed yet, which
-        // would push this trigger later than on the staged path.
+        // one-time `reserve_exact` in `commit_block`, this keeps the buffer at
+        // a fixed ~1.25x-window capacity on long streams. The drain memmoves
+        // the live window, so a quarter-window trigger bounds the write
+        // amplification (~4x the eviction stride) while closing most of the
+        // peak gap. Compare against the COMMITTED length: `history.len()` also
+        // counts bytes no block has claimed yet, which would delay the trigger
+        // by however much input happens to be read ahead.
         if self.history_start >= (self.max_window_size >> 2)
             || self.history_start * 2 >= self.history.len() - self.uncommitted_len
         {
-            self.history.drain(..self.history_start);
+            self.history.drain_front(self.history_start);
             self.history_start = 0;
         }
     }
@@ -3620,9 +3614,9 @@ impl RowMatchGenerator {
             // in bounds.
             return unsafe { core::slice::from_raw_parts(ptr, end) };
         }
-        // Stop at the committed end, not at `history.len()`: in-place ingest
-        // may have already read the next block's bytes into the tail, and a
-        // scan must not see past the block it is compressing.
+        // Stop at the committed end, not at `history.len()`: the next block's
+        // bytes may already be read into the tail, and a scan must not see
+        // past the block it is compressing.
         &self.history[self.history_start..self.history.len() - self.uncommitted_len]
     }
 
@@ -3639,16 +3633,16 @@ impl RowMatchGenerator {
     /// earlier frame lies below the window floor and is never taken, and
     /// the chain / tree walks never meet a position at or past the one they
     /// search (offset 0 "self-matches" from a zeroed floor were a corrupt
-    /// frame). The owned history is unused while borrowed (no `add_data`
-    /// copy).
+    /// frame). The owned history is unused while borrowed (no copy into
+    /// it).
     ///
     /// # Safety
     /// `buffer` must stay live and unmodified until `clear_borrowed_window`
     /// or `reset` — the matcher stores a raw pointer into it.
     pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
-        // Same `u32` headroom guard as `add_data`: the borrowed reuse path
+        // Same `u32` headroom guard as `commit_block`: the borrowed reuse path
         // advances the coordinate floor per frame without ever committing
-        // through `add_data`, so after ~4 GiB of cumulative reused frames the
+        // a block, so after ~4 GiB of cumulative reused frames the
         // inserted positions would wrap `u32` and every candidate would read
         // as stale. Rebase the origin down before this frame's positions are
         // stored (`rebase_positions` zeroes the floor; the previous frame's
@@ -4001,8 +3995,8 @@ impl RowMatchGenerator {
     /// stage `[block_start, block_end)` of the registered borrowed window,
     /// then run the SAME parse dispatch. The parse body reads its block range
     /// via `current_block_range()` and its bytes via `live_history()`, both
-    /// borrowed-aware, so the staged block is scanned in place (no
-    /// `add_data` copy into the owned mirror). `history_abs_start` was forced
+    /// borrowed-aware, so the staged block is scanned in place (no copy
+    /// into the owned mirror). `history_abs_start` was forced
     /// to 0 in `set_borrowed_window`, so positions stay absolute input
     /// offsets and the window-low candidate cap bounds offsets to the window.
     pub(crate) fn start_matching_borrowed(
@@ -4263,7 +4257,7 @@ impl RowMatchGenerator {
             };
             *self.row_heads_mut().get_unchecked_mut(row) = next as u8;
             *self.row_tags_mut().get_unchecked_mut(row_base + next) = tag;
-            // `abs_pos < u32::MAX` holds: `add_data` caps a Row frame's
+            // `abs_pos < u32::MAX` holds: `commit_block` caps a Row frame's
             // absolute cursor below `u32::MAX`, so the cast is lossless and
             // never collides with the `ROW_EMPTY_SLOT == u32::MAX` sentinel.
             *self.row_positions_mut().get_unchecked_mut(row_base + next) = abs_pos as u32;
@@ -4739,6 +4733,9 @@ impl RowMatchGenerator {
 // lacks is std-only, matching how `RowTagKernel::detect` gates the same probe.
 #[cfg(test)]
 mod rebase_tests;
+
+#[cfg(test)]
+mod layout_tests;
 
 #[cfg(all(
     test,

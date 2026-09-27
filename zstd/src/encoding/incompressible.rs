@@ -2,6 +2,7 @@ use super::CompressionLevel;
 use crate::common::MAX_BLOCK_SIZE;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::mem::MaybeUninit;
 
 /// What the block's own bytes cannot answer: has this content been seen
 /// earlier in the frame?
@@ -17,9 +18,9 @@ use alloc::vec::Vec;
 /// of CONSECUTIVE positions, which is what makes a shifted duplicate findable
 /// without reading the whole block: a copy sits some distance from its
 /// original, the probed positions map to original positions that far lower, and
-/// among [`Self::PROBE_RUN`] consecutive values exactly one is a multiple of
-/// [`Self::RECORD_STEP`] — so exactly one probe meets a recorded key, whatever
-/// the distance is. Probing on the same grid it records on would instead see a
+/// among as many consecutive values as the record step exactly one is a
+/// multiple of it, so exactly one probe meets a recorded key, whatever the
+/// distance is. Probing on the same grid it records on would instead see a
 /// repeat only at distances that happen to be a multiple of the step, and miss,
 /// say, a block that repeats the previous one after two inserted bytes.
 ///
@@ -123,8 +124,8 @@ impl SeenContentGrid {
     /// evicting: a probe run meets exactly ONE recorded key, so an evicted
     /// record is a repeat missed outright, where the previous scheme had a
     /// couple of hundred chances per block and could afford to lose most of
-    /// them. At sixteen bytes a slot this is a megabyte, and only a frame whose
-    /// window is that large ever allocates it.
+    /// them. At nine bytes a slot (the packed sample and its tag) this is
+    /// 576 KiB, taken only by a frame whose window holds that many records.
     const SLOTS: usize = 64 * 1024;
     /// Floor on the table, so a tiny window still has room for a few anchors
     /// without a slot collision reading as a repeat on every one.
@@ -136,34 +137,30 @@ impl SeenContentGrid {
     /// content lands on the same offsets however the blocks are cut. 256 records
     /// per 128 KiB block, and a 4 MiB window's worth fits the table without
     /// evicting most of itself.
+    ///
+    /// A record is a random write into a table as wide as the window's records,
+    /// so the step is what keeps that table in cache. Records every 128 bytes,
+    /// with the table four times the size, cost 33-42% of the encode of a
+    /// mebibyte of noise at the fast levels and dfast on x86_64.
     const RECORD_STEP: usize = 512;
     /// Consecutive positions probed per run. Equal to [`Self::RECORD_STEP`] by
     /// construction, not by coincidence: among that many consecutive stream
     /// offsets exactly one is a multiple of the step, so a copy at ANY distance
     /// from its original has exactly one probe that meets a recorded key.
     const PROBE_RUN: usize = Self::RECORD_STEP;
-    /// Runs per block: one at the start, one at the middle.
+    /// A probe run starts every this fraction of a block, so a copy the grid
+    /// misses is shorter than that fraction plus one run, wherever in the block
+    /// it begins. A run answers a copy at any distance but only one that it
+    /// begins inside, so with runs only at the start and the middle a block
+    /// carrying a copy of its own content between them went out raw with the
+    /// match in it.
     ///
-    /// A run answers a copy at any distance, but only where the run begins, so a
-    /// block carrying a copy of its own earlier content that starts elsewhere
-    /// goes out raw with the match inside it. Two ways of closing that were
-    /// measured on the bench host against this placement, three interleaved
-    /// readings a side of two prebuilt binaries, on a mebibyte of incompressible
-    /// input — the input the whole heuristic exists to make cheap:
-    ///
-    /// * a run every 16 KiB, eight on a 128 KiB block: 1.70x at the fast levels,
-    ///   1.60x at dfast, 1.10x at lazy. The runs ARE the grid's cost — each
-    ///   probe is a random slot lookup — so their number is the price.
-    /// * probing each grid point as it is recorded, which answers a copy
-    ///   anywhere in the block at a distance that is a whole number of steps:
-    ///   1.02x to 1.03x at the fast levels and dfast, 1.04x at greedy. Cheap,
-    ///   but not free — and it changed no compressed size anywhere in the
-    ///   fixture matrix, so it was paying on every block of noise for a case
-    ///   nothing measured reaches.
-    ///
-    /// So the bound is deliberate: a copy that begins away from both runs is
-    /// missed, and what that costs is capped by the block.
-    const PROBE_RUNS_PER_BLOCK: usize = 2;
+    /// A quarter rather than an eighth: on a mebibyte of noise at levels -7 to
+    /// 3 on x86_64, eight runs a block cost 13-19% over the two-run placement
+    /// and four runs cost 9-12% less than eight, three interleaved runs of
+    /// prebuilt binaries each. A copy a quarter of a block long still codes
+    /// most of what the eighth would have found.
+    const PROBE_FRACTION: usize = 4;
     /// What a rebase keeps: the widest window the format admits, so a record
     /// dropped there was out of every matcher's reach already.
     const REBASE_RETAIN_BYTES: u64 = 1 << 31;
@@ -255,7 +252,7 @@ impl SeenContentGrid {
         self.slots.capacity() * core::mem::size_of::<u64>() + self.tags.capacity()
     }
 
-    /// The mixed key at `at`, and the slot it belongs in.
+    /// The eight bytes at `at`.
     ///
     /// # Safety
     ///
@@ -265,18 +262,40 @@ impl SeenContentGrid {
     /// form pays a bounds check and a panic path at each of them for a bound the
     /// loop already holds.
     #[inline]
-    unsafe fn key_at(&self, block_ptr: *const u8, at: usize, mask: usize) -> (usize, u16, u8) {
+    unsafe fn key_at(block_ptr: *const u8, at: usize) -> u64 {
         // SAFETY: the caller guarantees `at + KEY_LEN` is inside the block, and
         // an unaligned read is what the byte-oriented key needs.
-        let key = unsafe { block_ptr.add(at).cast::<u64>().read_unaligned() }.to_le();
-        let mixed = Self::avalanche(key);
-        // Neither the fingerprint nor the tag is ever zero, so a slot no frame
-        // has written cannot read as a match.
-        (
-            (mixed >> 32) as usize & mask,
-            (mixed as u16) | 1,
-            (mixed >> 16) as u8 | 1,
-        )
+        unsafe { block_ptr.add(at).cast::<u64>().read_unaligned() }.to_le()
+    }
+
+    /// The slot a key belongs in and its tag, laid out as the full mix lays
+    /// them out: the slot from the high half, the tag from bits 16 to 23.
+    ///
+    /// One fold and one multiply, because this is the line nearly every probe
+    /// executes: a run is [`Self::PROBE_RUN`] positions, a block takes a run
+    /// every [`Self::PROBE_FRACTION`] of it, and on noise every one misses. The
+    /// fold carries the key's high bits down before the multiply, which alone
+    /// would leave its top byte out of the slot. The fingerprint a hit is
+    /// confirmed against comes from [`Self::avalanche`], an independent mix,
+    /// and only a probe whose tag matches computes it.
+    #[inline]
+    fn placement(key: u64) -> u64 {
+        let product = (key ^ (key >> 29)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        ((product >> 8) & 0xFFFF_FFFF_0000_0000) | ((product >> 40) & 0x00FF_0000)
+    }
+
+    /// The slot and tag of `key` in a table of `mask + 1` slots. Neither the
+    /// tag nor the fingerprint is ever zero, so a slot no frame has written
+    /// cannot read as a match.
+    #[inline]
+    fn slot_and_tag(key: u64, mask: usize) -> (usize, u8) {
+        let placed = Self::placement(key);
+        ((placed >> 32) as usize & mask, (placed >> 16) as u8 | 1)
+    }
+
+    #[inline]
+    fn fingerprint(key: u64) -> u16 {
+        (Self::avalanche(key) as u16) | 1
     }
 
     /// Whether the content at `at` was recorded within `reach`. Reads only: the
@@ -289,7 +308,8 @@ impl SeenContentGrid {
     #[inline]
     unsafe fn probe_key(&self, block_ptr: *const u8, at: usize, reach: u64, mask: usize) -> bool {
         // SAFETY: the caller's bound, forwarded.
-        let (slot, fingerprint, tag) = unsafe { self.key_at(block_ptr, at, mask) };
+        let key = unsafe { Self::key_at(block_ptr, at) };
+        let (slot, tag) = Self::slot_and_tag(key, mask);
         // The byte first: this is the only line nearly every probe executes.
         // SAFETY: `mask` is `len - 1` of both tables, which are the same power-of
         // -two length, so a masked slot is in bounds for either.
@@ -298,7 +318,7 @@ impl SeenContentGrid {
         }
         let held = SeenSample::unpack(unsafe { *self.slots.get_unchecked(slot) });
         let here = self.frame_offset + at as u64;
-        if held.epoch != self.epoch || held.fingerprint != fingerprint {
+        if held.epoch != self.epoch || held.fingerprint != Self::fingerprint(key) {
             return false;
         }
         let recorded = u64::from(held.at_step) * Self::RECORD_STEP as u64;
@@ -325,7 +345,9 @@ impl SeenContentGrid {
     #[inline]
     unsafe fn record_key(&mut self, block_ptr: *const u8, at: usize, mask: usize) {
         // SAFETY: the caller's bound, forwarded.
-        let (slot, fingerprint, tag) = unsafe { self.key_at(block_ptr, at, mask) };
+        let key = unsafe { Self::key_at(block_ptr, at) };
+        let (slot, tag) = Self::slot_and_tag(key, mask);
+        let fingerprint = Self::fingerprint(key);
         // SAFETY: a masked slot is in bounds for both tables; see `probe_key`.
         unsafe {
             *self.tags.get_unchecked_mut(slot) = tag;
@@ -379,6 +401,18 @@ impl SeenContentGrid {
             self.skip_block(block.len());
             return;
         }
+        self.take_block(block, window_size, false);
+    }
+
+    /// Record a block the caller searches without asking the classifier (see
+    /// [`raw_skip_worth_asking`]), and count the frame as using the grid.
+    ///
+    /// Such a block may well be noise, so the reason [`Self::asked`] lets a
+    /// searched block go unrecorded does not hold for it: a later block made of
+    /// its copy among unique noise reads as noise to the classifier, and only a
+    /// record of this block can send it to the search.
+    pub(crate) fn record_unclassified(&mut self, block: &[u8], window_size: usize) {
+        self.asked = true;
         self.take_block(block, window_size, false);
     }
 
@@ -465,31 +499,29 @@ impl SeenContentGrid {
         // The pass this replaces read every byte looking for content-defined
         // anchors. It was correct and it was the cost: on a fast level a whole
         // extra pass over the block doubles the encode of incompressible input,
-        // where the raw path is little more than a copy. This touches about
-        // eight kilobytes of a hundred-and-twenty-eight-kilobyte block.
+        // where the raw path is little more than a copy.
         //
-        // Several runs, not one: the run at the start answers a duplicate of
-        // anything recorded earlier, and every later run answers a block that
-        // carries a copy of its own earlier content — a hundred and twenty-eight
-        // kilobytes holding a fifty-kilobyte copy of itself reads as
-        // incompressible by any sample of it and is a block-sized match if the
-        // search runs. A run only answers a copy that it begins inside, so runs
-        // every [`Self::PROBE_SPACING`] bound what a copy has to be to hide.
+        // Runs at every `PROBE_FRACTION` of the block: the one at the start
+        // answers a duplicate of anything recorded earlier, and every later one
+        // a block that carries a copy of its own earlier content, which reads as
+        // incompressible by any sample of it and is a match the size of the copy
+        // if the search runs. A run only answers a copy that it begins inside, so
+        // the spacing bounds what a copy has to be to hide.
         //
-        // Dropping the second run on every block after a frame's first was
-        // tried, for half the grid's cost: it loses ratio. Four megabytes
-        // repeated at a shifted distance went from 4,129,240 bytes to 4,194,762
-        // at level 17. The later runs are not only about a block's own copies —
-        // each is another independent chance for the one aligned probe to meet a
-        // record that an earlier run's slot has since been written over.
+        // Every run is also another independent chance for the one aligned probe
+        // to meet a record that an earlier run's slot has since been written
+        // over. Dropping the second of two runs on every block after a frame's
+        // first cost ratio: four megabytes repeated at a shifted distance went
+        // from 4,129,240 bytes to 4,194,762 at level 17.
         let step = Self::RECORD_STEP as u64;
-        // A full run covers every distance a copy could sit at, and on a block
-        // of any size it is a rounding error. On a block of a couple of
-        // kilobytes it is half the block, and the grid then costs more than the
-        // duplicate it could find is worth — a missed one there is bounded by
-        // the block. So the run is capped at a probe per sixteen bytes, which
-        // reaches the full width by eight kilobytes and stays whole above it.
+        // A full run covers every distance a copy could sit at. On a block of a
+        // couple of kilobytes it is a large share of the block, and the grid
+        // then costs more than the duplicate it could find is worth — a missed
+        // one there is bounded by the block. So the run is capped at a probe per
+        // sixteen bytes, and the runs are spaced no closer than sixteen runs
+        // apart, which keeps a small block's probes to a sixteenth of it.
         let run = Self::PROBE_RUN.min((block.len() / 16).max(8));
+        let spacing = (block.len() / Self::PROBE_FRACTION).max(16 * run);
         // A record's offset is stored in grid steps, so a frame that runs past
         // what that index can hold moves its origin rather than wraps — a
         // wrapped offset reads as being near the start of the frame, and a
@@ -501,9 +533,9 @@ impl SeenContentGrid {
         }
         let mut abs = self.frame_offset.next_multiple_of(step);
         let block_end = self.frame_offset + last as u64;
-        let runs = Self::PROBE_RUNS_PER_BLOCK;
+        let runs = block.len().div_ceil(spacing);
         for idx in 0..runs {
-            let start = idx * (block.len() / runs);
+            let start = idx * spacing;
             // Records for everything before this run go in FIRST, because
             // meeting them is the run's whole job — a block whose own first half
             // is the original is invisible to a run that probes before that half
@@ -520,7 +552,11 @@ impl SeenContentGrid {
             }
             // The start run on a frame's first block cannot hit anything: the
             // table is empty until that block records into it, and a frame of a
-            // few kilobytes is one block.
+            // few kilobytes is one block. The later runs stay even on a frame's
+            // only block: a block that copies its own content reads as noise to
+            // every sample the classifier takes, and without them it goes out
+            // raw with the match inside it. They are the one check between the
+            // skip and that loss.
             // Nothing to ask once the answer is in: a probe is read-only and
             // the run reports one bool, so every lookup after the first hit is
             // a random table access for a verdict already reached.
@@ -585,24 +621,107 @@ impl SeenContentGrid {
         (wanted as usize).clamp(Self::MIN_SLOTS, Self::SLOTS)
     }
 
-    /// Full 64-bit avalanche (splitmix64's finalizer): every output bit depends
-    /// on every input bit, which a single multiply does not give — its low half
-    /// is barely mixed.
+    /// Full 64-bit avalanche (splitmix64's finalizer, or a two-word equivalent
+    /// on a 32-bit machine): every output bit depends on every input bit, which
+    /// a single multiply does not give — its low half is barely mixed.
     ///
-    /// Three multiplies is a lot for something a probe run pays five hundred
-    /// times a block, and one multiply with a fold was tried in its place. It
-    /// does not hold: the slot, the tag and the fingerprint are all cut from the
-    /// same word, so a weaker mix correlates them, and a repeat that the grid
-    /// used to report went unrecognised — the chain-finder regression test
-    /// fails on it. The cost of a weaker hash here is not a coincidence, it is
-    /// a miss.
+    /// Only the fingerprint comes from it, which a probe computes once its tag
+    /// matches. Cut from the same word as the slot and tag, one multiply with a
+    /// fold does not hold: a weaker mix correlates the three, and a repeat that
+    /// the grid used to report went unrecognised — the chain-finder regression
+    /// test fails on it. Taken from an independent mix, the fingerprint still
+    /// confirms what the cheap [`Self::placement`] only locates.
     #[inline]
     fn avalanche(key: u64) -> u64 {
+        #[cfg(not(all(target_pointer_width = "32", not(target_family = "wasm"))))]
+        {
+            Self::avalanche_wide(key)
+        }
+        // A 32-bit machine has no 64-bit multiply, so each of the wide mix's
+        // three becomes three of its own plus the carries; wasm32 is left on
+        // the wide mix because its `i64.mul` is native.
+        #[cfg(all(target_pointer_width = "32", not(target_family = "wasm")))]
+        {
+            Self::avalanche_narrow(key)
+        }
+    }
+
+    #[cfg(any(
+        test,
+        not(all(target_pointer_width = "32", not(target_family = "wasm")))
+    ))]
+    #[inline]
+    fn avalanche_wide(key: u64) -> u64 {
         let mut z = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
     }
+
+    /// The same contract from five 32-bit multiplies: the low word, which the
+    /// fingerprint and tag are cut from, mixes both halves of the key, and the
+    /// high word, which the slot is cut from, is that word mixed again with the
+    /// key's high half, so the slot and the bits checked against it are
+    /// separate avalanches rather than one word read twice.
+    #[cfg(any(test, all(target_pointer_width = "32", not(target_family = "wasm"))))]
+    #[inline]
+    fn avalanche_narrow(key: u64) -> u64 {
+        // murmur3's 32-bit finaliser.
+        fn fmix32(mut h: u32) -> u32 {
+            h ^= h >> 16;
+            h = h.wrapping_mul(0x85EB_CA6B);
+            h ^= h >> 13;
+            h = h.wrapping_mul(0xC2B2_AE35);
+            h ^ (h >> 16)
+        }
+        let lo = key as u32;
+        let hi = (key >> 32) as u32;
+        let low = fmix32(lo ^ hi.wrapping_mul(0x9E37_79B1));
+        let high = fmix32(low ^ hi ^ 0x27D4_EB2F);
+        (u64::from(high) << 32) | u64::from(low)
+    }
+}
+
+/// Block sizes at which a frame that stores its literals raw searches rather
+/// than asks the classifier.
+///
+/// With literals stored raw (the fast strategy with a positive target length,
+/// the negative levels) a search that finds nothing costs one pass of the fast
+/// kernel plus the raw fallback, which is also all upstream does there. The
+/// classifier's cost is fixed per block, so on a small block it is the larger
+/// of the two. Measured with the classifier on and off in one binary, per
+/// frame of noise, levels -7 to -1: from 2 KiB to 24 KiB searching was 1-57%
+/// faster in all but two of the seventy cells on x86_64 and i686, at 32 and
+/// 48 KiB the two were even, and from 64 KiB searching was 12-270% slower.
+/// Below 2 KiB the levels split (-7 faster, -1 up to 48% slower on i686), and
+/// every positive level searched slower at nearly every size, so both keep the
+/// classifier.
+///
+/// All of that is on tables the frame finds warm. A search over noise touches
+/// every page of its hash table, while the raw skip indexes a position in 512,
+/// so on a workspace mapped fresh for the frame the search pays a fault per
+/// table page: on musl, where a 10 KiB frame's workspace is past the mmap
+/// threshold, searching made levels -7 and -1 63% slower, 73 us to 120 us.
+///
+/// Those measurements were on glibc, and musl does not follow them on warm
+/// tables either: with a 10 KiB frame's workspace below musl's mmap threshold,
+/// searching made levels -7 and -1 11-15% slower than asking the classifier (78
+/// to 81 us against 89 to 91), so musl keeps the classifier at every size.
+const SEARCH_INSTEAD_OF_CLASSIFIER: core::ops::RangeInclusive<usize> = 2 * 1024..=24 * 1024;
+
+/// Whether a block is worth the classifier's fixed cost, given whether the
+/// frame stores its literals raw and whether its tables sit on pages mapped
+/// fresh for it. See [`SEARCH_INSTEAD_OF_CLASSIFIER`].
+#[inline]
+pub(crate) fn raw_skip_worth_asking(
+    literals_stored_raw: bool,
+    tables_on_fresh_pages: bool,
+    block_len: usize,
+) -> bool {
+    !(!cfg!(target_env = "musl")
+        && literals_stored_raw
+        && !tables_on_fresh_pages
+        && SEARCH_INSTEAD_OF_CLASSIFIER.contains(&block_len))
 }
 
 pub(crate) const RAW_FAST_PATH_MIN_BLOCK_LEN: usize = 512;
@@ -631,7 +750,9 @@ const RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES: u64 = 1u64 << RAW_FAST_PATH_MAX_WINDO
 // cuts per-call stack for repeat tracking from ~8 KiB to ~4 KiB.
 const INCOMPRESSIBLE_REPEAT_TABLE_BITS: usize = 10;
 const INCOMPRESSIBLE_REPEAT_TABLE_LEN: usize = 1 << INCOMPRESSIBLE_REPEAT_TABLE_BITS;
-const INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS: usize = INCOMPRESSIBLE_REPEAT_TABLE_LEN / 64;
+// 32-bit words: a 64-bit shift is two instructions and a branch on a 32-bit
+// target, and the bitset is the only thing the scan writes every quad.
+const INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS: usize = INCOMPRESSIBLE_REPEAT_TABLE_LEN / 32;
 const INCOMPRESSIBLE_REPEAT_HASH_MULT: u32 = 0x9E37_79B1;
 const INCOMPRESSIBLE_MIN_DISTINCT_BYTES: usize = 200;
 // Allow at most ~4.2% concentration for the most frequent symbol in sampled data.
@@ -737,55 +858,53 @@ pub(crate) fn compression_level_allows_raw_fast_path(
 #[inline]
 fn scan_sample_region(
     sample: &[u8],
-    // Wide enough for a whole block, not just a sample: the dictionary-aware
-    // classifier scans the full 128 KiB, and a byte can appear more than 65,535
-    // times there without the quad-repeat guard firing first (distinct quads
-    // sharing one byte value do exactly that), which a narrower counter would
-    // wrap or panic on.
-    counts: &mut [u32; 256],
-    repeat_table: &mut [u32; INCOMPRESSIBLE_REPEAT_TABLE_LEN],
-    repeat_occupied: &mut [u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS],
+    // A sample is at most `RAW_FAST_PATH_MAX_SAMPLE_LEN` bytes, so no byte can
+    // be counted past what sixteen bits hold, and the narrower array is half
+    // the per-call clear.
+    counts: &mut [u16; 256],
+    // Never cleared: a slot is read only once its occupancy bit says this call
+    // wrote it, so the four kilobytes of table cost nothing per call. Filling
+    // it was a fixed memset on every block the classifier looks at, which on a
+    // kilobyte block is a larger share of the call than the scan itself.
+    repeat_table: &mut [MaybeUninit<u32>; INCOMPRESSIBLE_REPEAT_TABLE_LEN],
+    repeat_occupied: &mut [u32; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS],
     repeats: &mut usize,
     repeat_guard: usize,
 ) -> bool {
-    let mut idx = 0usize;
-    let len = sample.len();
-    while idx + 4 <= len {
-        counts[sample[idx] as usize] += 1;
-        counts[sample[idx + 1] as usize] += 1;
-        counts[sample[idx + 2] as usize] += 1;
-        counts[sample[idx + 3] as usize] += 1;
-        let quad = u32::from_le_bytes([
-            sample[idx],
-            sample[idx + 1],
-            sample[idx + 2],
-            sample[idx + 3],
-        ]);
+    debug_assert!(sample.len() <= RAW_FAST_PATH_MAX_SAMPLE_LEN);
+    let (quads, tail) = sample.as_chunks::<4>();
+    for &chunk in quads {
+        // One unaligned load: the chunk is a `[u8; 4]` by type, so neither the
+        // read nor the byte counts below carry a bounds check.
+        let quad = u32::from_le_bytes(chunk);
+        counts[(quad & 0xFF) as usize] += 1;
+        counts[((quad >> 8) & 0xFF) as usize] += 1;
+        counts[((quad >> 16) & 0xFF) as usize] += 1;
+        counts[(quad >> 24) as usize] += 1;
         // Top `INCOMPRESSIBLE_REPEAT_TABLE_BITS` bits of the 32-bit hash give
         // the slot directly: the `as usize` value is `< 2^32`, so the shift
         // by `32 - BITS` already yields an index in `0..TABLE_LEN`. No mask
         // needed (upstream zstd `ZSTD_hashPtr` shape).
-        let slot = (quad.wrapping_mul(INCOMPRESSIBLE_REPEAT_HASH_MULT) as usize)
-            >> (32 - INCOMPRESSIBLE_REPEAT_TABLE_BITS);
-        let word = slot / 64;
-        let bit = 1_u64 << (slot % 64);
-        let occupied = (repeat_occupied[word] & bit) != 0;
-        if occupied && repeat_table[slot] == quad {
+        let slot = (quad.wrapping_mul(INCOMPRESSIBLE_REPEAT_HASH_MULT)
+            >> (32 - INCOMPRESSIBLE_REPEAT_TABLE_BITS)) as usize;
+        let word = slot / 32;
+        let bit = 1_u32 << (slot % 32);
+        // SAFETY: the occupancy bit is set only in the arm below, right after
+        // that slot is written, so a set bit means an initialised slot.
+        if repeat_occupied[word] & bit != 0 && unsafe { repeat_table[slot].assume_init() } == quad {
             *repeats += 1;
             if *repeats > repeat_guard {
                 return true;
             }
         } else {
-            repeat_table[slot] = quad;
+            repeat_table[slot] = MaybeUninit::new(quad);
             repeat_occupied[word] |= bit;
         }
-        idx += 4;
     }
     // Tail bytes that don't form a full quad still count toward the symbol
     // histogram used by the final distinct / max-frequency verdict.
-    while idx < len {
-        counts[sample[idx] as usize] += 1;
-        idx += 1;
+    for &byte in tail {
+        counts[byte as usize] += 1;
     }
     false
 }
@@ -830,20 +949,10 @@ pub(crate) fn block_looks_incompressible_strict(block: &[u8]) -> bool {
     }
 }
 
-#[inline]
+/// Whether a sample of at most [`RAW_FAST_PATH_MAX_SAMPLE_LEN`] bytes, the whole
+/// block or its head, middle and tail, looks like noise.
 fn sample_looks_incompressible(block: &[u8]) -> bool {
-    sample_looks_incompressible_capped(block, RAW_FAST_PATH_MAX_SAMPLE_LEN)
-}
-
-/// As [`sample_looks_incompressible`] but with an explicit sample cap. A larger
-/// cap scans more of the block, so it detects LONG-RANGE repeats (a region that
-/// re-occurs far away — e.g. a record drawn from a dictionary, or a block whose
-/// second half repeats its first) that the small fixed sample misses by only
-/// looking at disjoint head/mid/tail windows. Used by the dict-aware check,
-/// which samples the whole block: a high-entropy-LOOKING block that actually
-/// repeats (and so will compress, dict or not) must not be skipped to raw.
-fn sample_looks_incompressible_capped(block: &[u8], max_sample_len: usize) -> bool {
-    let sample_len = block.len().min(max_sample_len);
+    let sample_len = block.len().min(RAW_FAST_PATH_MAX_SAMPLE_LEN);
     if sample_len < RAW_FAST_PATH_MIN_SAMPLE_LEN {
         return false;
     }
@@ -874,11 +983,12 @@ fn sample_looks_incompressible_capped(block: &[u8], max_sample_len: usize) -> bo
     let total_quads: usize = regions[..region_count].iter().map(|r| r.len() / 4).sum();
     let repeat_guard = total_quads / INCOMPRESSIBLE_REPEAT_DIVISOR + 1;
 
-    let mut counts = [0u32; 256];
-    let mut repeat_table = [u32::MAX; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
+    let mut counts = [0u16; 256];
+    let mut repeat_table =
+        [const { MaybeUninit::<u32>::uninit() }; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
     // Bitset occupancy keeps this path no_std-friendly while avoiding the
     // larger per-slot bool map (and extra matcher-level scratch state).
-    let mut repeat_occupied = [0_u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
+    let mut repeat_occupied = [0_u32; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
     let mut repeats = 0usize;
 
     for region in &regions[..region_count] {

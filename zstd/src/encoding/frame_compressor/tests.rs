@@ -8,7 +8,8 @@ use alloc::vec;
 use super::FrameCompressor;
 use crate::common::{MAGIC_NUM, MAX_BLOCK_SIZE};
 use crate::decoding::FrameDecoder;
-use crate::encoding::{Matcher, Sequence};
+use crate::encoding::test_input::TestInput;
+use crate::encoding::{HistoryBuf, Matcher, Sequence};
 use alloc::vec::Vec;
 
 fn generate_data(seed: u64, len: usize) -> Vec<u8> {
@@ -28,42 +29,50 @@ fn generate_data(seed: u64, len: usize) -> Vec<u8> {
 // library crate never links libzstd.
 
 struct NoDictionaryMatcher {
-    last_space: Vec<u8>,
+    input: TestInput,
     window_size: u64,
 }
 
 impl NoDictionaryMatcher {
     fn new(window_size: u64) -> Self {
         Self {
-            last_space: Vec::new(),
+            input: TestInput::default(),
             window_size,
         }
     }
 }
 
 impl Matcher for NoDictionaryMatcher {
-    fn get_next_space(&mut self) -> Vec<u8> {
-        vec![0; self.window_size as usize]
-    }
-
     fn get_last_space(&mut self) -> &[u8] {
-        self.last_space.as_slice()
+        self.input.last_block()
     }
 
-    fn commit_space(&mut self, space: Vec<u8>) {
-        self.last_space = space;
+    fn fill_in_place(
+        &mut self,
+        capacity: usize,
+        fill: &mut dyn FnMut(&mut HistoryBuf) -> (usize, bool),
+    ) -> (usize, bool) {
+        self.input.fill(capacity, fill)
+    }
+
+    fn uncommitted_input(&self) -> &[u8] {
+        self.input.uncommitted()
+    }
+
+    fn commit_filled(&mut self, len: usize) {
+        self.input.commit(len);
     }
 
     fn skip_matching(&mut self) {}
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         handle_sequence(Sequence::Literals {
-            literals: self.last_space.as_slice(),
+            literals: self.input.last_block(),
         });
     }
 
     fn reset(&mut self, _level: super::CompressionLevel) {
-        self.last_space.clear();
+        self.input.clear();
     }
 
     fn window_size(&self) -> u64 {
@@ -92,6 +101,30 @@ fn very_simple_raw_compress() {
     compressor.set_drain(&mut output);
 
     compressor.compress();
+}
+
+/// An uncompressed frame read from a stream hashes every block it writes, so
+/// its content checksum verifies on decode: the blocks go straight into the
+/// output, and the checksum has to be taken from there.
+#[cfg(feature = "hash")]
+#[test]
+fn a_raw_frame_from_a_reader_carries_a_valid_checksum() {
+    use crate::io::Read;
+    let input: Vec<u8> = (0..300_000u32).map(|i| (i * 31 % 251) as u8).collect();
+    let mut output: Vec<u8> = Vec::new();
+    let mut compressor = FrameCompressor::new(super::CompressionLevel::Uncompressed);
+    compressor.set_content_checksum(true);
+    compressor.set_source(input.as_slice());
+    compressor.set_drain(&mut output);
+    compressor.compress();
+
+    let mut decoder = crate::decoding::StreamingDecoder::new(output.as_slice()).unwrap();
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded).unwrap();
+    assert_eq!(decoded, input);
+    // The frame declares the checksum the decoder verified
+    // (Content_Checksum_flag, RFC 8878 3.1.1.1.1.5).
+    assert_ne!(output[4] & 0b100, 0);
 }
 
 #[test]
@@ -1915,6 +1948,118 @@ fn custom_matcher_without_dictionary_priming_does_not_advertise_dict_id() {
     assert_eq!(decoded, payload);
 }
 
+/// A slice the matcher cannot scan in place (a dictionary is primed ahead of
+/// it) is read into a history laid out for exactly the dictionary and the
+/// slice: every read is held to what the slice has left, so the last one asks
+/// for no room past its end and the history never leaves the workspace.
+#[test]
+fn a_copied_slice_reads_only_what_its_history_was_laid_out_for() {
+    let dict =
+        crate::decoding::Dictionary::from_raw_content(0xABCD_0042, generate_data(7, 4 * 1024))
+            .expect("raw dictionary should be valid");
+    let payload = generate_data(11, 5000);
+    let mut compressor: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(3));
+    compressor
+        .set_dictionary(dict)
+        .expect("dictionary should attach");
+    let mut out = Vec::new();
+    compressor.compress_independent_frame_into(&payload, &mut out);
+    assert_eq!(
+        compressor.state.matcher.owned_table_and_history_bytes().1,
+        0,
+        "the last read asked for room the layout did not hold"
+    );
+}
+
+/// A frame of exact length carves its block buffers for a block no longer than
+/// itself: its window is rounded up to a power of two, and buffers sized from
+/// the window are kept for bytes no block of the frame can hold.
+#[test]
+fn a_frame_of_exact_length_reserves_block_buffers_for_its_length() {
+    let payload = generate_data(17, 5000);
+    let mut compressor: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(3));
+    let mut out = Vec::new();
+    compressor.compress_independent_frame_into(&payload, &mut out);
+    assert!(
+        compressor.state.matcher.window_size() as usize > payload.len(),
+        "fixture: the window rounds past the frame"
+    );
+    assert_eq!(compressor.state.workspace.block_capacity(), payload.len());
+    let mut decoded = Vec::with_capacity(payload.len());
+    FrameDecoder::new()
+        .decode_all_to_vec(&out, &mut decoded)
+        .unwrap();
+    assert_eq!(decoded, payload);
+}
+
+/// A small slice under an attached dictionary at the fast levels is scanned in
+/// place, so only the dictionary enters the history, and only it is laid out:
+/// room for the slice would be reserved on every frame and never written.
+#[test]
+fn an_attached_dictionary_frame_lays_out_only_the_dictionary() {
+    let dict_len = 4 * 1024;
+    let dict =
+        crate::decoding::Dictionary::from_raw_content(0xABCD_0043, generate_data(5, dict_len))
+            .expect("raw dictionary should be valid");
+    let payload = generate_data(13, 2000);
+    let mut compressor: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(1));
+    compressor
+        .set_dictionary(dict)
+        .expect("dictionary should attach");
+    let mut out = Vec::new();
+    compressor.compress_independent_frame_into(&payload, &mut out);
+    assert!(
+        compressor.state.matcher.borrowed_dict_supported(),
+        "fixture: the dictionary is attached and the slice scanned in place"
+    );
+    assert_eq!(
+        compressor.state.matcher.ingest_capacity(),
+        dict_len,
+        "the history holds the dictionary and nothing else"
+    );
+    let mut decoded = Vec::with_capacity(payload.len());
+    let mut decoder = FrameDecoder::new();
+    decoder
+        .add_dict(
+            crate::decoding::Dictionary::from_raw_content(0xABCD_0043, generate_data(5, dict_len))
+                .unwrap(),
+        )
+        .unwrap();
+    decoder.decode_all_to_vec(&out, &mut decoded).unwrap();
+    assert_eq!(decoded, payload);
+}
+
+/// A custom matcher holds nothing in the compressor's workspace, so replacing
+/// it hands back the matcher that ran, and the compressor goes on with the new
+/// one.
+#[test]
+fn a_custom_matcher_is_handed_back_whole_when_replaced() {
+    let payload = b"abcdefghabcdefgh";
+    let mut compressor = FrameCompressor::new_with_matcher(
+        NoDictionaryMatcher::new(64),
+        super::CompressionLevel::Fastest,
+    );
+    let mut first = Vec::new();
+    compressor.set_source(payload.as_slice());
+    compressor.set_drain(&mut first);
+    compressor.compress();
+
+    let outgoing = compressor.replace_matcher(NoDictionaryMatcher::new(128));
+    assert_eq!(outgoing.window_size, 64, "the matcher that ran comes back");
+
+    let mut second = Vec::new();
+    compressor.set_source(payload.as_slice());
+    compressor.set_drain(&mut second);
+    compressor.compress();
+    for frame in [&first, &second] {
+        let mut decoded = Vec::with_capacity(payload.len());
+        FrameDecoder::new()
+            .decode_all_to_vec(frame, &mut decoded)
+            .unwrap();
+        assert_eq!(decoded, payload);
+    }
+}
+
 #[cfg(feature = "hash")]
 #[test]
 fn checksum_two_frames_reused_compressor() {
@@ -2343,7 +2488,7 @@ fn periodic_stream_roundtrips_at_every_presplit_tier() {
 /// 0), so the first block is a homogeneous compressible run that banks
 /// savings, and the second block is the one whose intra-block transition
 /// `split_block_by_chunks()` resolves into a sub-block boundary (the
-/// `pending_input.split_off(...)` path). The test asserts that split
+/// remainder stays uncommitted for the next block). The test asserts that split
 /// decision directly so it cannot silently stop exercising the path if
 /// the fixture or params drift, then proves the emitted split frame
 /// round-trips. Level 13 (lazy) no longer pre-splits, hence Level 5.
@@ -2762,6 +2907,52 @@ fn compress_independent_frame_reuse_matches_fresh_on_the_optimal_band() {
     assert!(diverged.is_empty(), "{diverged:#?}");
 }
 
+/// One compressor moved across levels whose match finders differ (Fast, the
+/// optimal parser, dfast, the tree, rows, back to Fast) lays its workspace out
+/// anew every frame: tables grow, shrink and shift behind each other, and a
+/// region that lands on bytes another backend wrote must not be read as its
+/// own. Every frame must still be the one a fresh compressor writes and decode
+/// back, on both the one-shot and the streaming path. Small enough to run
+/// under Miri, which checks the regions' pointer discipline.
+#[test]
+fn a_compressor_moved_across_levels_lays_its_workspace_out_again() {
+    use crate::encoding::{CompressionLevel, compress_slice_to_vec};
+    let text: Vec<u8> = (0..60u32)
+        .flat_map(|i| alloc::format!("line {} of {} says {}\n", i % 17, i % 5, i % 11).into_bytes())
+        .collect();
+    let mut cctx: FrameCompressor<&[u8], Vec<u8>> =
+        FrameCompressor::new(CompressionLevel::Level(1));
+    for level in [1, 19, 3, 22, 5, 13, 1, 4] {
+        let level = CompressionLevel::Level(level);
+        cctx.set_compression_level(level);
+        let reused = cctx.compress_independent_frame(&text);
+        assert_eq!(
+            reused,
+            compress_slice_to_vec(&text, level),
+            "one-shot frame at {level:?} differs from a fresh compressor's"
+        );
+        let mut decoded = Vec::with_capacity(text.len());
+        FrameDecoder::new()
+            .decode_all_to_vec(&reused, &mut decoded)
+            .unwrap();
+        assert_eq!(decoded, text, "one-shot frame at {level:?} decodes wrongly");
+
+        cctx.set_source(text.as_slice());
+        cctx.set_drain(Vec::new());
+        cctx.compress();
+        let streamed = cctx.take_drain().expect("the drain was set");
+        let mut fresh: FrameCompressor<&[u8], Vec<u8>> = FrameCompressor::new(level);
+        fresh.set_source(text.as_slice());
+        fresh.set_drain(Vec::new());
+        fresh.compress();
+        assert_eq!(
+            Some(streamed),
+            fresh.take_drain(),
+            "streamed frame at {level:?} differs from a fresh compressor's"
+        );
+    }
+}
+
 /// A compressor kept for one-shot frame after frame, with its parameters set
 /// again before each (what a C context compressing through
 /// `ZSTD_compress2` does), writes each 4 KiB piece of a stream exactly as a
@@ -2882,6 +3073,45 @@ fn compress_independent_frame_reuses_sticky_dictionary() {
         let mut decoded = Vec::with_capacity(data.len());
         decoder.decode_all_to_vec(&reused, &mut decoded).unwrap();
         assert_eq!(&decoded, data, "dict roundtrip failed, len={}", data.len());
+    }
+}
+
+/// A matcher taken out of a compressor must not keep pointing into that
+/// compressor's workspace: its tables and its history, with the dictionary
+/// resident at the head, live there. Moved into a second compressor after the
+/// first is gone, it has to compress exactly as a fresh one does. Pointing into
+/// the freed workspace instead reads whatever took its place, which the
+/// allocation below arranges to be garbage (and Miri reports as a use after
+/// free).
+#[test]
+fn a_matcher_taken_out_of_a_compressor_outlives_it() {
+    use crate::encoding::CompressionLevel;
+    use crate::encoding::match_generator::MatchGeneratorDriver;
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let dict_content = crate::decoding::Dictionary::decode_dict(dict_raw).unwrap();
+    let payload = dict_content.dict_content[..1024].to_vec();
+
+    for level in [3, 5, 9, 16] {
+        let level = CompressionLevel::Level(level);
+        let mut first: FrameCompressor = FrameCompressor::new(level);
+        first.set_dictionary_from_bytes(dict_raw).unwrap();
+        let _ = first.compress_independent_frame(&payload);
+        let workspace_bytes = first.state.workspace.heap_bytes();
+        let matcher = first.replace_matcher(MatchGeneratorDriver::new(1024 * 128, 1));
+        drop(first);
+        let garbage = vec![0xEEu8; workspace_bytes];
+
+        let mut second: FrameCompressor = FrameCompressor::new(level);
+        second.set_dictionary_from_bytes(dict_raw).unwrap();
+        let _ = second.replace_matcher(matcher);
+        let moved = second.compress_independent_frame(&payload);
+
+        let mut fresh: FrameCompressor = FrameCompressor::new(level);
+        fresh.set_dictionary_from_bytes(dict_raw).unwrap();
+        let _ = fresh.compress_independent_frame(&payload);
+        let expected = fresh.compress_independent_frame(&payload);
+        assert_eq!(moved, expected, "{level:?}: the moved matcher diverged");
+        assert!(garbage.iter().all(|&b| b == 0xEE));
     }
 }
 
@@ -3642,81 +3872,17 @@ fn reused_compressor_borrowed_chain_frames_are_byte_identical() {
     }
 }
 
-/// A matcher that DOES implement in-place ingest, unlike the built-in driver's
-/// Simple backend. `Uncompressed` frames must still round-trip: the level, not
-/// the backend, decides whether the staged path is required.
-struct InPlaceMatcher {
-    buffer: Vec<u8>,
-    committed: usize,
-    window_size: u64,
-}
-
-impl InPlaceMatcher {
-    fn new(window_size: u64) -> Self {
-        Self {
-            buffer: Vec::new(),
-            committed: 0,
-            window_size,
-        }
-    }
-}
-
-impl Matcher for InPlaceMatcher {
-    fn get_next_space(&mut self) -> Vec<u8> {
-        vec![0; self.window_size as usize]
-    }
-
-    fn get_last_space(&mut self) -> &[u8] {
-        &self.buffer[..self.committed]
-    }
-
-    fn commit_space(&mut self, space: Vec<u8>) {
-        self.buffer = space;
-        self.committed = self.buffer.len();
-    }
-
-    fn fill_in_place(
-        &mut self,
-        capacity: usize,
-        fill: &mut dyn FnMut(&mut Vec<u8>) -> (usize, bool),
-    ) -> Option<(usize, bool)> {
-        self.buffer.reserve(capacity);
-        Some(fill(&mut self.buffer))
-    }
-
-    fn uncommitted_input(&self) -> &[u8] {
-        &self.buffer[self.committed..]
-    }
-
-    fn commit_filled(&mut self, len: usize) {
-        self.committed += len;
-    }
-
-    fn skip_matching(&mut self) {}
-
-    fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
-        handle_sequence(Sequence::Literals {
-            literals: &self.buffer[..self.committed],
-        });
-    }
-
-    fn reset(&mut self, _level: super::CompressionLevel) {
-        self.buffer.clear();
-        self.committed = 0;
-    }
-
-    fn window_size(&self) -> u64 {
-        self.window_size
-    }
-}
-
+/// An uncompressed frame is read straight into its output and never reaches
+/// the matcher, whichever matcher the compressor holds; its payload must
+/// still arrive whole, block after block.
 #[test]
-fn uncompressed_level_keeps_the_payload_with_an_in_place_matcher() {
-    let data = generate_data(0x5eed, 4096);
+fn uncompressed_level_keeps_the_payload_with_a_custom_matcher() {
+    // Past one block, and not a multiple of it, so the last block is short.
+    let data = generate_data(0x5eed, 2 * MAX_BLOCK_SIZE as usize + 4096);
     let mut out = Vec::new();
-    let mut compressor: FrameCompressor<&[u8], &mut Vec<u8>, InPlaceMatcher> =
+    let mut compressor: FrameCompressor<&[u8], &mut Vec<u8>, NoDictionaryMatcher> =
         FrameCompressor::new_with_matcher(
-            InPlaceMatcher::new(1 << 20),
+            NoDictionaryMatcher::new(1 << 20),
             super::CompressionLevel::Uncompressed,
         );
     compressor.set_source(&data[..]);
@@ -3726,9 +3892,25 @@ fn uncompressed_level_keeps_the_payload_with_an_in_place_matcher() {
     let mut decoder = FrameDecoder::new();
     let mut decoded = Vec::with_capacity(data.len());
     decoder.decode_all_to_vec(&out, &mut decoded).unwrap();
-    assert_eq!(
-        decoded, data,
-        "Uncompressed frames must carry their payload even when the matcher supports in-place ingest"
+    assert_eq!(decoded, data);
+}
+
+/// An uncompressed frame never builds a literals or sequences section, so its
+/// context must not lay out the buffers for them: a fresh raw-only context
+/// would otherwise allocate the whole compressed-block scratch for nothing.
+#[test]
+fn uncompressed_frame_lays_out_no_compressed_block_scratch() {
+    let data = generate_data(0x5eed, 2 * MAX_BLOCK_SIZE as usize);
+    let mut compressor: FrameCompressor =
+        FrameCompressor::new(super::CompressionLevel::Uncompressed);
+    let frame = compressor.compress_independent_frame(&data);
+    assert!(!frame.is_empty());
+    let scratch =
+        crate::encoding::blocks::CompressedBlockScratch::workspace_bytes(MAX_BLOCK_SIZE as usize);
+    assert!(
+        compressor.state.workspace.capacity() < scratch,
+        "a raw frame's workspace ({} bytes) holds the {scratch}-byte compressed-block scratch",
+        compressor.state.workspace.capacity(),
     );
 }
 
@@ -3775,6 +3957,33 @@ fn dictionary_frame_outgrowing_its_window_stays_decodable() {
         .decode_all_to_vec(&out, &mut decoded)
         .expect("frame must stay within the window it advertises");
     assert_eq!(decoded, data);
+}
+
+/// A reused compressor restores its primed-dictionary snapshot every frame.
+/// The restore must land in the tables and history the reset laid out in the
+/// context's workspace: replacing them with fresh clones left the workspace
+/// regions idle, held a second copy of every table, and allocated it again on
+/// every frame. Covers the dfast, row and binary-tree backends.
+#[test]
+fn a_restored_dictionary_snapshot_stays_in_the_workspace() {
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let data = generate_data(0xd1c7, 200_000);
+    for level in [3, 5, 16] {
+        let dict = crate::decoding::Dictionary::decode_dict(dict_raw).unwrap();
+        let mut compressor: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::Level(level));
+        compressor
+            .set_dictionary(dict)
+            .expect("valid dictionary should attach");
+        let first = compressor.compress_independent_frame(&data);
+        let second = compressor.compress_independent_frame(&data);
+        assert_eq!(first, second, "L{level}: a restored frame differs");
+        assert_eq!(
+            compressor.state.matcher.owned_table_and_history_bytes(),
+            (0, 0),
+            "L{level}: the restore moved the tables or history out of the workspace",
+        );
+    }
 }
 
 /// A prepared dictionary is attached by value, so every frame it primes clones
@@ -3911,24 +4120,24 @@ fn a_dictionary_frame_reserves_room_for_the_dictionary_too() {
             "level {level}: the dictionary and the frame both live in this \
              buffer, so both have to fit: {capacity} < {needed}"
         );
-        // And fit by reservation rather than by overshooting into them: the
-        // slack is the one block the final top-up asks for, where a buffer that
-        // grew lands on a doubling step well past it.
-        //
-        // Level 1 is excluded from the tight bound: the Fast backend's
-        // dictionary is not in the buffer when the frame is sized — priming
-        // widens its eviction band by the dictionary's length and the bytes
-        // arrive afterwards — so its buffer still ends past the reservation.
-        // Left as it is rather than asserted loosely in the other direction,
-        // since the reason it lands where it does is not established here.
-        if level != 1 {
-            assert!(
-                capacity <= needed + 256 * 1024,
-                "level {level}: {capacity} is past what the frame and \
-                 dictionary need ({needed}), which is what growth by doubling \
-                 leaves behind"
-            );
-        }
+        // And fit by layout rather than by overshooting into them: the slack is
+        // the one block the final top-up asks for, where a buffer that grew
+        // lands on a doubling step well past it. At level 1 the frame is
+        // larger than the window, so the Fast history slides, and it holds up
+        // to twice the window grown by the dictionary before it drains: that
+        // ceiling is laid out from the start.
+        let window = compressor.state.matcher.window_size() as usize;
+        let bound = if level == 1 {
+            2 * (window + dictionary.len()) + crate::common::MAX_BLOCK_SIZE as usize
+        } else {
+            needed + 256 * 1024
+        };
+        assert!(
+            capacity <= bound,
+            "level {level}: {capacity} is past what the frame and \
+             dictionary need ({bound}), which is what growth by doubling \
+             leaves behind"
+        );
     }
 }
 

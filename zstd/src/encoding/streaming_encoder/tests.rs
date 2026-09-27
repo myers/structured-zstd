@@ -456,42 +456,50 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 struct TinyMatcher {
-    last_space: Vec<u8>,
+    input: crate::encoding::test_input::TestInput,
     window_size: u64,
 }
 
 impl TinyMatcher {
     fn new(window_size: u64) -> Self {
         Self {
-            last_space: Vec::new(),
+            input: Default::default(),
             window_size,
         }
     }
 }
 
 impl Matcher for TinyMatcher {
-    fn get_next_space(&mut self) -> Vec<u8> {
-        vec![0; self.window_size as usize]
-    }
-
     fn get_last_space(&mut self) -> &[u8] {
-        self.last_space.as_slice()
+        self.input.last_block()
     }
 
-    fn commit_space(&mut self, space: Vec<u8>) {
-        self.last_space = space;
+    fn fill_in_place(
+        &mut self,
+        capacity: usize,
+        fill: &mut dyn FnMut(&mut crate::encoding::HistoryBuf) -> (usize, bool),
+    ) -> (usize, bool) {
+        self.input.fill(capacity, fill)
+    }
+
+    fn uncommitted_input(&self) -> &[u8] {
+        self.input.uncommitted()
+    }
+
+    fn commit_filled(&mut self, len: usize) {
+        self.input.commit(len);
     }
 
     fn skip_matching(&mut self) {}
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
         handle_sequence(Sequence::Literals {
-            literals: self.last_space.as_slice(),
+            literals: self.input.last_block(),
         });
     }
 
     fn reset(&mut self, _level: CompressionLevel) {
-        self.last_space.clear();
+        self.input.clear();
     }
 
     fn window_size(&self) -> u64 {
@@ -660,6 +668,36 @@ fn streaming_encoder_matcher_and_gates_resolve_from_one_size() {
         enc.context.state.strategy_tag,
     );
     enc.finish().unwrap();
+}
+
+/// A pledged stream under a window wider than its level's lays its history out
+/// for the whole pledge, so reading it never moves the history out of the
+/// context's workspace into an allocation of its own.
+#[test]
+fn a_pledged_stream_past_the_level_window_keeps_its_history_in_the_workspace() {
+    let level = CompressionLevel::Level(3);
+    let params = crate::encoding::CompressionParameters::builder(level)
+        .window_log(23)
+        .build()
+        .unwrap();
+    let input: Vec<u8> = (0..4u32 << 20)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8 & 0x3F)
+        .collect();
+    let mut enc = StreamingEncoder::new(Vec::new(), level);
+    enc.set_parameters(&params).unwrap();
+    enc.set_pledged_content_size(input.len() as u64).unwrap();
+    enc.write_all(&input).unwrap();
+    assert_eq!(
+        enc.context.state.matcher.owned_table_and_history_bytes().1,
+        0,
+        "the history outgrew the room laid out for the pledge"
+    );
+    let compressed = enc.finish().unwrap();
+    let mut decoded = Vec::with_capacity(input.len());
+    crate::decoding::FrameDecoder::new()
+        .decode_all_to_vec(&compressed, &mut decoded)
+        .unwrap();
+    assert_eq!(decoded, input);
 }
 
 /// Regression: a streamed periodic input at the btlazy2 levels round-trips.
@@ -1680,6 +1718,90 @@ fn set_dictionary_from_bytes_takes_unmagicked_bytes_as_raw_content() {
         ),
     )
     .unwrap();
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded).unwrap();
+    assert_eq!(decoded, payload);
+}
+
+/// A small block the negative levels search without asking the classifier is
+/// still recorded on the repeat grid. A later block that carries a copy of it
+/// among unique noise reads as noise to the classifier, and only the grid can
+/// send it to the search that finds the copy; left unrecorded, the block went
+/// out raw with the match sitting in the matcher's history.
+#[test]
+fn a_block_searched_without_the_classifier_is_found_again() {
+    let noise = |mut state: u32, len: usize| -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    };
+    let small = noise(0x1234_5678, 10 * 1024);
+    let mut large = small.clone();
+    large.extend(noise(0x9E37_79B9, 118 * 1024));
+
+    for level in [-7, -1] {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(level));
+        encoder.write_all(&small).unwrap();
+        encoder.flush().unwrap();
+        encoder.write_all(&large).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let total = small.len() + large.len();
+        assert!(
+            compressed.len() < total - 8 * 1024,
+            "level {level}: {} bytes from {total}, the copy of the first block was not found",
+            compressed.len(),
+        );
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded.len(), total);
+        assert_eq!(&decoded[..small.len()], &small[..]);
+        assert_eq!(&decoded[small.len()..], &large[..]);
+    }
+}
+
+/// A streamed uncompressed frame hashes each block as it goes out, so its
+/// content checksum verifies on decode.
+#[cfg(feature = "hash")]
+#[test]
+fn a_streamed_raw_frame_carries_a_valid_checksum() {
+    let payload: Vec<u8> = (0..200_000u32).map(|i| (i * 7 % 253) as u8).collect();
+    let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Uncompressed);
+    encoder.set_content_checksum(true).unwrap();
+    encoder.write_all(&payload).unwrap();
+    let compressed = encoder.finish().unwrap();
+    // Content_Checksum_flag (RFC 8878 3.1.1.1.1.5).
+    assert_ne!(compressed[4] & 0b100, 0);
+    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded).unwrap();
+    assert_eq!(decoded, payload);
+}
+
+/// A full final buffer is cut like any other block: where the content changes
+/// inside it, the pre-split sends the prefix out as a block of its own before
+/// the last one, and the frame still decodes to its input.
+#[test]
+fn a_full_last_buffer_is_pre_split_where_its_content_changes() {
+    let mut payload = b"log line with a steady shape, ".repeat(64 * 1024 / 30);
+    payload.truncate(64 * 1024);
+    let mut state = 0x2545_F491_u32;
+    payload.extend((0..64 * 1024).map(|_| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state as u8
+    }));
+    let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(19));
+    encoder.write_all(&payload).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
     let mut decoded = Vec::new();
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);

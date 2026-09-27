@@ -87,6 +87,9 @@ pub(crate) mod opt;
 pub(crate) mod row;
 pub(crate) mod simple;
 pub(crate) mod strategy;
+#[cfg(test)]
+pub(crate) mod test_input;
+pub(crate) mod workspace;
 
 pub(crate) mod frame_compressor;
 #[cfg(feature = "lsm")]
@@ -111,6 +114,7 @@ pub use parameters::{
     LiteralCompressionMode, ParameterError, Strategy,
 };
 pub use streaming_encoder::{CompressionContext, StreamingEncoder};
+pub use workspace::HistoryBuf;
 
 use crate::io::{Read, Write};
 use alloc::vec::Vec;
@@ -447,61 +451,39 @@ pub fn dictionary_describes_frame(dict_content: usize, src_size: Option<u64>) ->
 /// Trait used by the encoder that users can use to extend the matching facilities with their own algorithm
 /// making their own tradeoffs between runtime, memory usage and compression ratio
 ///
-/// This trait operates on buffers that represent the chunks of data the matching algorithm wants to work on.
-/// Each one of these buffers is referred to as a *space*. One or more of these buffers represent the window
-/// the decoder will need to decode the data again.
-///
-/// This library asks the Matcher for a new buffer using `get_next_space` to allow reusing of allocated buffers when they are no longer part of the
-/// window of data that is being used for matching.
-///
-/// The library fills the buffer with data that is to be compressed and commits them back to the matcher using `commit_space`.
-///
-/// Then it will either call `start_matching` or, if the space is deemed not worth compressing, `skip_matching` is called.
+/// The matcher owns the input: the encoder reads the data to be compressed
+/// straight into the matcher's [`HistoryBuf`] through
+/// [`fill_in_place`](Self::fill_in_place), where it waits, uncommitted, until
+/// the encoder has chosen where the next block ends. The encoder then claims
+/// the block with [`commit_filled`](Self::commit_filled) and either calls
+/// `start_matching` or, if the block is deemed not worth compressing,
+/// `skip_matching`. Bytes left uncommitted head the next block.
 ///
 /// This is repeated until no more data is left to be compressed.
 pub trait Matcher {
-    /// Get a space where we can put data to be matched on. Will be encoded as one block. The maximum allowed size is 128 kB.
-    fn get_next_space(&mut self) -> alloc::vec::Vec<u8>;
-    /// Get a reference to the last committed space
+    /// The block most recently claimed by [`commit_filled`](Self::commit_filled).
     fn get_last_space(&mut self) -> &[u8];
-    /// Commit a space to the matcher so it can be matched against
-    fn commit_space(&mut self, space: alloc::vec::Vec<u8>);
-    /// Read the next block straight into the matcher's own history buffer,
-    /// skipping the scratch buffer that [`commit_space`](Self::commit_space)
-    /// otherwise has to copy in.
+    /// Read input straight into the matcher's history buffer.
     ///
-    /// `fill` is handed the history buffer with room reserved for `capacity`
-    /// more bytes and returns `(appended, eof)`. The bytes are readable through
-    /// [`uncommitted_input`](Self::uncommitted_input) but are NOT yet part of
-    /// the match window: the caller chooses the block boundary (the pre-split
-    /// pass needs the bytes to decide) and then calls
+    /// `fill` is handed the buffer, with room for `capacity` more bytes, to
+    /// append to, and returns `(appended, eof)`, which this returns. The bytes
+    /// are then readable through [`uncommitted_input`](Self::uncommitted_input)
+    /// but are NOT yet part of the match window: the encoder chooses the block
+    /// boundary (the pre-split pass needs the bytes to decide) and then calls
     /// [`commit_filled`](Self::commit_filled). Whatever is left over stays in
     /// the buffer and becomes the head of the next block, so a carried split
     /// remainder costs no copy.
-    ///
-    /// Returns `None` if this matcher has no in-place ingest, which is the
-    /// default: the caller then keeps the staged-copy path.
     fn fill_in_place(
         &mut self,
-        _capacity: usize,
-        _fill: &mut dyn FnMut(&mut alloc::vec::Vec<u8>) -> (usize, bool),
-    ) -> Option<(usize, bool)> {
-        None
-    }
-    /// Bytes ingested by [`fill_in_place`](Self::fill_in_place) that no block
-    /// has claimed yet. Empty unless that hook is implemented.
-    fn uncommitted_input(&self) -> &[u8] {
-        &[]
-    }
+        capacity: usize,
+        fill: &mut dyn FnMut(&mut HistoryBuf) -> (usize, bool),
+    ) -> (usize, bool);
+    /// Bytes read by [`fill_in_place`](Self::fill_in_place) that no block has
+    /// claimed yet.
+    fn uncommitted_input(&self) -> &[u8];
     /// Claim `len` bytes from the head of
     /// [`uncommitted_input`](Self::uncommitted_input) as the next block.
-    fn commit_filled(&mut self, _len: usize) {}
-    /// Size the ingest buffer for a frame of `bytes` up front, so filling it
-    /// block by block doesn't walk a doubling chain of reallocations. Clamped
-    /// internally to the buffer's eviction ceiling, so an over-long or absent
-    /// hint can never reserve more than a bounded window. No-op unless
-    /// [`fill_in_place`](Self::fill_in_place) is implemented.
-    fn reserve_for_frame(&mut self, _bytes: usize) {}
+    fn commit_filled(&mut self, len: usize);
     /// Just process the data in the last committed space for future matching.
     fn skip_matching(&mut self);
     /// Hint-aware skip path used internally to thread a precomputed block
@@ -516,6 +498,30 @@ pub trait Matcher {
     fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>));
     /// Reset this matcher so it can be used for the next new frame
     fn reset(&mut self, level: CompressionLevel);
+    /// Reset for the next frame at `level`, as [`reset`](Self::reset), with
+    /// the compression context's workspace to take tables from rather than
+    /// allocating them. The context calls this in place of `reset`, once per
+    /// frame.
+    ///
+    /// The workspace type cannot be named outside this crate, so a matcher
+    /// defined elsewhere can neither override nor call this: it keeps the
+    /// default, which resets and keeps its own allocations. That is what makes
+    /// the workspace's regions sound to hand out: only the context lays it out,
+    /// and only for the matcher it is resetting.
+    #[doc(hidden)]
+    fn reset_in_workspace(
+        &mut self,
+        level: CompressionLevel,
+        _workspace: &mut workspace::Workspace,
+    ) {
+        self.reset(level);
+    }
+    /// Move whatever this matcher holds in a compression context's workspace
+    /// into allocations of its own, before it leaves that context. Only a
+    /// matcher that takes [`reset_in_workspace`](Self::reset_in_workspace)
+    /// holds anything there.
+    #[doc(hidden)]
+    fn leave_workspace(&mut self) {}
     /// Provide a hint about the total uncompressed size for the next frame.
     ///
     /// Implementations may use this to select smaller hash tables and windows

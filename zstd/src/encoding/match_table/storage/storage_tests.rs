@@ -110,7 +110,7 @@ fn replay_history_for_rebase_bt_walks_inserted_prefix() {
     let mut t = new_table(64);
     // Construct a contiguous mirror long enough for the BT walker
     // (`bt_insert_range` reads 8-byte prefixes).
-    t.history = vec![0u8; 64];
+    t.history = vec![0u8; 64].into();
     for (i, slot) in t.history.iter_mut().enumerate() {
         *slot = (i % 17) as u8;
     }
@@ -138,7 +138,7 @@ fn begin_rebase_clears_index_tables_and_resets_base() {
     let mut t = new_table(32);
     // The three regions share one buffer; seed it through the seams so each
     // region carries a distinct non-empty marker.
-    t.tables = vec![7; 48];
+    t.tables = crate::encoding::workspace::Table::owned(vec![7; 48]);
     t.chain_off = 16;
     t.hash3_off = 32;
     t.chain_table_mut().fill(9);
@@ -168,7 +168,7 @@ fn the_hoisted_hash3_fill_matches_the_per_position_loop() {
     for (floor, index_shift) in [(0, 0), (12, 70_000)] {
         let build = |hoisted: bool| {
             let mut t = new_table(64);
-            t.history = b"abcdef_abcdef_abcdef_abcdef_abcdef_abcdef".to_vec();
+            t.history = b"abcdef_abcdef_abcdef_abcdef_abcdef_abcdef".to_vec().into();
             t.history_start = 0;
             t.history_abs_start = floor;
             t.position_base = floor;
@@ -225,7 +225,7 @@ fn the_hoisted_hash3_fill_matches_the_per_position_loop() {
 #[test]
 fn arming_a_block_re_encodes_when_its_last_position_would_not_fit() {
     let mut t = new_table(64);
-    t.history = b"abcdef_abcdef_abcdef_abcdef".to_vec();
+    t.history = b"abcdef_abcdef_abcdef_abcdef".to_vec().into();
     t.history_start = 0;
     t.history_abs_start = 0;
     t.window_size = t.history.len();
@@ -252,7 +252,7 @@ fn arming_a_block_re_encodes_when_its_last_position_would_not_fit() {
 #[test]
 fn arming_a_block_that_already_fits_changes_nothing() {
     let mut t = new_table(64);
-    t.history = b"abcdef_abcdef_abcdef_abcdef".to_vec();
+    t.history = b"abcdef_abcdef_abcdef_abcdef".to_vec().into();
     t.history_start = 0;
     t.history_abs_start = 0;
     t.window_size = t.history.len();
@@ -272,7 +272,7 @@ fn arming_a_block_that_already_fits_changes_nothing() {
 #[test]
 fn a_hash3_catch_up_past_the_index_range_rebases_first() {
     let mut t = new_table(64);
-    t.history = b"abcdef_abcdef_abcdef_abcdef_abcdef_abcdef".to_vec();
+    t.history = b"abcdef_abcdef_abcdef_abcdef_abcdef_abcdef".to_vec().into();
     t.history_start = 0;
     t.history_abs_start = 0;
     t.window_size = t.history.len();
@@ -302,7 +302,7 @@ fn a_hash3_catch_up_past_the_index_range_rebases_first() {
 #[test]
 fn rebase_positions_cold_rebuilds_hash3_for_btultra2() {
     let mut t = new_table(64);
-    t.history = b"abcdef_abcdef_abcdef_abcdef_abcdef_abcdef".to_vec();
+    t.history = b"abcdef_abcdef_abcdef_abcdef_abcdef_abcdef".to_vec().into();
     t.history_start = 0;
     t.history_abs_start = 0;
     t.window_size = t.history.len();
@@ -336,7 +336,7 @@ fn rebase_positions_cold_rebuilds_hash3_for_btultra2() {
 #[test]
 fn insert_positions_with_step_zero_step_is_noop() {
     let mut t = new_table(32);
-    t.history = vec![0u8; 32];
+    t.history = vec![0u8; 32].into();
     t.push_test_chunk(vec![0u8; 32]);
     t.ensure_tables();
     let next_to_update3_before = t.next_to_update3;
@@ -352,7 +352,7 @@ fn insert_positions_with_step_saturating_step_breaks_loop() {
     // `pos.saturating_add(step)` to usize::MAX, then the `next <= pos`
     // guard breaks out of the loop after one insert.
     let mut t = new_table(32);
-    t.history = vec![1u8; 32];
+    t.history = vec![1u8; 32].into();
     t.push_test_chunk(vec![1u8; 32]);
     t.ensure_tables();
     t.insert_positions_with_step(0, 16, usize::MAX);
@@ -450,27 +450,12 @@ fn reset_clears_uncommitted_bytes_left_by_an_abandoned_fill() {
         (8, true)
     });
     assert_eq!(t.uncommitted().len(), 8, "fill must stage the bytes");
-    t.reset(|_| {});
+    t.reset();
     assert!(
         t.uncommitted().is_empty(),
         "reset must drop bytes no block claimed"
     );
     assert!(t.live_history().is_empty(), "reset must clear the window");
-}
-
-#[test]
-fn reserve_for_frame_takes_the_request_as_given() {
-    // The caller sizes the slack off the ACTIVE block capacity, which a small
-    // window shrinks below the format maximum. Adding a fixed 128 KiB here
-    // would dwarf a small hinted frame's whole buffer.
-    let mut t = new_table(1 << 20);
-    t.reserve_for_frame(1024);
-    assert!(t.history.capacity() >= 1024, "the request must be honoured");
-    assert!(
-        t.history.capacity() < 64 * 1024,
-        "reservation must not add a format-maximum block on top: got {}",
-        t.history.capacity()
-    );
 }
 
 #[test]
@@ -484,17 +469,80 @@ fn ensure_tables_releases_the_buffer_when_the_layout_shrinks() {
     t.chain_log = 20;
     t.hash3_log = 0;
     t.ensure_tables();
-    let large = t.tables.capacity();
-    assert!(large >= 2 << 20, "fixture precondition: a large layout");
+    let large = t.tables.owned_bytes();
+    assert!(
+        large >= (2 << 20) * core::mem::size_of::<u32>(),
+        "fixture precondition: a large layout"
+    );
 
     t.hash_log = 10;
     t.chain_log = 10;
     t.ensure_tables();
     assert!(
-        t.tables.capacity() < large / 2,
+        t.tables.owned_bytes() < large / 2,
         "a smaller layout must release the oversized buffer, kept {} of {large}",
-        t.tables.capacity()
+        t.tables.owned_bytes()
     );
+}
+
+/// A level change that moves only the hash3 width keeps the hash and chain
+/// entries and leaves the hash3 table empty at its new width: entries hashed at
+/// the old width would sit in slots the new hash never maps them to.
+#[test]
+fn a_hash3_width_change_keeps_the_hash_and_chain_and_empties_the_tail() {
+    let mut t = new_table(64);
+    t.hash3_log = 4;
+    t.ensure_tables();
+    t.hash_table_mut().fill(11);
+    t.chain_table_mut().fill(12);
+    t.hash3_table_mut().fill(13);
+
+    t.hash3_log = 5;
+    t.ensure_tables();
+    assert_eq!(t.hash_table().len(), 1 << 8);
+    assert_eq!(t.chain_table().len(), 1 << 8);
+    assert_eq!(t.hash3_table().len(), 1 << 5);
+    assert!(
+        t.hash_table().iter().all(|&v| v == 11),
+        "hash entries survive"
+    );
+    assert!(
+        t.chain_table().iter().all(|&v| v == 12),
+        "chain entries survive"
+    );
+    assert!(
+        t.hash3_table().iter().all(|&v| v == HC_EMPTY),
+        "the hash3 table starts empty at its new width"
+    );
+
+    t.hash3_table_mut().fill(13);
+    t.hash3_log = 0;
+    t.ensure_tables();
+    assert!(
+        t.hash3_table().is_empty(),
+        "a disabled hash3 table takes no room"
+    );
+    assert!(t.hash_table().iter().all(|&v| v == 11));
+}
+
+/// Bytes an abandoned frame read but never committed were never indexed, so
+/// they do not move the next frame's floor: counting them spends the floor's
+/// headroom on nothing and brings the full table clear at its ceiling closer.
+#[test]
+fn an_abandoned_frames_uncommitted_bytes_do_not_advance_the_floor() {
+    let mut t = new_table(64);
+    t.push_test_chunk(vec![7u8; 32]);
+    let committed_end = t.history_abs_end();
+    t.fill_uncommitted(8, |buf| {
+        buf.extend_from_slice(b"abcdefgh");
+        (8, true)
+    });
+    let retired = t.retire();
+    assert_eq!(
+        retired.next_floor, committed_end,
+        "the floor moves past the committed input only"
+    );
+    assert!(t.uncommitted().is_empty());
 }
 
 #[test]

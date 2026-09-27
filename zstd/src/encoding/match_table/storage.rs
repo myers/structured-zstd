@@ -24,12 +24,13 @@ use super::super::cost_model::HC_OPT_NUM;
 use super::super::dict_attach::DictAttach;
 use super::super::hc::HC_MIN_MATCH_LEN;
 use super::super::opt::types::{HcOptimalSequence, MatchCandidate};
+use super::super::workspace::{HistoryBuf, Table, Workspace, region_bytes};
 use super::helpers::INCOMPRESSIBLE_SKIP_STEP;
 
 /// Lookahead bytes the BT walker / optimal parser will read past the
 /// per-position absolute cursor (`abs_pos + 9` for match-end sentinels,
 /// `abs_pos + HC_OPT_NUM` for the optimal-parser match-length cap, etc.).
-/// `MatchTable::add_data` rejects input that would advance
+/// `MatchTable::fill_uncommitted` rejects input that would advance
 /// `history_abs_end` past `usize::MAX - STREAM_ABS_HEADROOM`, which lets
 /// every downstream raw `abs_pos + N` arithmetic stay within `usize` on
 /// 32-bit targets without per-call saturating guards.
@@ -88,8 +89,8 @@ pub(crate) fn capacity_is_oversized(capacity: usize, wanted: usize) -> bool {
 /// with the still-resident `window_size`, must leave at least
 /// `STREAM_ABS_HEADROOM` slack below `usize::MAX`. Failing fast here
 /// lets every downstream `abs_pos + N` site stay raw and keeps i686
-/// streams correct. New match-finder backends with their own
-/// `add_data` path must route through this helper.
+/// streams correct. Every match-finder backend's `fill_uncommitted`
+/// must route through this helper.
 #[inline]
 pub(crate) fn check_stream_abs_headroom(
     history_abs_start: usize,
@@ -231,11 +232,11 @@ pub(crate) struct MatchTable {
     /// so the live region is never duplicated.
     pub(crate) chunk_lens: VecDeque<usize>,
     pub(crate) window_size: usize,
-    /// Bytes at the tail of `history` read but not yet claimed by a block
-    /// (in-place ingest). Zero on the staged path. Explicit rather than derived
-    /// from `window_size`, since a primed dictionary also lives in `history`.
+    /// Bytes at the tail of `history` read but not yet claimed by a block.
+    /// Explicit rather than derived from `window_size`, since a primed
+    /// dictionary also lives in `history`.
     pub(crate) uncommitted_len: usize,
-    pub(crate) history: Vec<u8>,
+    pub(crate) history: HistoryBuf,
     pub(crate) history_start: usize,
     pub(crate) history_abs_start: usize,
     pub(crate) position_base: usize,
@@ -248,7 +249,8 @@ pub(crate) struct MatchTable {
     /// allocation per compressor instead of three keeps the allocator seeing a
     /// single size class, which is what decides whether the tables keep their
     /// pages between frames rather than being handed back and faulted in again.
-    pub(crate) tables: Vec<u32>,
+    /// In the context's workspace when a context drives the matcher.
+    pub(crate) tables: Table<u32>,
     /// Start of the chain table inside [`Self::tables`] (== hash table length).
     pub(crate) chain_off: usize,
     /// Start of the hash3 table inside [`Self::tables`]; equals the buffer
@@ -320,6 +322,10 @@ pub(crate) struct MatchTable {
     /// cached value instead of re-detecting in the hot path. Mirrors the
     /// `kernel` field the Fast / Row / Dfast matchers already cache.
     pub(crate) kernel: crate::encoding::fastpath::FastpathKernel,
+    /// Set by [`Self::retire_history`] ahead of a layout and taken by the next
+    /// [`Self::reset`], which would otherwise read the floor off a history
+    /// already cut down to what it keeps.
+    pub(crate) retired: Option<crate::encoding::workspace::RetiredHistory>,
 }
 
 // Manual `Clone` (not derived) so the per-frame dictionary-snapshot restore can
@@ -362,6 +368,7 @@ impl Clone for MatchTable {
             borrowed_input: self.borrowed_input,
             borrowed_block: self.borrowed_block,
             kernel: self.kernel,
+            retired: self.retired,
         }
     }
 
@@ -404,6 +411,7 @@ impl Clone for MatchTable {
         self.borrowed_input = source.borrowed_input;
         self.borrowed_block = source.borrowed_block;
         self.kernel = source.kernel;
+        self.retired = source.retired;
     }
 }
 
@@ -509,13 +517,13 @@ impl MatchTable {
             chunk_lens: VecDeque::new(),
             window_size: 0,
             uncommitted_len: 0,
-            history: Vec::new(),
+            history: HistoryBuf::new(),
             history_start: 0,
             history_abs_start: 0,
             position_base: 0,
             index_shift: 0,
             offset_hist: [1, 4, 8],
-            tables: Vec::new(),
+            tables: Table::empty(),
             chain_off: 0,
             hash3_off: 0,
             hash_log: HC_HASH_LOG,
@@ -536,6 +544,7 @@ impl MatchTable {
             borrowed_input: None,
             borrowed_block: None,
             kernel: crate::encoding::fastpath::select_kernel(),
+            retired: None,
         }
     }
 
@@ -706,6 +715,36 @@ impl MatchTable {
     /// reaches via `get_unchecked`, so a stale-width table after a
     /// level change would index out of bounds (UB) on the next encode.
     pub(crate) fn ensure_tables(&mut self) {
+        let (hash_size, chain_size, total) = self.table_sizes();
+        // The three regions share one buffer, so a width change on any of them
+        // re-lays out all three. That costs the same fill the separate vectors
+        // paid for the region that changed, and saves two allocations.
+        if self.chain_off != hash_size || self.hash3_off != hash_size + chain_size {
+            // A buffer of the right length is refilled in place; a matcher no
+            // context laid out (driven on its own) allocates one at the exact
+            // size.
+            if self.tables.len() == total {
+                self.tables.fill(HC_EMPTY);
+            } else {
+                self.tables = Table::owned(alloc::vec![HC_EMPTY; total]);
+            }
+            self.chain_off = hash_size;
+            self.hash3_off = hash_size + chain_size;
+        } else if self.tables.len() != total {
+            // Only the hash3 tail changed width: the hash and chain regions
+            // keep their entries, the tail is empty at the new width.
+            // Only the hash and chain regions are carried over; old hash3
+            // entries were hashed at the old width.
+            let mut resized = Vec::with_capacity(total);
+            resized.extend_from_slice(&self.tables[..self.hash3_off]);
+            resized.resize(total, HC_EMPTY);
+            self.tables = Table::owned(resized);
+        }
+    }
+
+    /// The hash and chain region lengths and the buffer length at the current
+    /// widths; the hash3 region, when enabled, takes the rest.
+    fn table_sizes(&self) -> (usize, usize, usize) {
         let hash_size = 1 << self.hash_log;
         let chain_size = 1 << self.chain_log;
         let hash3_size = if self.hash3_log == 0 {
@@ -713,42 +752,24 @@ impl MatchTable {
         } else {
             1 << self.hash3_log
         };
-        let total = hash_size + chain_size + hash3_size;
-        // The three regions share one buffer, so a width change on any of them
-        // re-lays out all three. That costs the same fill the separate vectors
-        // paid for the region that changed, and saves two allocations.
-        if self.chain_off != hash_size || self.hash3_off != hash_size + chain_size {
-            // Two shapes want opposite things here, so the buffer it already
-            // has decides which one this is.
-            //
-            // A matcher taken FRESH per frame has none, and then the fresh
-            // `vec![HC_EMPTY; total]` is what matters: the sentinel is zero, so
-            // the allocator is asked for zeroed memory and a large request comes
-            // back as pages the kernel has not had to write and this frame does
-            // not touch until it indexes them. Resizing writes every element
-            // instead, which for that shape meant faulting and zeroing the whole
-            // table every frame — at level 22 on eight mebibytes, 40% of the
-            // encode in `memset` and half of it in the kernel.
-            //
-            // A REUSED one alternating between layouts — levels 16 and 18 on the
-            // same compressor — has a buffer that fits, and taking a fresh one
-            // there is an allocate and free per frame. Refilling it instead, on
-            // forty frames of a mebibyte, ran 267/265/231 ms against 253/239/219
-            // and halved the page faults, 23,640 to 11,263, for 1.8 M more
-            // instructions. The oversize test keeps the release a level-down
-            // from the tree finder needs.
-            if self.tables.capacity() >= total
-                && !capacity_is_oversized(self.tables.capacity(), total)
-            {
-                self.tables.clear();
-                self.tables.resize(total, HC_EMPTY);
-            } else {
-                self.tables = alloc::vec![HC_EMPTY; total];
-            }
+        (hash_size, chain_size, hash_size + chain_size + hash3_size)
+    }
+
+    /// Workspace bytes the hash, chain and hash3 tables take at the current
+    /// widths.
+    pub(crate) fn tables_workspace_bytes(&self) -> usize {
+        region_bytes::<u32>(self.table_sizes().2)
+    }
+
+    /// Lays the hash, chain and hash3 tables out in the open `workspace`.
+    /// Tables that continue the previous frame's keep their contents for the
+    /// floor-advance reset; otherwise they start empty with their seams set,
+    /// so the first block does not lay them out again.
+    pub(crate) fn bind_tables(&mut self, workspace: &mut Workspace) {
+        let (hash_size, chain_size, total) = self.table_sizes();
+        if !self.tables.bind(workspace, total, HC_EMPTY) {
             self.chain_off = hash_size;
             self.hash3_off = hash_size + chain_size;
-        } else if self.tables.len() != total {
-            self.tables.resize(total, HC_EMPTY);
         }
     }
 
@@ -1037,61 +1058,24 @@ impl MatchTable {
         );
     }
 
-    /// Append a freshly committed buffer to the rolling window. Drops
-    /// chunk-length entries for the oldest slices until the new total
-    /// fits inside `max_window_size`, extends the contiguous `history`
-    /// mirror with the new bytes, then hands the *input* buffer back
-    /// through `reuse_space` for pool reuse — `history` now owns the
-    /// bytes, so the input buffer carries no live data. (Callers must
-    /// therefore treat the callback as recycle-only, not as an eviction
-    /// report; eviction bytes come from the `window_size` delta.)
-    /// Pre-size the contiguous `history` mirror to `expected_bytes` (capped to
-    /// the window eviction bound) so the per-block `add_data`
-    /// `extend_from_slice` growth does not overshoot through `Vec` capacity
-    /// doubling. Upstream zstd allocates its window buffer at `windowSize + blockSize`
-    /// exactly; left to `Vec` doubling, a ~1 MiB history lands in a 2 MiB
-    /// allocation — wasted peak that dominates once the match-finder tables are
-    /// dictionary-tier-small. Correctness-neutral: the mirror still grows on
-    /// demand if `expected_bytes` underestimates. Only worth calling when the
-    /// total is known (source-size hinted); an unhinted stream keeps doubling.
     /// Heap bytes this table owns: history, the hash / hash3 / chain tables,
     /// the chunk-length deque, and any attached immutable dictionary tables.
     pub(crate) fn heap_size(&self) -> usize {
         let u32_sz = core::mem::size_of::<u32>();
         let usize_sz = core::mem::size_of::<usize>();
         self.chunk_lens.capacity() * usize_sz
-            + self.history.capacity()
-            // One buffer for the hash, chain and hash3 regions together.
-            + (self.tables.capacity())
-                * u32_sz
+            // The history and one buffer for the hash, chain and hash3 regions
+            // together, each counted here only when it is not in a context's
+            // workspace.
+            + self.history.owned_bytes()
+            + self.tables.owned_bytes()
             + self.dms.table().map_or(0, |t| {
                 (t.hash_table.capacity() + t.chain_table.capacity()) * u32_sz
             })
     }
 
-    pub(crate) fn reserve_history(&mut self, expected_bytes: usize) {
-        // Eviction keeps the live mirror within `max_window_size`; the dead
-        // prefix is drained at a quarter window (see `compact_history`) and one
-        // pending block can sit on top, so the steady-state ceiling is
-        // `max_window_size + max_window_size/4 + MAX_BLOCK_SIZE` — matching the
-        // `add_data` eviction reserve so the two never fight over capacity.
-        // Plain arithmetic (not `saturating_*`): `max_window_size = 1 <<
-        // window_log` with `window_log <= ZSTD_WINDOWLOG_MAX` (31), so the sum
-        // is at most `2^31 + 2^29 + 2^17 < usize::MAX` even on 32-bit targets —
-        // overflow is unreachable, and a silent saturation here would only mask
-        // a window_log bound violation upstream.
-        let cap = self.max_window_size
-            + (self.max_window_size >> 2)
-            + crate::common::MAX_BLOCK_SIZE as usize;
-        let want = expected_bytes.min(cap);
-        if want > self.history.capacity() {
-            self.history.reserve_exact(want - self.history.len());
-        }
-    }
-
-    /// Phase 1 of in-place ingest: `fill` writes the next block STRAIGHT into
-    /// the tail of `history`, instead of a scratch `Vec` that [`Self::add_data`]
-    /// then copies in. Room for `capacity` more bytes is reserved first.
+    /// Phase 1 of ingest: `fill` writes the next block STRAIGHT into the tail
+    /// of `history`. Room for `capacity` more bytes is reserved first.
     ///
     /// The bytes are readable through [`Self::uncommitted`] but are not part of
     /// the window until [`Self::commit_block`] claims them — the block boundary
@@ -1101,7 +1085,7 @@ impl MatchTable {
     pub(crate) fn fill_uncommitted(
         &mut self,
         capacity: usize,
-        fill: impl FnOnce(&mut Vec<u8>) -> (usize, bool),
+        fill: impl FnOnce(&mut HistoryBuf) -> (usize, bool),
     ) -> (usize, bool) {
         // Count the bytes already carried, not just this top-up: `capacity` is
         // `block_capacity - carried` (and zero on the EOF re-inspection), yet
@@ -1130,31 +1114,12 @@ impl MatchTable {
         (appended, eof)
     }
 
-    /// Size `history` for a whole frame in one allocation instead of letting
-    /// the per-block `reserve` walk a doubling chain. Clamped to the eviction
-    /// ceiling, which is the largest the buffer ever grows anyway.
-    pub(crate) fn reserve_for_frame(&mut self, bytes: usize) {
-        let ceiling = self.max_window_size
-            + (self.max_window_size >> 2)
-            + crate::common::MAX_BLOCK_SIZE as usize;
-        // `bytes` already carries the caller's block-sized slack, sized off the
-        // active block capacity — adding the format maximum here would reserve
-        // ~128 KiB for a frame whose window (and therefore block) is 1 KiB.
-        // Counted on top of what the buffer already holds: a dictionary is
-        // primed into it before this runs, so sizing to the frame alone would
-        // leave the dictionary's bytes to be grown into afterwards.
-        let target = self.history.len().saturating_add(bytes).min(ceiling);
-        if self.history.capacity() < target {
-            self.history.reserve_exact(target - self.history.len());
-        }
-    }
-
     /// Bytes read but not yet claimed by a block.
     pub(crate) fn uncommitted(&self) -> &[u8] {
         &self.history[self.history.len() - self.uncommitted_len..]
     }
 
-    /// Phase 2 of in-place ingest: claim `len` bytes from the head of
+    /// Phase 2 of ingest: claim `len` bytes from the head of
     /// [`Self::uncommitted`] as the next block.
     pub(crate) fn commit_block(&mut self, len: usize) {
         if len == 0 {
@@ -1170,9 +1135,12 @@ impl MatchTable {
             self.uncommitted().len(),
         );
         if self.window_size + len > self.max_window_size {
-            // Same one-time ceiling as `add_data`, applied at the same point in
-            // the sequence: once eviction starts, grow the mirror linearly to
-            // (window + window/4 + one block) instead of doubling.
+            // Cap the history mirror near the live window once eviction starts:
+            // reserve exactly (window + window/4 + one block) so it grows
+            // linearly to that ceiling instead of doubling to ~2x window;
+            // `compact_history`'s quarter-window drain keeps the length under
+            // it, so it never moves again. Small frames that never fill the
+            // window keep their tight data-sized buffer.
             let target = self.max_window_size
                 + (self.max_window_size >> 2)
                 + crate::common::MAX_BLOCK_SIZE as usize;
@@ -1186,9 +1154,8 @@ impl MatchTable {
             self.history_start += removed_len;
             self.history_abs_start += removed_len;
         }
-        // Same position in the sequence as `add_data`: compact AFTER the
-        // eviction that raised `history_start`, so the drain trigger sees the
-        // same state and the buffer evolves identically.
+        // Compact AFTER the eviction that raised `history_start`, so the drain
+        // trigger sees the dead prefix this block's eviction created.
         self.compact_history();
         self.next_to_update3 = self.next_to_update3.max(self.history_abs_start);
         self.window_size += len;
@@ -1196,39 +1163,16 @@ impl MatchTable {
         self.uncommitted_len -= len;
     }
 
-    pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
-        assert!(data.len() <= self.max_window_size);
-        check_stream_abs_headroom(self.history_abs_start, self.window_size, data.len());
-        if self.window_size + data.len() > self.max_window_size {
-            // Cap the history mirror near the live window once eviction starts:
-            // reserve exactly (window + window/4 + one block) so the Vec grows
-            // linearly to that ceiling instead of power-of-two doubling to ~2x
-            // window; `compact_history`'s quarter-window drain keeps len under
-            // it, so the Vec never reallocates again. Small frames that never
-            // fill the window keep their tight data-sized buffer.
-            let target = self.max_window_size
-                + (self.max_window_size >> 2)
-                + crate::common::MAX_BLOCK_SIZE as usize;
-            if target > self.history.len() && self.history.capacity() < target {
-                self.history.reserve_exact(target - self.history.len());
-            }
-        }
-        while self.window_size + data.len() > self.max_window_size {
-            let removed_len = self.chunk_lens.pop_front().unwrap();
-            self.window_size -= removed_len;
-            self.history_start += removed_len;
-            self.history_abs_start += removed_len;
-        }
-        self.compact_history();
-        let added = data.len();
-        self.history.extend_from_slice(&data);
-        self.next_to_update3 = self.next_to_update3.max(self.history_abs_start);
-        self.window_size += added;
-        self.chunk_lens.push_back(added);
-        // The input buffer's bytes now live in `history`; hand the buffer
-        // straight back to the caller's pool instead of holding a second
-        // copy in the window (the source of the per-compress duplicate).
-        reuse_space(data);
+    /// Read `input` in and commit it as one block, the way the driver does
+    /// in two calls.
+    #[cfg(test)]
+    pub(crate) fn commit_input(&mut self, input: impl AsRef<[u8]>) {
+        let input = input.as_ref();
+        self.fill_uncommitted(input.len(), |history| {
+            history.extend_from_slice(input);
+            (input.len(), false)
+        });
+        self.commit_block(input.len());
     }
 
     /// Drop window slices that have rolled past `max_window_size`.
@@ -1251,15 +1195,15 @@ impl MatchTable {
             return;
         }
         // Drain the dead prefix at a quarter window (paired with the eviction
-        // reserve in `add_data`) so the mirror stays near `window + window/4`
-        // rather than doubling to ~2x window on long streams.
-        // Compare against the COMMITTED length: with in-place ingest
-        // `history.len()` also counts bytes no block has claimed yet, which
-        // would push this trigger later than on the staged path.
+        // reserve in `commit_block`) so the mirror stays near `window +
+        // window/4` rather than doubling to ~2x window on long streams.
+        // Compare against the COMMITTED length: `history.len()` also counts
+        // bytes no block has claimed yet, which would delay the trigger by
+        // however much input happens to be read ahead.
         if self.history_start >= (self.max_window_size >> 2)
             || self.history_start * 2 >= self.history.len() - self.uncommitted_len
         {
-            self.history.drain(..self.history_start);
+            self.history.drain_front(self.history_start);
             self.history_start = 0;
         }
     }
@@ -1284,9 +1228,9 @@ impl MatchTable {
             // `end <= total` in bounds.
             return unsafe { core::slice::from_raw_parts(ptr, end) };
         }
-        // Stop at the committed end, not at `history.len()`: in-place ingest
-        // may have already read the next block's bytes into the tail, and a
-        // scan must not see past the block it is compressing.
+        // Stop at the committed end, not at `history.len()`: the next block's
+        // bytes may already be read into the tail, and a scan must not see
+        // past the block it is compressing.
         &self.history[self.history_start..self.history.len() - self.uncommitted_len]
     }
 
@@ -1314,8 +1258,8 @@ impl MatchTable {
 
     /// Register the borrowed input window. Zeroes `history_abs_start` so
     /// borrowed positions are absolute input offsets (the owned floor-advance
-    /// reset leaves it non-zero across frames; borrowed never `add_data`s, so
-    /// it stays 0 for the frame). Every probed candidate is byte-verified, so
+    /// reset leaves it non-zero across frames; a borrowed frame commits
+    /// nothing, so it stays 0 for the frame). Every probed candidate is byte-verified, so
     /// stale table entries from a prior frame are rejected (or, if their bytes
     /// coincidentally match, are genuine in-window matches).
     ///
@@ -1346,12 +1290,13 @@ impl MatchTable {
     }
 
     /// `(current_abs_start, current_len)` for the active scan. Borrowed: the
-    /// staged block range. Owned: the last committed chunk in the live window.
+    /// staged block range. Owned: the last committed chunk in the live window,
+    /// or an empty range at the window's end when none has been committed.
     pub(crate) fn current_block_range(&self) -> (usize, usize) {
         if let Some((start, end)) = self.borrowed_block {
             (start, end - start)
         } else {
-            let current_len = *self.chunk_lens.back().unwrap();
+            let current_len = self.chunk_lens.back().copied().unwrap_or(0);
             (
                 self.history_abs_start + self.window_size - current_len,
                 current_len,
@@ -1359,10 +1304,8 @@ impl MatchTable {
         }
     }
 
-    /// Test-only: append a chunk to the live window without eviction /
-    /// compaction, mirroring the storage side of [`add_data`]. Replaces
-    /// the old `window.push_back(vec)` setup now that chunk bytes live
-    /// only in `history`.
+    /// Test-only: append a chunk to the live window without eviction or
+    /// compaction.
     #[cfg(test)]
     pub(crate) fn push_test_chunk(&mut self, data: Vec<u8>) {
         self.history.extend_from_slice(&data);
@@ -1536,15 +1479,23 @@ impl MatchTable {
     /// [`REBASE_RESET_FLOOR_CEILING`], the original full zeroing runs and
     /// the floor rewinds to `0`, bounding the absolute cursor so
     /// [`check_stream_abs_headroom`] stays satisfiable on 32-bit targets.
-    /// The window is just `chunk_lens` (the bytes live in `history`,
-    /// cleared below), so there are no per-block buffers to drain;
-    /// `_reuse_space` is retained only for caller signature compatibility
-    /// and is intentionally unused.
-    pub(crate) fn reset(&mut self, _reuse_space: impl FnMut(Vec<u8>)) {
-        // Bytes an abandoned frame ingested but never claimed are not part of
-        // the next frame. Drop them FIRST: every tail-relative bound below
-        // (and `history_abs_end`) subtracts this count from the buffer length,
-        // so leaving it set underflows once the history is cleared.
+    /// Settles, ahead of the next frame's layout, what [`Self::reset`] keeps of
+    /// the history, and drops the rest, so the layout sizes the room for and
+    /// carries over only that. Once per frame; the reset takes the result.
+    pub(crate) fn retire_history(&mut self) {
+        if self.retired.is_none() {
+            self.retired = Some(self.retire());
+        }
+    }
+
+    fn retire(&mut self) -> crate::encoding::workspace::RetiredHistory {
+        // Bytes an abandoned frame ingested but never claimed were never
+        // indexed and are not part of the next frame. Cut them off the buffer
+        // before the count goes: every tail-relative bound below (and
+        // `history_abs_end`) subtracts the count from the buffer length, so
+        // zeroing it alone would count them as committed and move the floor.
+        let committed = self.history.len() - self.uncommitted_len;
+        self.history.truncate(committed);
         self.uncommitted_len = 0;
         // Snapshot the previous frame's one-past-the-end absolute
         // position before clearing the history that `history_abs_end`
@@ -1562,20 +1513,29 @@ impl MatchTable {
         // it whenever `search_mls` changes (a level switch). So a primed dms is
         // always one built with the CURRENT `search_mls`; the reborrow can never
         // reuse a dms whose tables were built under a stale mls.
-        let reborrow_region =
-            if self.dictionary_active && self.dms.is_primed() && self.history_start == 0 {
-                // `checked_sub`, not `-`: after the dict chunk is evicted,
-                // `compact_history` can reset `history_start` to 0 while
-                // `history_abs_start` has already advanced PAST
-                // `dictionary_limit_abs`. The plain subtraction would underflow
-                // (panic under overflow checks) before the `r > 0` filter rejects
-                // the stale region; `checked_sub` -> `None` lets the filter run.
-                self.dictionary_limit_abs
-                    .and_then(|limit| limit.checked_sub(self.history_abs_start))
-                    .filter(|&r| r > 0 && r <= self.history.len())
-            } else {
-                None
-            };
+        let kept = if self.dictionary_active && self.dms.is_primed() && self.history_start == 0 {
+            // `checked_sub`, not `-`: after the dict chunk is evicted,
+            // `compact_history` can reset `history_start` to 0 while
+            // `history_abs_start` has already advanced PAST
+            // `dictionary_limit_abs`. The plain subtraction would underflow
+            // (panic under overflow checks) before the `r > 0` filter rejects
+            // the stale region; `checked_sub` -> `None` lets the filter run.
+            self.dictionary_limit_abs
+                .and_then(|limit| limit.checked_sub(self.history_abs_start))
+                .filter(|&r| r > 0 && r <= self.history.len())
+        } else {
+            None
+        };
+        // Keep `[0, region)` (the dict); drop the previous frame's input.
+        self.history.truncate(kept.unwrap_or(0));
+        crate::encoding::workspace::RetiredHistory { next_floor, kept }
+    }
+
+    pub(crate) fn reset(&mut self) {
+        let crate::encoding::workspace::RetiredHistory {
+            next_floor,
+            kept: reborrow_region,
+        } = self.retired.take().unwrap_or_else(|| self.retire());
         self.window_size = 0;
         self.offset_hist = [1, 4, 8];
         self.skip_insert_until_abs = 0;

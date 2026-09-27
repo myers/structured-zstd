@@ -8,56 +8,13 @@ use crate::{
         frame_compressor::CompressState,
         incompressible::{
             block_looks_incompressible, block_looks_incompressible_strict,
-            compression_level_allows_raw_fast_path,
+            compression_level_allows_raw_fast_path, raw_skip_worth_asking,
         },
         match_generator::MatchGeneratorDriver,
         strategy::StrategyTag,
     },
 };
 use alloc::vec::Vec;
-
-/// Where this block's bytes live before the matcher takes ownership of them.
-///
-/// The owned block loop used to always stage a block in a scratch `Vec` that
-/// the matcher then copied into its history. Backends implementing
-/// [`Matcher::fill_in_place`] instead
-/// read straight into that history, so the bytes are already in place and only
-/// need claiming — [`BlockInput::InPlace`] carries just the length.
-pub(crate) enum BlockInput {
-    /// Bytes staged in a caller-owned buffer, handed to the matcher on commit.
-    Staged(Vec<u8>),
-    /// Bytes already at the head of the matcher's uncommitted region; the
-    /// payload is the block length.
-    InPlace(usize),
-}
-
-impl BlockInput {
-    fn len(&self) -> usize {
-        match self {
-            BlockInput::Staged(v) => v.len(),
-            BlockInput::InPlace(n) => *n,
-        }
-    }
-
-    /// Borrow the block's bytes before they are committed. Shared borrow of
-    /// `matcher` for the in-place case, so this composes with the other
-    /// read-only matcher queries the classification below performs.
-    fn bytes<'a, M: Matcher>(&'a self, matcher: &'a M) -> &'a [u8] {
-        match self {
-            BlockInput::Staged(v) => v,
-            BlockInput::InPlace(n) => &matcher.uncommitted_input()[..*n],
-        }
-    }
-
-    /// Hand the block to the matcher: move the staged buffer in, or claim the
-    /// already-resident bytes.
-    fn commit<M: Matcher>(self, matcher: &mut M) {
-        match self {
-            BlockInput::Staged(v) => matcher.commit_space(v),
-            BlockInput::InPlace(n) => matcher.commit_filled(n),
-        }
-    }
-}
 
 /// Compresses a single block using the shared compressed-block pipeline.
 ///
@@ -70,10 +27,9 @@ impl BlockInput {
 ///   the start of this block
 /// - `last_block`: Whether or not this block is going to be the last block in the frame
 ///   (needed because this info is written into the block header)
-/// - `uncompressed_data`: A block's worth of uncompressed data, either staged
-///   in a caller-owned buffer or already sitting in the matcher's history (see
-///   [`BlockInput`])
-/// - `output`: As `uncompressed_data` is compressed, it's appended to `output`.
+/// - `block_len`: The block is the first `block_len` bytes of the matcher's
+///   [`uncommitted_input`](Matcher::uncommitted_input); it is committed here
+/// - `output`: As the block is compressed, it's appended to `output`.
 // Mirrors the per-block sidecar plumbing of its borrowed sibling
 // (`compress_block_encoded_borrowed`): the lsm decompressed-size and
 // optional XXH64 checksum out-params push the arg count past the lint's
@@ -85,7 +41,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     state: &mut CompressState<M>,
     compression_level: CompressionLevel,
     last_block: bool,
-    uncompressed_data: BlockInput,
+    block_len: usize,
     output: &mut Vec<u8>,
     // Whether a dictionary is primed for this frame. A high-entropy block is
     // not necessarily incompressible when one is, so the raw-skip below raises
@@ -99,11 +55,11 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     #[cfg(feature = "lsm")] block_decompressed_sizes: Option<&mut Vec<u32>>,
     #[cfg(all(feature = "lsm", feature = "hash"))] block_checksums: Option<&mut Vec<u32>>,
 ) -> BlockType {
-    let block_size = uncompressed_data.len() as u32;
+    let block_size = block_len as u32;
     // Classify the block while the bytes are still uncommitted. Every query
-    // here is read-only, so the `InPlace` borrow of the matcher's history
-    // coexists with the `window_size()` / `block_samples_match_dict()` probes.
-    let bytes = uncompressed_data.bytes(&state.matcher);
+    // here is read-only, so the borrow of the matcher's history coexists with
+    // the `window_size()` probe.
+    let bytes = &state.matcher.uncommitted_input()[..block_len];
     let rle_byte_opt = bytes
         .first()
         .copied()
@@ -135,9 +91,15 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     // on where no block may go out raw, and recording there would take its
     // tables and hash a run of every block for an answer no one asks for.
     let raw_skip_reachable = compression_level_allows_raw_fast_path(compression_level, window_size);
+    let classifier_asked = raw_skip_worth_asking(
+        state.literal_compression_disabled,
+        state.workspace.on_fresh_pages(),
+        block_len,
+    );
     let looks_incompressible = rle_byte_opt.is_none()
         && !dict_rejects_raw
         && raw_skip_reachable
+        && classifier_asked
         && should_emit_raw_fast_path(compression_level, bytes);
     let repeats_earlier_content = if looks_incompressible {
         state
@@ -153,12 +115,19 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         // duplicates it is itself one repeated byte, and such a block is
         // answered as RLE above without ever asking the grid. Recording it is a
         // key every `RECORD_STEP` bytes for a question nobody puts.
-        if raw_skip_reachable && rle_byte_opt.is_none() {
+        //
+        // Nor is a frame's last block recorded: nothing reads the grid after
+        // it, so the keys would be hashed for nobody.
+        if raw_skip_reachable && (rle_byte_opt.is_some() || last_block) {
+            state.seen_content.skip_recording(bytes.len());
+        } else if raw_skip_reachable && !classifier_asked {
+            state
+                .seen_content
+                .record_unclassified(bytes, window_size as usize);
+        } else if raw_skip_reachable {
             state
                 .seen_content
                 .record_searched(bytes, window_size as usize);
-        } else if raw_skip_reachable {
-            state.seen_content.skip_recording(bytes.len());
         }
         false
     };
@@ -188,7 +157,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         if let Some(sink) = block_checksums {
             sink.push(precomputed_checksum.expect("checksum is hashed whenever a sink exists"));
         }
-        uncompressed_data.commit(&mut state.matcher);
+        state.matcher.commit_filled(block_len);
         state.matcher.skip_matching_with_hint(Some(false));
         let header = BlockHeader {
             last_block,
@@ -208,7 +177,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         if let Some(sink) = block_checksums {
             sink.push(precomputed_checksum.expect("checksum is hashed whenever a sink exists"));
         }
-        uncompressed_data.commit(&mut state.matcher);
+        state.matcher.commit_filled(block_len);
         state.matcher.skip_matching_with_hint(Some(true));
         let header = BlockHeader {
             last_block,
@@ -220,7 +189,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         BlockType::Raw
     } else {
         // Compress as a standard compressed block
-        uncompressed_data.commit(&mut state.matcher);
+        state.matcher.commit_filled(block_len);
         if post_split {
             // This helper may emit multiple physical blocks (compressed or raw)
             // into `output`; the decompressed-size and (if requested) checksum
@@ -352,7 +321,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
 /// Borrowed one-shot variant of [`compress_block_encoded`] for the Fast
 /// (Simple) backend: the block bytes live at `[block_start, block_end)`
 /// of the matcher's registered borrowed window (`set_borrowed_window`),
-/// so there is no owned block `Vec` to `commit_space`. Instead the range
+/// so nothing is committed into the history. Instead the range
 /// is staged via `set_borrowed_block`, which routes the subsequent
 /// `start_matching` / `skip_matching_with_hint` to the borrowed scan.
 ///
@@ -400,9 +369,15 @@ pub(crate) fn compress_block_encoded_borrowed(
     // As on the owned path: where no block may go out raw, the grid has nothing
     // to answer and is left alone.
     let raw_skip_reachable = compression_level_allows_raw_fast_path(compression_level, window_size);
+    let classifier_asked = raw_skip_worth_asking(
+        state.literal_compression_disabled,
+        state.workspace.on_fresh_pages(),
+        block.len(),
+    );
     let looks_incompressible = !is_rle
         && !dict_rejects_raw
         && raw_skip_reachable
+        && classifier_asked
         && should_emit_raw_fast_path(compression_level, block);
     let repeats_earlier_content = if looks_incompressible {
         state
@@ -410,14 +385,19 @@ pub(crate) fn compress_block_encoded_borrowed(
             .record_and_report_repeat(block, window_size as usize)
     } else {
         // As on the owned path: a searched block is recorded, not merely
-        // stepped over — except a block of one repeated byte, which nothing
-        // will ever ask the grid about.
-        if raw_skip_reachable && !is_rle {
+        // stepped over, except a block of one repeated byte, which nothing
+        // will ever ask the grid about, and a frame's last block, which
+        // nothing reads the grid after.
+        if raw_skip_reachable && (is_rle || last_block) {
+            state.seen_content.skip_recording(block.len());
+        } else if raw_skip_reachable && !classifier_asked {
+            state
+                .seen_content
+                .record_unclassified(block, window_size as usize);
+        } else if raw_skip_reachable {
             state
                 .seen_content
                 .record_searched(block, window_size as usize);
-        } else if raw_skip_reachable {
-            state.seen_content.skip_recording(block.len());
         }
         false
     };
@@ -462,7 +442,7 @@ pub(crate) fn compress_block_encoded_borrowed(
         BlockType::Raw
     } else {
         // Stage the borrowed range so `compress_block`'s internal
-        // `start_matching` scans it in place (no `commit_space` copy).
+        // `start_matching` scans it in place (no copy into the history).
         state.matcher.set_borrowed_block(block_start, block_end);
         // No post-split branch here: the optimal levels (16-22), the only
         // strategies that post-split, are NOT borrowed-eligible

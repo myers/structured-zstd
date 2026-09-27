@@ -1,7 +1,6 @@
 //! Utilities and interfaces for encoding an entire frame. Allows reusing resources
 
 use alloc::vec::Vec;
-use core::convert::TryInto;
 #[cfg(feature = "hash")]
 use twox_hash::XxHash64;
 
@@ -11,6 +10,7 @@ use core::hash::Hasher;
 use super::{
     CompressionLevel, LiteralCompressionMode, Matcher, block_header::BlockHeader,
     frame_header::FrameHeader, levels::*, match_generator::MatchGeneratorDriver,
+    workspace::IngestBuffer,
 };
 use crate::common::MAX_BLOCK_SIZE;
 use crate::fse::fse_encoder::{FSETable, default_ll_table, default_ml_table, default_of_table};
@@ -1361,6 +1361,10 @@ pub(crate) struct CompressState<M: Matcher> {
     pub(crate) huff_weights: crate::huff0::huff0_encoder::WeightScratch,
     pub(crate) fse_tables: FseTables,
     pub(crate) block_scratch: crate::encoding::blocks::CompressedBlockScratch,
+    /// The one allocation the match finder's tables and the per-block buffers
+    /// are carved from, laid out at each frame start by
+    /// [`Self::reset_for_frame`] and [`Self::finish_layout`].
+    pub(crate) workspace: crate::encoding::workspace::Workspace,
     /// Offset history for repeat offset encoding: [rep0, rep1, rep2].
     /// Initialized to [1, 4, 8] per RFC 8878 §3.1.2.5.
     pub(crate) offset_hist: [u32; 3],
@@ -1424,15 +1428,64 @@ pub(crate) fn huf_search_enabled(
 }
 
 impl<M: Matcher> CompressState<M> {
-    /// Clears `last_huff_table`, parking the table's buffers in
-    /// `huff_table_spare` for reuse instead of dropping them.
-    #[inline]
+    /// Resets the matcher for the next frame at `level` and lets it lay its
+    /// tables and history out in the workspace, reserving room behind them for
+    /// the block buffers of blocks up to `block_target` bytes (capped by the
+    /// frame's window). `ingest` is how the frame's input reaches the matcher,
+    /// which sizes its history. [`Self::finish_layout`] completes the layout.
+    pub(crate) fn reset_for_frame(
+        &mut self,
+        level: CompressionLevel,
+        block_target: usize,
+        ingest: crate::encoding::workspace::IngestPlan,
+    ) {
+        // A raw frame builds no compressed block, so it reserves no buffers
+        // for one.
+        let trailing_for = if ingest == crate::encoding::workspace::IngestPlan::Raw {
+            crate::encoding::workspace::no_trailing
+        } else {
+            crate::encoding::blocks::CompressedBlockScratch::workspace_bytes
+        };
+        self.workspace
+            .begin_layout(block_target, trailing_for, ingest);
+        self.matcher.reset_in_workspace(level, &mut self.workspace);
+    }
+
+    /// Carves the block buffers for blocks of up to `block_capacity` bytes, or
+    /// of the frame's length when that is exact and shorter, opening the layout
+    /// first when the matcher took no tables from it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `block_capacity` exceeds what the layout reserved for, which
+    /// would mean the frame and the matcher disagree on the window.
+    pub(crate) fn finish_layout(&mut self, block_capacity: usize) {
+        if !self.workspace.is_open() {
+            self.workspace.open(0, block_capacity);
+        }
+        let reserved = self.workspace.block_capacity();
+        // A frame of exact length never carries a block longer than itself, and
+        // the layout reserved for no more.
+        let largest = block_capacity.min(self.workspace.ingest().exact_len().unwrap_or(usize::MAX));
+        assert!(
+            largest <= reserved,
+            "a {largest}-byte block exceeds the {reserved} bytes the workspace reserved"
+        );
+        if self.workspace.ingest() == crate::encoding::workspace::IngestPlan::Raw {
+            self.block_scratch.unbind();
+        } else {
+            self.block_scratch.bind(&mut self.workspace, reserved);
+        }
+        // Everything is laid out in the current allocation by now.
+        self.workspace.release_retired();
+    }
+
     /// Heap bytes the compressor keeps between blocks and frames beyond the
     /// match finder: the FSE tables both slots of each axis hold, the rollback
     /// slot the emit paths copy a Huffman table into before a block that may not
-    /// be kept, and the block scratch with everything it holds — its literal and
-    /// sequence buffers, the splitter's workspace, and the nested estimator
-    /// scratch.
+    /// be kept, the block scratch with everything it holds (the splitter's
+    /// workspace and the nested estimator scratch), and the context workspace
+    /// the literal and sequence buffers are carved from.
     ///
     /// All of it survives a frame, so a caller sizing a context has to see it.
     pub(crate) fn retained_scratch_heap_size(&self) -> usize {
@@ -1442,8 +1495,12 @@ impl<M: Matcher> CompressState<M> {
                 .as_ref()
                 .map_or(0, |table| table.heap_size())
             + self.block_scratch.retained_heap_size()
+            + self.workspace.heap_bytes()
     }
 
+    /// Clears `last_huff_table`, parking the table's buffers in
+    /// `huff_table_spare` for reuse instead of dropping them.
+    #[inline]
     pub(crate) fn clear_huff_table(&mut self) {
         if let Some(table) = self.last_huff_table.take() {
             self.park_huff_table(table);
@@ -1536,19 +1593,33 @@ fn initial_all_blocks_cap(initial_size_hint: Option<u64>, block_capacity: usize)
 /// append with one `extend_from_slice` — the generic reader impl must
 /// `resize` an initialized target region before `Read::read` can fill it,
 /// which costs a zero-fill memset of the whole block on every frame.
+///
+/// `buf` is the matcher's history on the in-place path and a staging `Vec`
+/// otherwise.
 pub(crate) trait OwnedBlockSource {
-    fn fill_block(
+    fn fill_block<B: IngestBuffer>(
         &mut self,
-        buf: &mut Vec<u8>,
+        buf: &mut B,
         block_capacity: usize,
         size_hint_remaining: Option<u64>,
     ) -> (usize, bool);
+
+    /// Bytes left, when the source knows them exactly. The matcher reserves
+    /// room for a read before it is made, so a read held to this asks for no
+    /// room past the end of the input.
+    fn exact_remaining(&self) -> Option<usize> {
+        None
+    }
 }
 
 impl OwnedBlockSource for &[u8] {
-    fn fill_block(
+    fn exact_remaining(&self) -> Option<usize> {
+        Some(self.len())
+    }
+
+    fn fill_block<B: IngestBuffer>(
         &mut self,
-        buf: &mut Vec<u8>,
+        buf: &mut B,
         block_capacity: usize,
         _size_hint_remaining: Option<u64>,
     ) -> (usize, bool) {
@@ -1593,9 +1664,9 @@ impl<Rd> ReaderBlockSource<Rd> {
 }
 
 impl<Rd: Read> OwnedBlockSource for ReaderBlockSource<Rd> {
-    fn fill_block(
+    fn fill_block<B: IngestBuffer>(
         &mut self,
-        buf: &mut Vec<u8>,
+        buf: &mut B,
         block_capacity: usize,
         size_hint_remaining: Option<u64>,
     ) -> (usize, bool) {
@@ -1698,6 +1769,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 seen_content: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
+                workspace: crate::encoding::workspace::Workspace::new(),
                 offset_hist: [1, 4, 8],
                 strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
                     compression_level,
@@ -1832,8 +1904,16 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             }
             // Dictionary frames: only the Simple (Fast) backend in attach mode
             // has a borrowed (no input copy) dict scan. Copy-mode dict frames
-            // and the other backends still take the owned path.
-            return self.state.matcher.borrowed_dict_supported();
+            // and the other backends still take the owned path. The reset laid
+            // the history out on a prediction of this, which must hold, or the
+            // history is either unused or outgrown.
+            let attached = self.state.matcher.borrowed_dict_supported();
+            debug_assert_eq!(
+                attached,
+                self.state.matcher.frame_scans_in_place(),
+                "the reset's in-place prediction disagrees with the primed dictionary mode",
+            );
+            return attached;
         }
         // The borrowed (no-copy, in-place over-window) scan exists for the
         // Simple (Fast), Dfast, and Row backends, and for the HashChain
@@ -1841,8 +1921,9 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         // the owned path. Every borrowed scan applies the per-position
         // `window_low = abs_ip - advertised_window` offset cap so over-window
         // inputs are matched in place (no input->history copy), matching C's
-        // continuous-index + windowLow one-shot behaviour.
-        self.state.matcher.borrowed_supported()
+        // continuous-index + windowLow one-shot behaviour. The reset decided
+        // it, and laid the history out to match.
+        self.state.matcher.frame_scans_in_place()
     }
 
     /// Compress `input` as one frame's worth of blocks into `out` (appended
@@ -1921,7 +2002,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         // previous call may have left behind (a wrong hint would change the
         // resolved window/header and could flip borrowed eligibility).
         self.source_size_hint = Some(input.len() as u64);
-        let prep = self.prepare_frame();
+        let prep = self.prepare_frame(crate::encoding::workspace::IngestPlan::Slice(input.len()));
         // Content size is known up front (one-shot), so write the frame
         // header FIRST and emit blocks STRAIGHT into `out` — no separate
         // `all_blocks` accumulator and no header+blocks copy (which was the
@@ -1981,8 +2062,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// Borrowed one-shot block loop: walks `input` in `MAX_BLOCK_SIZE`
     /// strides (the Fast backend never pre-splits, so boundaries match the
     /// owned loop), scanning each block range in place against the
-    /// borrowed window via `compress_block_encoded_borrowed` — no
-    /// per-block `commit_space` copy. Returns `(all_blocks,
+    /// borrowed window via `compress_block_encoded_borrowed`, with no
+    /// per-block copy into the history. Returns `(all_blocks,
     /// total_uncompressed)`. Caller guarantees Fast backend + no
     /// dictionary; over-window inputs are fine (matches are bounded by
     /// `window_low` exactly as the owned evicting path).
@@ -2019,24 +2100,28 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         unsafe {
             self.state.matcher.set_borrowed_window(input);
         }
+        // Fixed for the whole frame, so resolved before the loop takes the
+        // state.
+        let block_capacity = self.block_capacity();
+        let pre_split = self.pre_split_level();
+        let dict_active =
+            self.dictionary.is_some() && self.state.matcher.supports_dictionary_priming();
         // Panic-safety: clear the borrowed `(ptr, len)` on EVERY exit,
         // including an unwind from an `assert!` inside the block loop, so
         // a caught-and-reused compressor never retains a dangling window.
         // (The next frame's `reset()` also clears it before any read, but
-        // this guard makes the invariant local and unwind-proof.)
-        struct ClearBorrowedOnDrop(*mut MatchGeneratorDriver);
-        impl Drop for ClearBorrowedOnDrop {
+        // this guard makes the invariant local and unwind-proof.) The guard
+        // holds the state's `&mut` and the loop reaches the state through it:
+        // a raw pointer kept beside the loop's own `&mut self.state` would be
+        // invalidated by it (Stacked Borrows), making the drop's access
+        // undefined.
+        struct ClearBorrowedOnDrop<'a>(&'a mut CompressState<MatchGeneratorDriver>);
+        impl Drop for ClearBorrowedOnDrop<'_> {
             fn drop(&mut self) {
-                // SAFETY: at drop (normal return or unwind) the loop's
-                // borrows of the matcher have ended, so this is the only
-                // access. `addr_of_mut!` produced this pointer without an
-                // intermediate `&mut`, so the interleaved `&mut` uses in
-                // the loop did not invalidate it.
-                unsafe { (*self.0).clear_borrowed_window() };
+                self.0.matcher.clear_borrowed_window();
             }
         }
-        let _clear_guard = ClearBorrowedOnDrop(core::ptr::addr_of_mut!(self.state.matcher));
-        let block_capacity = self.block_capacity();
+        let guard = ClearBorrowedOnDrop(&mut self.state);
         let mut start = 0usize;
         while start < input.len() {
             reserve_for_next_block(
@@ -2062,7 +2147,6 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             // splitter actually runs) — so non-pre-split levels, the first
             // block, and the trailing partial block pay nothing. See
             // `warm_presplit_window`.
-            let pre_split = self.pre_split_level();
             if savings >= 3
                 && input.len() - start >= MAX_BLOCK_SIZE as usize
                 && block_capacity >= MAX_BLOCK_SIZE as usize
@@ -2084,10 +2168,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             if self.content_checksum {
                 self.hasher.write(block);
             }
-            let dict_active =
-                self.dictionary.is_some() && self.state.matcher.supports_dictionary_priming();
             crate::encoding::levels::compress_block_encoded_borrowed(
-                &mut self.state,
+                &mut *guard.0,
                 self.compression_level,
                 last_block,
                 block,
@@ -2102,7 +2184,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             );
             start = end;
         }
-        // `_clear_guard` drops here, clearing the borrowed window.
+        // `guard` drops here, clearing the borrowed window.
+        drop(guard);
         total_uncompressed
     }
 }
@@ -2125,6 +2208,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 seen_content: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
+                workspace: crate::encoding::workspace::Workspace::new(),
                 offset_hist: [1, 4, 8],
                 strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
                     compression_level,
@@ -2363,7 +2447,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // `prepare_frame` / `finish_frame` are shared with the borrowed
         // one-shot path, so both run the same reset / dict-prime /
         // entropy-seed setup and frame tail.
-        let prep = self.prepare_frame();
+        let prep = self.prepare_frame(crate::encoding::workspace::IngestPlan::Stream);
         // Take the reader out so `run_owned_block_loop` can borrow it
         // mutably alongside `&mut self` (the rest of the loop touches
         // `self.state` / `self.hasher`, disjoint from the reader). Restored
@@ -2399,7 +2483,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.finish_frame(all_blocks, total_uncompressed, &prep);
     }
 
-    fn prepare_frame(&mut self) -> FramePrep {
+    /// Resets the compressor for the next frame, whose input reaches the
+    /// match finder as `ingest` says.
+    fn prepare_frame(&mut self, ingest: crate::encoding::workspace::IngestPlan) -> FramePrep {
         // The raw-skip's memory of what this frame has already emitted. Frames
         // are independent, so carrying it over would let one frame's content
         // hold the skip off for the next; the allocation is kept.
@@ -2440,7 +2526,20 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             self.state.matcher.set_dictionary_size_hint(dict.sizes());
         }
         // Clearing buffers to allow re-using of the compressor
-        self.state.matcher.reset(self.compression_level);
+        let block_target = self
+            .target_block_size
+            .map_or(crate::common::MAX_BLOCK_SIZE as usize, |t| t as usize);
+        // Raw frames emit straight from the staged buffer and never consult
+        // the match finder, so they keep no history.
+        let ingest = if matches!(self.compression_level, CompressionLevel::Uncompressed) {
+            crate::encoding::workspace::IngestPlan::Raw
+        } else {
+            ingest
+        };
+        self.state
+            .reset_for_frame(self.compression_level, block_target, ingest);
+        let block_capacity = self.block_capacity();
+        self.state.finish_layout(block_capacity);
         self.state.offset_hist = [1, 4, 8];
         // Sync `state.strategy_tag` to the level resolved at this reset so
         // the literal-compression gates (`min_literals_to_compress` /
@@ -2601,6 +2700,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         hint_is_exact: bool,
         out: &mut Vec<u8>,
     ) -> u64 {
+        if matches!(self.compression_level, CompressionLevel::Uncompressed) {
+            return self.run_raw_block_loop(source, initial_size_hint, out);
+        }
         // Compressed blocks are appended to `out` from its current end. The
         // streaming drain path passes a fresh buffer (the frame header is
         // written to the drain afterward, since Frame_Content_Size is only
@@ -2610,144 +2712,38 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // output deltas, so a header prefix never skews it.
         let blocks_start = out.len();
         let mut total_uncompressed: u64 = 0;
-        let mut pending_input: Vec<u8> = Vec::new();
         let mut reached_eof = false;
         let mut savings = 0i64;
-        // One allocation for the whole frame's ingest buffer, instead of a
-        // doubling chain of reallocations as the blocks arrive. A fresh
-        // compressor starts with an empty buffer, so without this every frame
-        // climbs the ladder again and hands the pages back at the end of it:
-        // measured at level 3 over a 1 MB frame, three growth steps per frame
-        // and about 2.4 MB of pages faulted back in each time, against none for
-        // a reference that sizes its workspace once.
-        //
-        // An inexact hint is sized on too. The worry it would otherwise raise —
-        // that a wild overestimate reserves memory the reader never fills — is
-        // already answered twice over: the same hint has by this point sized
-        // the window and the match-finder tables (it reaches the matcher
-        // through `set_source_size_hint`, and the level parameters cap the
-        // window by it), and `reserve_for_frame` clamps to the eviction ceiling
-        // the buffer would reach anyway. So the reservation is proportionate to
-        // allocations the hint has already caused, not a new class of waste.
-        // The slack is one block, so the final top-up (which asks for a whole
-        // block even when only a tail remains) does not reallocate; sized off
-        // the ACTIVE block capacity, since a small window shrinks the block
-        // below the format maximum.
-        // Raw frames are excluded: they emit straight from the staged buffer
-        // and never consult the match finder (the `in_place` gate below keeps
-        // them off it whatever the backend supports), so sizing its history for
-        // them holds a window's worth of memory the frame has no use for.
-        if let Some(hint) = initial_size_hint
-            && !matches!(self.compression_level, CompressionLevel::Uncompressed)
-        {
-            // `saturating_add`: a caller may pledge `u64::MAX`, and clamping a
-            // reservation request at the address-space limit is the meaningful
-            // answer — the matcher caps it at its eviction ceiling anyway.
-            let mut target =
-                (hint.min(usize::MAX as u64) as usize).saturating_add(self.block_capacity());
-            if !hint_is_exact {
-                // An advisory number is a claim about data that has not arrived,
-                // so it is trusted only as far as the frame's own configuration
-                // makes plausible: the window this LEVEL would choose, never an
-                // overridden one. Overriding the window is itself a claim about
-                // the data — one only the data can confirm — and taking it here
-                // let a caller who promised gibibytes and delivered ten bytes
-                // reserve two of them. Beyond this bound the buffer grows as it
-                // did before, which costs a few reallocations on frames already
-                // large enough for that to be noise.
-                let level_window = crate::encoding::levels::config::resolve_level_params(
-                    self.compression_level,
-                    initial_size_hint,
-                )
-                .window_log;
-                let plausible = (1usize << level_window).saturating_add(self.block_capacity());
-                target = target.min(plausible);
-            }
-            self.state.matcher.reserve_for_frame(target);
-        }
-        // Compress block by block
+        // The matcher's history was laid out for the whole frame when the
+        // context was (`frame_history_bytes`), so the blocks read into it below
+        // never reallocate it.
+        let block_capacity = self.block_capacity();
         loop {
-            // Read up to one upstream zstd block. When the pre-block splitter keeps a
-            // suffix, top it back up before compressing the next block, matching
-            // ZSTD_compress_frameChunk() over a contiguous input buffer.
-            let block_capacity = self.block_capacity();
-            // Always draw the block buffer from the matcher's recycled pool
-            // (its capacity already covers the block size, so the resize below
-            // stays in-place). Any carried pre-split suffix is copied in, and
-            // `pending_input` is retained as a reusable carry buffer. The prior
-            // approach `split_off`'d a fresh suffix Vec per pre-split and
-            // `reserve_exact`-grew it to `block_capacity` every block; on a
-            // heavily pre-split frame that churned one block-sized allocation
-            // per split (~12 MB over ~90 splits on a 1 MiB corpus input).
-            // Remaining-bytes expectation for the reader source's sizing
-            // (`None` = unknown, or an inexact hint already met by prior
-            // blocks). The slice source appends directly and ignores it.
-            let size_hint_remaining = match initial_size_hint {
-                Some(hint) if hint > total_uncompressed => Some(hint - total_uncompressed),
-                _ => None,
-            };
-            // Preferred shape: read straight into the matcher's history, so
-            // neither this block nor a pre-split remainder is ever copied. The
-            // leftover from the previous iteration is already sitting there as
-            // uncommitted bytes, which is why there is no `pending_input`
-            // top-up on this path.
-            // `Uncompressed` emits Raw blocks straight from the staged buffer,
-            // so it stays on the staged path whatever the matcher supports. The
-            // gate is on the LEVEL, not the backend: `fill_in_place` dispatches
-            // on the matcher, and an external `M: Matcher` that implements it
-            // would otherwise leave the payload sitting uncommitted while an
-            // empty Raw block goes out.
-            let in_place = if matches!(self.compression_level, CompressionLevel::Uncompressed) {
-                None
-            } else if reached_eof {
-                // Nothing left to read; the carried remainder is already in the
-                // matcher, so just re-inspect it.
-                self.state
-                    .matcher
-                    .fill_in_place(0, &mut |_buf| (0, true))
-                    .map(|_| 0usize)
-            } else {
-                let carried = self.state.matcher.uncommitted_input().len();
-                let want = block_capacity.saturating_sub(carried);
-                self.state
-                    .matcher
-                    .fill_in_place(want, &mut |buf| {
-                        source.fill_block(buf, buf.len() + want, size_hint_remaining)
-                    })
-                    .map(|(appended, eof)| {
-                        total_uncompressed += appended as u64;
-                        reached_eof = eof;
-                        appended
-                    })
-            };
-
-            let mut uncompressed_data;
-            if in_place.is_some() {
-                // Bytes live in the matcher; nothing staged here.
-                uncompressed_data = Vec::new();
-            } else {
-                uncompressed_data = self.state.matcher.get_next_space();
-                uncompressed_data.clear();
-                uncompressed_data.extend_from_slice(&pending_input);
-                pending_input.clear();
-                if !reached_eof {
-                    let (appended, eof) = source.fill_block(
-                        &mut uncompressed_data,
-                        block_capacity,
-                        size_hint_remaining,
-                    );
-                    total_uncompressed += appended as u64;
-                    reached_eof = eof;
-                }
+            // Top the matcher's uncommitted input back up to one block. Reading
+            // straight into its history means neither the block nor a pre-split
+            // remainder is ever copied: the remainder of the previous iteration
+            // is already there, uncommitted, and heads this block, as upstream's
+            // ZSTD_compress_frameChunk() runs over one contiguous input buffer.
+            if !reached_eof {
+                // Remaining-bytes expectation for the reader source's sizing
+                // (`None` = unknown, or an inexact hint already met by prior
+                // blocks). The slice source appends directly and ignores it.
+                let size_hint_remaining = match initial_size_hint {
+                    Some(hint) if hint > total_uncompressed => Some(hint - total_uncompressed),
+                    _ => None,
+                };
+                // A carried remainder is what a pre-split left of a full block,
+                // so it is shorter than one. Held to what an exact source has
+                // left: its history was laid out for its bytes and no more.
+                let want = (block_capacity - self.state.matcher.uncommitted_input().len())
+                    .min(source.exact_remaining().unwrap_or(usize::MAX));
+                let (appended, eof) = self.state.matcher.fill_in_place(want, &mut |buf| {
+                    source.fill_block(buf, buf.len() + want, size_hint_remaining)
+                });
+                total_uncompressed += appended as u64;
+                reached_eof = eof;
             }
-            // Unified view of this iteration's candidate bytes, whichever path
-            // produced them. Length only — the bytes themselves are read back
-            // through the matcher on the in-place path.
-            let available = if in_place.is_some() {
-                self.state.matcher.uncommitted_input().len()
-            } else {
-                uncompressed_data.len()
-            };
+            let available = self.state.matcher.uncommitted_input().len();
             let mut last_block = reached_eof;
             let remaining_for_split = if reached_eof {
                 available
@@ -2755,49 +2751,28 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 block_capacity
             };
             // Length this block will actually claim. The pre-split pass may
-            // shorten it; on the in-place path the remainder simply stays
-            // uncommitted in the matcher and heads the next block, so there is
-            // no suffix copy at all.
+            // shorten it; the remainder stays uncommitted and heads the next
+            // block.
             let mut block_len = available;
-            if !matches!(self.compression_level, CompressionLevel::Uncompressed)
-                && available == block_capacity
-            {
-                let split_at = {
-                    let bytes: &[u8] = if in_place.is_some() {
-                        self.state.matcher.uncommitted_input()
-                    } else {
-                        &uncompressed_data
-                    };
-                    optimal_block_size_with(
-                        self.pre_split_level(),
-                        bytes,
-                        remaining_for_split,
-                        block_capacity,
-                        savings,
-                    )
-                };
+            if available == block_capacity {
+                let split_at = optimal_block_size_with(
+                    self.pre_split_level(),
+                    self.state.matcher.uncommitted_input(),
+                    remaining_for_split,
+                    block_capacity,
+                    savings,
+                );
                 if split_at < available {
                     block_len = split_at;
                     last_block = false;
-                    if in_place.is_none() {
-                        // Staged path keeps its carry buffer: copy the kept
-                        // suffix out and truncate the block being compressed.
-                        pending_input.clear();
-                        pending_input.extend_from_slice(&uncompressed_data[block_len..]);
-                        uncompressed_data.truncate(block_len);
-                    }
                 }
             }
             // As we read, hash that data too (skipped when the content
             // checksum is disabled).
             #[cfg(feature = "hash")]
             if self.content_checksum {
-                if in_place.is_some() {
-                    let bytes = &self.state.matcher.uncommitted_input()[..block_len];
-                    self.hasher.write(bytes);
-                } else {
-                    self.hasher.write(&uncompressed_data);
-                }
+                self.hasher
+                    .write(&self.state.matcher.uncommitted_input()[..block_len]);
             }
             // Per-physical-block XXH64 (low 32 bits) for the optional
             // per-block checksum sidecar. Hashing happens INSIDE the
@@ -2811,14 +2786,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // size hint, ensure one block's worst case and let the doubling
             // growth policy amortize across blocks.
             // Bytes already emitted as blocks: everything read so far minus what
-            // this block will claim and minus whatever stays buffered for the
-            // next one (the staged carry, or the in-place uncommitted tail).
-            let buffered_after = if in_place.is_some() {
-                (available - block_len) as u64
-            } else {
-                pending_input.len() as u64
-            };
-            let emitted = total_uncompressed - block_len as u64 - buffered_after;
+            // is still uncommitted, this block included.
+            let emitted = total_uncompressed - available as u64;
             match initial_size_hint {
                 Some(hint) if hint >= total_uncompressed => {
                     // An advisory hint (streaming path) is only trusted up to
@@ -2862,73 +2831,79 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 break;
             }
 
-            match self.compression_level {
-                CompressionLevel::Uncompressed => {
-                    // Always the staged buffer here — the ingest above refuses
-                    // the in-place path for this level.
-                    let header = BlockHeader {
-                        last_block,
-                        block_type: crate::blocks::block::BlockType::Raw,
-                        block_size: uncompressed_data.len().try_into().unwrap(),
-                    };
-                    header.serialize(out);
-                    #[cfg(feature = "lsm")]
-                    self.block_decompressed_sizes
-                        .push(uncompressed_data.len() as u32);
-                    #[cfg(all(feature = "lsm", feature = "hash"))]
-                    if let Some(checksums) = self.block_checksums.as_mut() {
-                        checksums.push(xxh64_block_low32(&uncompressed_data));
-                    }
-                    out.extend_from_slice(&uncompressed_data);
-                    savings +=
-                        uncompressed_data.len() as i64 - (3 + uncompressed_data.len()) as i64;
-                }
-                CompressionLevel::Fastest
-                | CompressionLevel::Default
-                | CompressionLevel::Better
-                | CompressionLevel::Best
-                | CompressionLevel::Level(_) => {
-                    let before_len = out.len();
-                    // A primed dictionary makes "incompressible-looking"
-                    // blocks matchable against the dict, so the raw-fast-
-                    // path inside must be bypassed (it skips matching).
-                    // Mirror prepare_frame's `use_dictionary_state`: a dict
-                    // is only PRIMED (and thus matchable) when the matcher
-                    // supports priming — a non-priming matcher ignores an
-                    // attached dictionary, so the raw-fast-path must stay
-                    // enabled for it. (This arm is already non-Uncompressed.)
-                    let block_input = if in_place.is_some() {
-                        crate::encoding::levels::BlockInput::InPlace(block_len)
-                    } else {
-                        crate::encoding::levels::BlockInput::Staged(uncompressed_data)
-                    };
-                    let dict_active = self.dictionary.is_some()
-                        && self.state.matcher.supports_dictionary_priming();
-                    compress_block_encoded(
-                        &mut self.state,
-                        self.compression_level,
-                        last_block,
-                        block_input,
-                        out,
-                        dict_active,
-                        #[cfg(feature = "lsm")]
-                        Some(&mut self.block_decompressed_sizes),
-                        #[cfg(all(feature = "lsm", feature = "hash"))]
-                        self.block_checksums.as_mut(),
-                    );
-                    savings += block_len as i64 - (out.len() - before_len) as i64;
-                }
+            let before_len = out.len();
+            // A primed dictionary makes "incompressible-looking" blocks
+            // matchable against the dict, so the raw-fast-path inside must be
+            // bypassed (it skips matching). Mirror prepare_frame's
+            // `use_dictionary_state`: a dict is only PRIMED (and thus matchable)
+            // when the matcher supports priming; a non-priming matcher ignores
+            // an attached dictionary, so the raw-fast-path must stay enabled
+            // for it.
+            let dict_active =
+                self.dictionary.is_some() && self.state.matcher.supports_dictionary_priming();
+            compress_block_encoded(
+                &mut self.state,
+                self.compression_level,
+                last_block,
+                block_len,
+                out,
+                dict_active,
+                #[cfg(feature = "lsm")]
+                Some(&mut self.block_decompressed_sizes),
+                #[cfg(all(feature = "lsm", feature = "hash"))]
+                self.block_checksums.as_mut(),
+            );
+            savings += block_len as i64 - (out.len() - before_len) as i64;
+            // A block is last only when it took everything read, so nothing
+            // uncommitted is left behind it.
+            if last_block {
+                break;
             }
-            // The in-place path carries its remainder as uncommitted bytes in
-            // the matcher rather than in `pending_input`, so the staged
-            // emptiness test alone would exit while a split leftover still
-            // needs a block.
-            let carry_left = if in_place.is_some() {
-                available - block_len
-            } else {
-                pending_input.len()
+        }
+        total_uncompressed
+    }
+
+    /// Block loop of an uncompressed frame: each block is read straight into
+    /// `out` behind its header, which is filled in once the block's length is
+    /// known, so the payload is never staged and the match finder never sees
+    /// it.
+    fn run_raw_block_loop<S: OwnedBlockSource>(
+        &mut self,
+        source: &mut S,
+        initial_size_hint: Option<u64>,
+        out: &mut Vec<u8>,
+    ) -> u64 {
+        let block_capacity = self.block_capacity();
+        let mut total_uncompressed: u64 = 0;
+        loop {
+            let size_hint_remaining = match initial_size_hint {
+                Some(hint) if hint > total_uncompressed => Some(hint - total_uncompressed),
+                _ => None,
             };
-            if last_block && carry_left == 0 {
+            let header_at = out.len();
+            out.extend_from_slice(&[0; 3]);
+            let payload_at = out.len();
+            let (block_len, last_block) =
+                source.fill_block(out, payload_at + block_capacity, size_hint_remaining);
+            total_uncompressed += block_len as u64;
+            let header = BlockHeader {
+                last_block,
+                block_type: crate::blocks::block::BlockType::Raw,
+                // At most one block, which a block header's 21-bit size holds.
+                block_size: block_len as u32,
+            };
+            out[header_at..payload_at].copy_from_slice(&header.to_le_bytes());
+            #[cfg(feature = "hash")]
+            if self.content_checksum {
+                self.hasher.write(&out[payload_at..]);
+            }
+            #[cfg(feature = "lsm")]
+            self.block_decompressed_sizes.push(block_len as u32);
+            #[cfg(all(feature = "lsm", feature = "hash"))]
+            if let Some(checksums) = self.block_checksums.as_mut() {
+                checksums.push(xxh64_block_low32(&out[payload_at..]));
+            }
+            if last_block {
                 break;
             }
         }
@@ -3259,6 +3234,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// Before calling [FrameCompressor::compress] you can replace the matcher
     pub fn replace_matcher(&mut self, mut match_generator: M) -> M {
         core::mem::swap(&mut match_generator, &mut self.state.matcher);
+        // The outgoing matcher may hold tables and history in this
+        // compressor's workspace, which it must not outlive.
+        match_generator.leave_workspace();
         match_generator
     }
 

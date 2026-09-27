@@ -57,18 +57,21 @@ fn the_content_grid_reports_a_repeat_that_is_shifted() {
     );
 }
 
-/// A block carrying a copy of its own earlier content is answered where a run
-/// begins inside the copy, and missed where none does.
+/// A block carrying a copy of its own earlier content is answered wherever the
+/// copy begins, once it is longer than a run spacing and a run.
 ///
 /// Such a block reads as incompressible to every sample of it, and the copy is a
-/// block-sized match the search would have found, so the first half is what the
-/// midpoint run is for. The second half pins the bound at the placement two
-/// measurements chose (see `PROBE_RUNS_PER_BLOCK`): a change that starts
-/// answering it has changed the run placement and owes its own numbers.
+/// match the search would have found. Runs at fixed places (the start and the
+/// middle) missed a copy that began between them; runs every
+/// `PROBE_FRACTION` of the block bound what a copy has to be to hide, whatever
+/// its offset.
 #[test]
 fn the_content_grid_answers_a_block_that_copies_itself() {
     const BLOCK: usize = 128 * 1024;
     const WIDE: usize = 8 * 1024 * 1024;
+    let step = SeenContentGrid::RECORD_STEP;
+    let spacing = BLOCK / SeenContentGrid::PROBE_FRACTION;
+    let span = spacing + step + SeenContentGrid::KEY_LEN;
 
     let mut halves = deterministic_bytes(0xBEEF, BLOCK);
     halves.copy_within(0..BLOCK / 2, BLOCK / 2);
@@ -79,16 +82,31 @@ fn the_content_grid_answers_a_block_that_copies_itself() {
         "a block of two identical halves is half a block of match",
     );
 
-    // Away from both runs: the documented bound.
-    let mut offset = deterministic_bytes(0xBEEF, BLOCK);
-    let span = BLOCK - 76 * 1024;
-    offset.copy_within(8 * 1024..8 * 1024 + span, 76 * 1024);
+    // Copies of the guaranteed length at offsets that avoid every run start,
+    // including the one that sat between the old start and middle runs.
+    // Every offset leaves the original `[0, span)` intact.
+    for at in [span + 1, 76 * 1024, BLOCK - span - 777, BLOCK - span] {
+        let mut block = deterministic_bytes(0xBEEF, BLOCK);
+        block.copy_within(0..span, at);
+        let mut grid = SeenContentGrid::default();
+        grid.reset_for_frame();
+        assert!(
+            grid.record_and_report_repeat(&block, WIDE),
+            "a {span}-byte copy at {at} must be answered",
+        );
+    }
+
+    // A copy shorter than a spacing between two run starts can hide: the bound
+    // the spacing buys. A change that answers it has changed the run spacing
+    // and owes its cost on incompressible input.
+    let short = spacing / 2;
+    let mut block = deterministic_bytes(0xBEEF, BLOCK);
+    block.copy_within(0..short, spacing + step + 64);
     let mut grid = SeenContentGrid::default();
     grid.reset_for_frame();
     assert!(
-        !grid.record_and_report_repeat(&offset, WIDE),
-        "a copy away from both runs is now answered, so the placement changed \
-         and its cost on incompressible input has to be re-measured",
+        !grid.record_and_report_repeat(&block, WIDE),
+        "a copy between two runs is answered, so the spacing changed",
     );
 }
 
@@ -294,6 +312,113 @@ fn the_content_grid_answers_a_block_shorter_than_its_key() {
     }
 }
 
+/// The grid's placement and both of its full mixes spread keys over the slots
+/// and keep the tag independent of the slot.
+///
+/// A mix that correlates them fails in a way no single-key test sees: keys
+/// crowding into fewer slots evict each other's records, and a repeat whose
+/// record was evicted is missed outright. So the check is statistical, over the
+/// key shapes the grid is fed: overlapping eight-byte windows of noise and of
+/// structured text, and counters that differ only in their low bits. Every mix
+/// lays the slot in its high half and the tag in bits 16 to 23.
+#[test]
+fn the_grid_mixes_spread_slots_and_keep_the_tag_independent() {
+    const SLOT_BITS: u32 = 16;
+    let noise = deterministic_bytes(0x5EED, 96 * 1024);
+    let mut text = Vec::new();
+    let mut line = 0u32;
+    while text.len() < 96 * 1024 {
+        text.extend_from_slice(
+            alloc::format!("record {line}: value {}\n", line * 7 % 1000).as_bytes(),
+        );
+        line += 1;
+    }
+    let mut keys: Vec<u64> = Vec::new();
+    for source in [&noise, &text] {
+        keys.extend(
+            source
+                .windows(8)
+                .map(|w| u64::from_le_bytes(w.try_into().unwrap())),
+        );
+    }
+    keys.extend(0..64 * 1024u64);
+    keys.sort_unstable();
+    keys.dedup();
+
+    type Mix = fn(u64) -> u64;
+    // The full mixes are meant to look random, so a deviation either way is a
+    // defect. The placement is a multiplicative hash, which spreads counters
+    // more evenly than random — fewer empty slots and fewer shared tags than a
+    // random mix — so for it only crowding, a deviation upward, is one.
+    let mixes: [(&str, Mix, bool); 3] = [
+        ("placement", SeenContentGrid::placement, false),
+        ("wide", SeenContentGrid::avalanche_wide, true),
+        ("narrow", SeenContentGrid::avalanche_narrow, true),
+    ];
+    for (name, mix, random) in mixes {
+        let within = |ratio: f64| {
+            if random {
+                (0.85..1.15).contains(&ratio)
+            } else {
+                ratio < 1.15
+            }
+        };
+        let mut fields: Vec<(u32, u8)> = keys
+            .iter()
+            .map(|&key| {
+                let mixed = mix(key);
+                (
+                    ((mixed >> 32) as u32) & ((1 << SLOT_BITS) - 1),
+                    (mixed >> 16) as u8 | 1,
+                )
+            })
+            .collect();
+        fields.sort_unstable();
+
+        // Poisson occupancy: at a load of `lambda` keys per slot, a share
+        // `e^-lambda` of the slots stays empty.
+        let slots = 1usize << SLOT_BITS;
+        let lambda = keys.len() as f64 / slots as f64;
+        let mut used = 0usize;
+        let mut slot_pairs = 0usize;
+        let mut tag_pairs = 0usize;
+        let mut i = 0;
+        while i < fields.len() {
+            let slot = fields[i].0;
+            let mut j = i;
+            while j < fields.len() && fields[j].0 == slot {
+                j += 1;
+            }
+            used += 1;
+            let n = j - i;
+            slot_pairs += n * (n - 1) / 2;
+            let mut k = i;
+            while k < j {
+                let mut m = k;
+                while m < j && fields[m].1 == fields[k].1 {
+                    m += 1;
+                }
+                tag_pairs += (m - k) * (m - k - 1) / 2;
+                k = m;
+            }
+            i = j;
+        }
+        let empty = (slots - used) as f64;
+        let expected_empty = slots as f64 * (-lambda).exp();
+        assert!(
+            within(empty / expected_empty),
+            "{name}: {empty} empty slots against {expected_empty:.0} expected at load {lambda:.2}",
+        );
+        // The tag keeps seven free bits, so two keys sharing a slot share a tag
+        // one time in 128 when the two are independent.
+        let expected_tag_pairs = slot_pairs as f64 / 128.0;
+        assert!(
+            within(tag_pairs as f64 / expected_tag_pairs),
+            "{name}: {tag_pairs} same-slot pairs share a tag against {expected_tag_pairs:.0} expected",
+        );
+    }
+}
+
 fn deterministic_bytes(seed: u64, len: usize) -> Vec<u8> {
     let mut state = seed;
     let mut out = vec![0u8; len];
@@ -309,15 +434,15 @@ fn deterministic_bytes(seed: u64, len: usize) -> Vec<u8> {
 #[test]
 fn sample_metrics_do_not_count_first_u32_max_as_repeat() {
     let sample = [0xFF_u8; 4];
-    let mut counts = [0u32; 256];
-    let mut repeat_table = [u32::MAX; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
-    let mut repeat_occupied = [0_u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
+    let mut counts = [0u16; 256];
+    // Every slot holds `0xFFFFFFFF` before the scan, the value the first quad
+    // is, so only the occupancy bit keeps it from reading as a repeat.
+    let mut repeat_table = [MaybeUninit::new(u32::MAX); INCOMPRESSIBLE_REPEAT_TABLE_LEN];
+    let mut repeat_occupied = [0_u32; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
     let mut repeats = 0usize;
 
-    // Guard set high so the early-exit never fires: this exercises the
-    // repeat-table init, where `0xFFFFFFFF` matches the `u32::MAX`
-    // sentinel but the occupancy bit is still clear, so the first quad
-    // must NOT be counted as a repeat.
+    // Guard set high so the early-exit never fires, so the first quad is
+    // scanned in full and must NOT be counted as a repeat.
     let bailed = scan_sample_region(
         &sample,
         &mut counts,
@@ -336,9 +461,10 @@ fn scan_sample_region_early_exits_on_repetitive_input() {
     // 32 identical 4-byte quads: the repeat count climbs past any small
     // guard, exercising the early-exit `true` path directly.
     let sample = [0xAB_u8; 128];
-    let mut counts = [0u32; 256];
-    let mut repeat_table = [u32::MAX; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
-    let mut repeat_occupied = [0_u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
+    let mut counts = [0u16; 256];
+    let mut repeat_table =
+        [const { MaybeUninit::<u32>::uninit() }; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
+    let mut repeat_occupied = [0_u32; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
     let mut repeats = 0usize;
 
     // Guard of 1: the first quad seeds the table, the second is the first
@@ -355,6 +481,184 @@ fn scan_sample_region_early_exits_on_repetitive_input() {
 
     assert!(bailed, "repetitive input must trigger the early exit");
     assert!(repeats > 1, "repeat count must have exceeded the guard");
+}
+
+/// The classifier as it stood before its scan was narrowed to 32-bit words,
+/// sixteen-bit counts and an uncleared table, kept verbatim as the reference the
+/// rewrite must agree with.
+fn reference_sample_looks_incompressible(block: &[u8]) -> bool {
+    let sample_len = block.len().min(RAW_FAST_PATH_MAX_SAMPLE_LEN);
+    if sample_len < RAW_FAST_PATH_MIN_SAMPLE_LEN {
+        return false;
+    }
+    let mut regions: [&[u8]; 3] = [&[], &[], &[]];
+    let region_count = if sample_len == block.len() {
+        regions[0] = block;
+        1
+    } else {
+        let head_len = sample_len / 3;
+        let mid_len = sample_len / 3;
+        let tail_len = sample_len - head_len - mid_len;
+        let mid_start = (block.len() - mid_len) / 2;
+        regions[0] = &block[..head_len];
+        regions[1] = &block[mid_start..mid_start + mid_len];
+        regions[2] = &block[block.len() - tail_len..];
+        3
+    };
+    let max_symbol_guard = sample_len / INCOMPRESSIBLE_MAX_SYMBOL_DIVISOR;
+    let total_quads: usize = regions[..region_count].iter().map(|r| r.len() / 4).sum();
+    let repeat_guard = total_quads / INCOMPRESSIBLE_REPEAT_DIVISOR + 1;
+    let mut counts = [0u32; 256];
+    let mut repeat_table = [u32::MAX; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
+    let mut repeat_occupied = [0_u64; INCOMPRESSIBLE_REPEAT_TABLE_LEN / 64];
+    let mut repeats = 0usize;
+    for sample in &regions[..region_count] {
+        let mut idx = 0usize;
+        let len = sample.len();
+        while idx + 4 <= len {
+            counts[sample[idx] as usize] += 1;
+            counts[sample[idx + 1] as usize] += 1;
+            counts[sample[idx + 2] as usize] += 1;
+            counts[sample[idx + 3] as usize] += 1;
+            let quad = u32::from_le_bytes([
+                sample[idx],
+                sample[idx + 1],
+                sample[idx + 2],
+                sample[idx + 3],
+            ]);
+            let slot = (quad.wrapping_mul(INCOMPRESSIBLE_REPEAT_HASH_MULT) as usize)
+                >> (32 - INCOMPRESSIBLE_REPEAT_TABLE_BITS);
+            let word = slot / 64;
+            let bit = 1_u64 << (slot % 64);
+            let occupied = (repeat_occupied[word] & bit) != 0;
+            if occupied && repeat_table[slot] == quad {
+                repeats += 1;
+                if repeats > repeat_guard {
+                    return false;
+                }
+            } else {
+                repeat_table[slot] = quad;
+                repeat_occupied[word] |= bit;
+            }
+            idx += 4;
+        }
+        while idx < len {
+            counts[sample[idx] as usize] += 1;
+            idx += 1;
+        }
+    }
+    let distinct = counts.iter().filter(|&&count| count != 0).count();
+    let max_freq = counts.iter().copied().max().unwrap_or(0) as usize;
+    distinct >= INCOMPRESSIBLE_MIN_DISTINCT_BYTES
+        && max_freq <= max_symbol_guard
+        && repeats <= repeat_guard
+}
+
+/// The rewritten scan decides every block exactly as the one it replaced.
+///
+/// The verdict picks which blocks go out raw, so a scan that is faster but
+/// disagrees on even one shape changes compressed output. The corpus straddles
+/// every threshold the verdict reads: lengths around the sample cap, the
+/// three-region split and the quad remainder; alphabets around the
+/// distinct-byte floor; a skewed byte around the frequency ceiling; and repeat
+/// densities around the quad-repeat guard. Both outcomes have to occur, or the
+/// corpus is not testing the boundary.
+#[test]
+fn the_rewritten_scan_decides_every_block_as_before() {
+    let lengths = [
+        0,
+        RAW_FAST_PATH_MIN_SAMPLE_LEN - 1,
+        RAW_FAST_PATH_MIN_SAMPLE_LEN,
+        RAW_FAST_PATH_MIN_BLOCK_LEN - 1,
+        RAW_FAST_PATH_MIN_BLOCK_LEN,
+        1000,
+        1024,
+        1027,
+        RAW_FAST_PATH_MAX_SAMPLE_LEN - 1,
+        RAW_FAST_PATH_MAX_SAMPLE_LEN,
+        RAW_FAST_PATH_MAX_SAMPLE_LEN + 1,
+        RAW_FAST_PATH_MAX_SAMPLE_LEN + 3,
+        10 * 1024,
+        64 * 1024 + 5,
+        128 * 1024,
+    ];
+    let mut outcomes = [0usize; 2];
+    let mut seed = 0x1234_5678_9ABC_DEF1_u64;
+    for &len in &lengths {
+        for alphabet in [16usize, 180, 199, 200, 201, 230, 256] {
+            for skew_per_mille in [0usize, 30, 42, 45, 60] {
+                for repeat_per_mille in [0usize, 10, 15, 16, 20, 40, 200] {
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    let mut block = deterministic_bytes(seed | 1, len);
+                    for (i, byte) in block.iter_mut().enumerate() {
+                        let pick = (i as u64).wrapping_mul(seed | 1) >> 7;
+                        *byte = if (pick % 1000) < skew_per_mille as u64 {
+                            0x42
+                        } else {
+                            (*byte as usize % alphabet) as u8
+                        };
+                    }
+                    // Copy a quad from four bytes back at the chosen density,
+                    // which is what the repeat guard counts.
+                    let mut i = 8;
+                    while i + 4 <= block.len() {
+                        let pick = (i as u64).wrapping_mul(seed.rotate_left(17) | 1) >> 11;
+                        if (pick % 1000) < repeat_per_mille as u64 {
+                            block.copy_within(i - 8..i - 4, i);
+                        }
+                        i += 4;
+                    }
+                    let expected = reference_sample_looks_incompressible(&block);
+                    assert_eq!(
+                        sample_looks_incompressible(&block),
+                        expected,
+                        "len {len}, alphabet {alphabet}, skew {skew_per_mille}, repeats {repeat_per_mille}",
+                    );
+                    if len >= RAW_FAST_PATH_MIN_BLOCK_LEN {
+                        assert_eq!(block_looks_incompressible(&block), expected);
+                    }
+                    outcomes[usize::from(expected)] += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        outcomes[0] > 0 && outcomes[1] > 0,
+        "the corpus must reach both verdicts, got {outcomes:?}",
+    );
+}
+
+/// A frame that stores its literals raw searches its 2-24 KiB blocks instead of
+/// asking the classifier, where the search is the cheaper of the two; every
+/// other block, every block of a frame that codes its literals, and every block
+/// of a frame whose tables sit on freshly mapped pages still asks.
+#[test]
+fn only_small_blocks_of_raw_literal_frames_skip_the_classifier() {
+    for len in [2 * 1024, 10 * 1024, 24 * 1024] {
+        assert!(
+            !raw_skip_worth_asking(true, false, len),
+            "{len} bytes, raw literals"
+        );
+        assert!(
+            raw_skip_worth_asking(false, false, len),
+            "{len} bytes, coded literals"
+        );
+        assert!(
+            raw_skip_worth_asking(true, true, len),
+            "{len} bytes, fresh pages"
+        );
+    }
+    for len in [
+        RAW_FAST_PATH_MIN_BLOCK_LEN,
+        2 * 1024 - 1,
+        24 * 1024 + 1,
+        128 * 1024,
+    ] {
+        assert!(
+            raw_skip_worth_asking(true, false, len),
+            "{len} bytes, raw literals"
+        );
+    }
 }
 
 /// The window, not the level, is what closes the skip: a match that may reach
