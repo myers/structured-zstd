@@ -9,8 +9,43 @@
 //! per-call via the `USE_CMOV` const generic.
 
 use super::count::{count_forward, count_forward_dict_2segment};
-use super::hash_table::{FastHashTable, hash_ptr_raw};
+use super::hash_table::{FastHashTable, TAG_BITS, TAG_MASK, TAGGED_POSITION_LIMIT, hash_ptr_raw};
 use crate::encoding::Sequence;
+
+/// Bits a slot's position is shifted by: [`TAG_BITS`] in a tagged table.
+#[inline(always)]
+const fn tag_shift<const TAGGED: bool>() -> u32 {
+    if TAGGED { TAG_BITS } else { 0 }
+}
+
+/// Table index of a hash taken at `hash_log + tag_shift` bits.
+#[inline(always)]
+fn slot_index<const TAGGED: bool>(hash: u32) -> usize {
+    (hash >> tag_shift::<TAGGED>()) as usize
+}
+
+/// The word stored for `pos` under `hash`.
+#[inline(always)]
+fn slot_value<const TAGGED: bool>(pos: usize, hash: u32) -> u32 {
+    if TAGGED {
+        ((pos as u32) << TAG_BITS) | (hash & TAG_MASK)
+    } else {
+        pos as u32
+    }
+}
+
+/// Whether `entry` was stored under the same tag as `hash`; always in an
+/// untagged table.
+#[inline(always)]
+fn tag_matches<const TAGGED: bool>(entry: u32, hash: u32) -> bool {
+    !TAGGED || (entry ^ hash) & TAG_MASK == 0
+}
+
+/// The position a slot word names.
+#[inline(always)]
+fn slot_position<const TAGGED: bool>(entry: u32) -> u32 {
+    entry >> tag_shift::<TAGGED>()
+}
 
 /// Per-iteration diagnostic tracing of the Fast kernel inner loop.
 ///
@@ -123,18 +158,20 @@ pub(crate) const DICT_TAG_MASK: u32 = (1 << DICT_TAG_BITS) - 1;
 ///
 /// # Safety
 /// `ptr` must have the readable-bytes context `hash_ptr_raw::<MLS>` requires;
-/// `dict_hash_log + DICT_TAG_BITS <= 32` so the slot index stays in range.
+/// `dict_slots` is [`FastHashTable::dict_slots`] of a table of
+/// `dict_hash_log` bits, and `dict_hash_log + DICT_TAG_BITS <= 32` so the slot
+/// index stays in range.
 #[inline(always)]
 pub(crate) unsafe fn dict_lookup<const MLS: u32>(
-    dict_table: &FastHashTable,
+    dict_slots: &[u32],
     ptr: *const u8,
     dict_hash_log: u32,
 ) -> u32 {
     let hat = unsafe { hash_ptr_raw::<MLS>(ptr, dict_hash_log + DICT_TAG_BITS) };
-    // SAFETY: `hat >> DICT_TAG_BITS` < `1 << dict_hash_log` = table len. The dict
-    // table is never epoch-advanced (bias 0), so `get` returns the raw stored
-    // `(pos << TAG) | tag` word unchanged.
-    let stored = unsafe { dict_table.get(hat >> DICT_TAG_BITS) };
+    let index = (hat >> DICT_TAG_BITS) as usize;
+    debug_assert!(index < dict_slots.len());
+    // SAFETY: `index` < `1 << dict_hash_log` = the slot count.
+    let stored = unsafe { *dict_slots.get_unchecked(index) };
     if stored & DICT_TAG_MASK == hat & DICT_TAG_MASK {
         stored >> DICT_TAG_BITS
     } else {
@@ -184,12 +221,17 @@ const CMOV_DUMMY: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
 ///   in-range `match_idx` returned by the table is automatically
 ///   ≥ 4 bytes from the buffer end. See the comment block inside
 ///   the function body for the full derivation.
+///
+/// `tag_ok` is the short-cache tag check (always `true` on an untagged table):
+/// a candidate it rejects is treated as out of range, so its bytes are never
+/// loaded — the random window access the tag exists to skip.
 #[inline(always)]
 unsafe fn match_found<const USE_CMOV: bool>(
     ip: *const u8,
     base: *const u8,
     match_idx: u32,
     prefix_start_index: u32,
+    tag_ok: bool,
 ) -> bool {
     // Upstream zstd-parity hot-path: the ONLY filter on the branch variant is
     // `match_idx < prefix_start_index` (rejects stale entries below
@@ -241,7 +283,7 @@ unsafe fn match_found<const USE_CMOV: bool>(
         // SAFETY: both candidate addresses have ≥ 4 readable bytes
         // (CMOV_DUMMY is exactly 4 bytes; base+match_pos has ≥ 4
         // by the bounds check above).
-        let in_range = match_idx >= prefix_start_index;
+        let in_range = (match_idx >= prefix_start_index) & tag_ok;
         let mval_addr = if in_range {
             unsafe { base.add(match_pos) }
         } else {
@@ -262,7 +304,7 @@ unsafe fn match_found<const USE_CMOV: bool>(
         // strongly predictable — that's the typical Fast strategy
         // case where almost all hash table entries are within the
         // current window.
-        if match_idx < prefix_start_index {
+        if !tag_ok || match_idx < prefix_start_index {
             return false;
         }
         unsafe { read32(ip) == read32(base.add(match_pos)) }
@@ -402,8 +444,11 @@ pub(crate) struct PrefixBounds {
     pub window_low: u32,
 }
 
+///
+/// `TAGGED` selects the slot format of `hash_table` (see
+/// [`FastHashTable::is_tagged`]); the caller dispatches on it.
 #[inline(always)]
-pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
+pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool, const TAGGED: bool>(
     data: &[u8],
     block_start: usize,
     bounds: PrefixBounds,
@@ -482,6 +527,18 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
          u32 offset codes, so larger inputs would silently truncate",
         data.len(),
         u32::MAX,
+    );
+    assert_eq!(
+        TAGGED,
+        hash_table.is_tagged(),
+        "compress_block_fast called with a table in the other slot format",
+    );
+    // A tagged slot holds positions below `TAGGED_POSITION_LIMIT`, and every
+    // position stored is below `data.len()`.
+    assert!(
+        !TAGGED || data.len() <= TAGGED_POSITION_LIMIT,
+        "a tagged table cannot hold positions of a {}-byte window",
+        data.len(),
     );
 
     // Block too short to do any matching — report the whole block
@@ -572,6 +629,9 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
     // `FastHashTable::hot_state`). The table is fixed-size for the frame, so
     // the slice ptr stays valid for the whole loop.
     let (table, hlog) = hash_table.hot_state();
+    // A tagged table hashes `TAG_BITS` wider: the top `hlog` bits are the
+    // slot, the rest the tag.
+    let hlog = hlog + tag_shift::<TAGGED>();
     'restart: while ip0 < ilimit {
         // _start: setup. ip0 already positioned; derive ip1/ip2/ip3
         // from current step. If even ip3 is past ilimit, the loop
@@ -598,7 +658,8 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
         // contract.
         let mut hash0 = unsafe { hash_ptr_raw::<MLS>(base.add(ip0), hlog) };
         let mut hash1 = unsafe { hash_ptr_raw::<MLS>(base.add(ip1), hlog) };
-        let mut match_idx = unsafe { *table.get_unchecked(hash0 as usize) };
+        // The slot word probed for the current ip0, tagged or bare.
+        let mut match_idx = unsafe { *table.get_unchecked(slot_index::<TAGGED>(hash0)) };
         ktrace!(
             "OUTER ip0={} ip1={} ip2={} ip3={} step={} hash0={} hash1={} match_idx={} rep1={} rep2={}",
             ip0,
@@ -664,7 +725,10 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             // SAFETY: hash0 from hash_ptr ⇒ in-bounds; ip0 ≤ u32::MAX
             // by the entry-point cap.
             ktrace!("PUT hash0={} pos={} (iter-start)", hash0, ip0);
-            unsafe { *table.get_unchecked_mut(hash0 as usize) = ip0 as u32 };
+            unsafe {
+                *table.get_unchecked_mut(slot_index::<TAGGED>(hash0)) =
+                    slot_value::<TAGGED>(ip0, hash0)
+            };
 
             // Repcode-at-ip2 check. Bitwise `&` (not short-circuit `&&`)
             // so both operands evaluate unconditionally — the
@@ -711,7 +775,10 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 // match site), so its position won't conflict with
                 // the match's forward extension. Upstream zstd lines 286-287.
                 ktrace!("PUT hash1={} pos={} (rep-emit post)", hash1, ip1);
-                unsafe { *table.get_unchecked_mut(hash1 as usize) = ip1 as u32 };
+                unsafe {
+                    *table.get_unchecked_mut(slot_index::<TAGGED>(hash1)) =
+                        slot_value::<TAGGED>(ip1, hash1)
+                };
                 ktrace!(
                     "MATCH rep new_ip={} match0={} m_len={} offset={}",
                     new_ip,
@@ -731,22 +798,32 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
 
             // First explicit-match probe at ip0 (upstream zstd line 292).
             ktrace!("PROBE1 ip0={} match_idx={}", ip0, match_idx);
+            let match_pos = slot_position::<TAGGED>(match_idx);
             if unsafe {
-                match_found::<USE_CMOV>(base.add(ip0), base, match_idx, prefix_start_index)
+                match_found::<USE_CMOV>(
+                    base.add(ip0),
+                    base,
+                    match_pos,
+                    prefix_start_index,
+                    tag_matches::<TAGGED>(match_idx, hash0),
+                )
             } {
                 // Safe writeback for hash1 (ip1 = ip0 + 1, before
                 // search resumption). Upstream zstd line 296.
                 ktrace!("PUT hash1={} pos={} (explicit1 post)", hash1, ip1);
-                unsafe { *table.get_unchecked_mut(hash1 as usize) = ip1 as u32 };
+                unsafe {
+                    *table.get_unchecked_mut(slot_index::<TAGGED>(hash1)) =
+                        slot_value::<TAGGED>(ip1, hash1)
+                };
                 ktrace!(
                     "MATCH explicit1 ip0={} match_idx={} offset={}",
                     ip0,
-                    match_idx,
-                    ip0 as i64 - match_idx as i64
+                    match_pos,
+                    ip0 as i64 - match_pos as i64
                 );
                 break Some(MatchFound::Explicit {
                     new_ip: ip0,
-                    match_idx,
+                    match_idx: match_pos,
                     current0: ip0,
                 });
             }
@@ -756,7 +833,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             // the CURRENT ip2 (before the cursor shift below), which
             // becomes the new ip1 — so post-shift `hash1` matches
             // the new `ip1`, NOT the new `ip2`.
-            match_idx = unsafe { *table.get_unchecked(hash1 as usize) };
+            match_idx = unsafe { *table.get_unchecked(slot_index::<TAGGED>(hash1)) };
             hash0 = hash1;
             hash1 = unsafe { hash_ptr_raw::<MLS>(base.add(ip2), hlog) };
             ip0 = ip1;
@@ -765,30 +842,43 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
 
             // Writeback for new ip0. Upstream zstd lines 314-315.
             ktrace!("PUT hash0={} pos={} (post-shift1)", hash0, ip0);
-            unsafe { *table.get_unchecked_mut(hash0 as usize) = ip0 as u32 };
+            unsafe {
+                *table.get_unchecked_mut(slot_index::<TAGGED>(hash0)) =
+                    slot_value::<TAGGED>(ip0, hash0)
+            };
 
             // Second explicit-match probe at the shifted ip0
             // (upstream zstd line 317).
             ktrace!("PROBE2 ip0={} match_idx={}", ip0, match_idx);
+            let match_pos = slot_position::<TAGGED>(match_idx);
             if unsafe {
-                match_found::<USE_CMOV>(base.add(ip0), base, match_idx, prefix_start_index)
+                match_found::<USE_CMOV>(
+                    base.add(ip0),
+                    base,
+                    match_pos,
+                    prefix_start_index,
+                    tag_matches::<TAGGED>(match_idx, hash0),
+                )
             } {
                 // Conditional writeback: only safe if `step <= 4`
                 // (upstream zstd lines 319-324) — otherwise ip1 might fall
                 // past the match start when we resume scanning.
                 if step <= 4 {
                     ktrace!("PUT hash1={} pos={} (explicit2 post, step<=4)", hash1, ip1);
-                    unsafe { *table.get_unchecked_mut(hash1 as usize) = ip1 as u32 };
+                    unsafe {
+                        *table.get_unchecked_mut(slot_index::<TAGGED>(hash1)) =
+                            slot_value::<TAGGED>(ip1, hash1)
+                    };
                 }
                 ktrace!(
                     "MATCH explicit2 ip0={} match_idx={} offset={}",
                     ip0,
-                    match_idx,
-                    ip0 as i64 - match_idx as i64
+                    match_pos,
+                    ip0 as i64 - match_pos as i64
                 );
                 break Some(MatchFound::Explicit {
                     new_ip: ip0,
-                    match_idx,
+                    match_idx: match_pos,
                     current0: ip0,
                 });
             }
@@ -797,7 +887,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             // shift is the one that advances ip2/ip3 by `step`
             // rather than by 1; this is where the step-skip kicks
             // in. Upstream zstd lines 329-339.
-            match_idx = unsafe { *table.get_unchecked(hash1 as usize) };
+            match_idx = unsafe { *table.get_unchecked(slot_index::<TAGGED>(hash1)) };
             hash0 = hash1;
             hash1 = unsafe { hash_ptr_raw::<MLS>(base.add(ip2), hlog) };
             ip0 = ip1;
@@ -967,11 +1057,17 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 // `usize`, so the `+ 2` cannot wrap.
                 let current0_plus_2 = current0 + 2;
                 let h_fwd = unsafe { hash_ptr_raw::<MLS>(base.add(current0_plus_2), hlog) };
-                unsafe { *table.get_unchecked_mut(h_fwd as usize) = current0_plus_2 as u32 };
+                unsafe {
+                    *table.get_unchecked_mut(slot_index::<TAGGED>(h_fwd)) =
+                        slot_value::<TAGGED>(current0_plus_2, h_fwd)
+                };
             }
             if ip0 >= 2 {
                 let h_back = unsafe { hash_ptr_raw::<MLS>(base.add(ip0 - 2), hlog) };
-                unsafe { *table.get_unchecked_mut(h_back as usize) = (ip0 - 2) as u32 };
+                unsafe {
+                    *table.get_unchecked_mut(slot_index::<TAGGED>(h_back)) =
+                        slot_value::<TAGGED>(ip0 - 2, h_back)
+                };
             }
 
             // Repcode-2 inner loop. Upstream zstd swaps rep1 / rep2 on each
@@ -999,7 +1095,10 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
 
                 // Hash refill at ip0 (upstream zstd line 415).
                 let h_at = unsafe { hash_ptr_raw::<MLS>(base.add(ip0), hlog) };
-                unsafe { *table.get_unchecked_mut(h_at as usize) = ip0 as u32 };
+                unsafe {
+                    *table.get_unchecked_mut(slot_index::<TAGGED>(h_at)) =
+                        slot_value::<TAGGED>(ip0, h_at)
+                };
 
                 // Emit a lit_len=0 rep1 sequence: this branch runs with
                 // `anchor == ip0`, set by the emit before it.
@@ -1164,6 +1263,7 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
     // so the bias is applied inline (`saturating_sub` on read, `+ bias` on write)
     // exactly as `FastHashTable::get`/`put` do — byte-identical, reload-free.
     let (main_tbl, main_hlog, main_bias) = main_table.hot_state_biased();
+    let dict_slots = dict_table.dict_slots();
 
     // Inner-loop result: literals end (where the match copy begins), the raw
     // match offset, the match length, and the upstream zstd `curr` (probe position,
@@ -1180,7 +1280,7 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
         let mut hash0 = unsafe { hash_ptr_raw::<MLS>(base.add(ip0), main_hlog) };
         let mut main_idx =
             unsafe { (*main_tbl.get_unchecked(hash0 as usize)).saturating_sub(main_bias) };
-        let mut dict_idx = unsafe { dict_lookup::<MLS>(dict_table, base.add(ip0), dict_hash_log) };
+        let mut dict_idx = unsafe { dict_lookup::<MLS>(dict_slots, base.add(ip0), dict_hash_log) };
         let mut curr = ip0;
 
         // No-match step accelerator (upstream zstd `zstd_fast.c:552-554`):
@@ -1264,8 +1364,9 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
             }
 
             // Main match (recent input) — upstream zstd line 600.
-            if unsafe { match_found::<USE_CMOV>(base.add(ip0), base, main_idx, prefix_start_index) }
-            {
+            if unsafe {
+                match_found::<USE_CMOV>(base.add(ip0), base, main_idx, prefix_start_index, true)
+            } {
                 let mut match_ip = ip0;
                 let mut match_pos = main_idx as usize;
                 let mut m_len = 4 + unsafe {
@@ -1295,7 +1396,7 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
             }
 
             // Prepare next iteration (upstream zstd 616-630).
-            dict_idx = unsafe { dict_lookup::<MLS>(dict_table, base.add(ip1), dict_hash_log) };
+            dict_idx = unsafe { dict_lookup::<MLS>(dict_slots, base.add(ip1), dict_hash_log) };
             main_idx =
                 unsafe { (*main_tbl.get_unchecked(hash1 as usize)).saturating_sub(main_bias) };
             if ip1 >= next_step {
@@ -1558,6 +1659,7 @@ fn compress_block_fast_dict_borrowed_impl<
     // through `&mut FastHashTable` on every access; bias is applied inline exactly
     // as `get`/`put` do (matches the owned dict kernel).
     let (main_tbl, main_hlog, main_bias) = main_table.hot_state_biased();
+    let dict_slots = dict_table.dict_slots();
 
     // Inner-loop result: literals end (input offset), raw match offset, match
     // length, and the upstream zstd `curr` probe offset for the post-match `curr + 2`
@@ -1575,7 +1677,7 @@ fn compress_block_fast_dict_borrowed_impl<
         let mut main_idx =
             unsafe { (*main_tbl.get_unchecked(hash0 as usize)).saturating_sub(main_bias) };
         let mut dict_idx =
-            unsafe { dict_lookup::<MLS>(dict_table, inp_base.add(ip0), dict_hash_log) };
+            unsafe { dict_lookup::<MLS>(dict_slots, inp_base.add(ip0), dict_hash_log) };
         let mut curr = ip0;
 
         // No-match step accelerator (upstream zstd `zstd_fast.c:552-554`),
@@ -1768,7 +1870,7 @@ fn compress_block_fast_dict_borrowed_impl<
             }
 
             // Prepare next iteration.
-            dict_idx = unsafe { dict_lookup::<MLS>(dict_table, inp_base.add(ip1), dict_hash_log) };
+            dict_idx = unsafe { dict_lookup::<MLS>(dict_slots, inp_base.add(ip1), dict_hash_log) };
             main_idx =
                 unsafe { (*main_tbl.get_unchecked(hash1 as usize)).saturating_sub(main_bias) };
             if ip1 >= next_step {
