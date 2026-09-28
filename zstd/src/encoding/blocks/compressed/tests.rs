@@ -385,7 +385,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
             };
             let mut est_state = CompressState::<EntropyOnlyMatcher> {
                 matcher: EntropyOnlyMatcher,
-                copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
+                copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: seed_table.clone(),
                 huff_table_spare: None,
                 huff_rollback: None,
@@ -402,7 +402,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
             };
             let mut emit_state = CompressState::<EntropyOnlyMatcher> {
                 matcher: EntropyOnlyMatcher,
-                copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
+                copy_kernel: crate::encoding::fastpath::select_kernel(),
                 last_huff_table: seed_table,
                 huff_table_spare: None,
                 huff_rollback: None,
@@ -467,7 +467,7 @@ fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
 
     let make_state = || CompressState::<EntropyOnlyMatcher> {
         matcher: EntropyOnlyMatcher,
-        copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
+        copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: None,
         huff_table_spare: None,
         huff_rollback: None,
@@ -532,7 +532,7 @@ fn encode_match_len_uses_correct_upper_range_base() {
 fn retained_heap_size_counts_the_block_buffers() {
     let mut state = CompressState {
         matcher: super::EntropyOnlyMatcher,
-        copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
+        copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: None,
         huff_table_spare: None,
         huff_rollback: None,
@@ -612,7 +612,7 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
     for strat in [StrategyTag::Fast, StrategyTag::Lazy, StrategyTag::BtUltra2] {
         let make_state = || CompressState::<EntropyOnlyMatcher> {
             matcher: EntropyOnlyMatcher,
-            copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
+            copy_kernel: crate::encoding::fastpath::select_kernel(),
             last_huff_table: None,
             huff_table_spare: None,
             huff_rollback: None,
@@ -676,7 +676,7 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
 fn raw_partition_fallback_restores_repeat_offset_history() {
     let mut state = CompressState {
         matcher: super::EntropyOnlyMatcher,
-        copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
+        copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: None,
         huff_table_spare: None,
         huff_rollback: None,
@@ -1068,25 +1068,129 @@ fn match_length_coding_agrees_with_the_ranges_over_every_length() {
     }
 }
 
-/// Literals that outgrow the buffer stop the encoder rather than write past it:
-/// the short-run copy writes through a raw pointer, and a caller whose buffer
-/// was sized for less must reach the checked append instead.
-#[test]
-#[should_panic(expected = "workspace buffer sized below what the frame put in it")]
-fn literals_past_the_buffer_stop_instead_of_overflowing() {
+/// A literals buffer holding `capacity` bytes, laid out the way a frame lays
+/// out its own.
+fn literals_buffer(capacity: usize) -> (Workspace, RegionVec<u8>) {
     let mut ws = Workspace::new();
     ws.begin_layout(
-        region_bytes::<u8>(4),
+        region_bytes::<u8>(capacity),
         |bytes| bytes,
         crate::encoding::workspace::IngestPlan::Stream,
     );
     ws.open(0, usize::MAX);
-    let mut literals: RegionVec<u8> = ws.buffer(4);
-    super::append_literals(
-        &mut literals,
+    let literals: RegionVec<u8> = ws.buffer(capacity);
+    (ws, literals)
+}
+
+/// A block smaller than its literals buffer can hold stops the encoder rather
+/// than write past it: the gather writes through a raw pointer.
+#[test]
+#[should_panic(expected = "workspace buffer sized below what the frame put in it")]
+fn literals_past_the_buffer_stop_instead_of_overflowing() {
+    let (_ws, mut literals) = literals_buffer(4);
+    super::literal_runs::gather_literals(
+        crate::encoding::fastpath::FastpathKernel::Scalar,
         &[0xA5; 8],
-        crate::decoding::simd_copy::ExactCopyTier::Scalar,
+        &[],
+        8,
+        &mut literals,
     );
+}
+
+/// Sequences that describe more than the block are refused before any byte is
+/// read past it. A matcher is a public extension point, so its report is not
+/// trusted with an out-of-bounds read.
+#[test]
+#[should_panic(expected = "sequences reach past the block they describe")]
+fn sequences_past_the_block_are_refused() {
+    let (_ws, mut literals) = literals_buffer(64);
+    let sequences = [RawSequence {
+        ll: 4,
+        ml: 60,
+        off_base: 1,
+    }];
+    super::literal_runs::gather_literals(
+        crate::encoding::fastpath::FastpathKernel::Scalar,
+        &[0x5A; 32],
+        &sequences,
+        0,
+        &mut literals,
+    );
+}
+
+/// Every literal-gather tier this CPU can run, not only the one it selects, so
+/// a narrower tier's path is exercised on a wider machine.
+fn runnable_fastpath_kernels() -> Vec<crate::encoding::fastpath::FastpathKernel> {
+    use crate::encoding::fastpath::FastpathKernel;
+    #[allow(unused_mut)]
+    let mut kernels = alloc::vec![FastpathKernel::Scalar];
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-sse"
+    ))]
+    if std::is_x86_feature_detected!("sse2") {
+        kernels.push(FastpathKernel::Sse2);
+        if std::is_x86_feature_detected!("sse4.2") {
+            kernels.push(FastpathKernel::Sse42);
+        }
+    }
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2"
+    ))]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
+        kernels.push(FastpathKernel::Avx2Bmi2);
+    }
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel-neon"
+    ))]
+    kernels.push(FastpathKernel::Neon);
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel-simd128"
+    ))]
+    kernels.push(FastpathKernel::Simd128);
+    kernels
+}
+
+/// The gather reproduces the literal runs exactly, under every tier this CPU
+/// can run, across run lengths that cross every kernel's
+/// size classes (the small copy, the vector kernel and its overlapping tail,
+/// and the `memcpy` hand-off).
+#[test]
+fn gathered_literals_are_the_runs_in_order() {
+    let lengths = [
+        0usize, 1, 7, 8, 9, 16, 17, 31, 32, 33, 47, 64, 65, 127, 128, 129, 800, 2047, 2048, 3000,
+    ];
+    let block_len: usize = lengths.iter().map(|&ll| ll + 5).sum::<usize>() + 13;
+    let block: Vec<u8> = (0..block_len as u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+        .collect();
+    let sequences: Vec<RawSequence> = lengths
+        .iter()
+        .map(|&ll| RawSequence {
+            ll: ll as u32,
+            ml: 5,
+            off_base: 1,
+        })
+        .collect();
+    let mut expected = Vec::new();
+    let mut pos = 0;
+    for &ll in &lengths {
+        expected.extend_from_slice(&block[pos..pos + ll]);
+        pos += ll + 5;
+    }
+    expected.extend_from_slice(&block[pos..]);
+    for kernel in runnable_fastpath_kernels() {
+        let (_ws, mut literals) = literals_buffer(block_len);
+        super::literal_runs::gather_literals(kernel, &block, &sequences, 13, &mut literals);
+        assert_eq!(&literals[..], &expected[..], "{kernel:?}");
+    }
 }
 
 #[test]

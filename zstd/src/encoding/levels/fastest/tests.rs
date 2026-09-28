@@ -41,7 +41,7 @@ impl Matcher for HintProbeMatcher {
         self.skip_hints.push(incompressible_hint);
     }
 
-    fn start_matching(&mut self, _handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+    fn start_matching(&mut self, _handle_sequence: impl FnMut(Sequence)) {
         panic!("start_matching must not run for early-exit paths");
     }
 
@@ -69,7 +69,7 @@ fn custom_matcher_dict_probe_defaults_to_false() {
 fn rle_branch_passes_compressible_hint_to_skip_matching() {
     let mut state = CompressState {
         matcher: HintProbeMatcher::default(),
-        copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
+        copy_kernel: crate::encoding::fastpath::select_kernel(),
         last_huff_table: None,
         huff_table_spare: None,
         huff_rollback: None,
