@@ -333,9 +333,34 @@ fn leak_owned(name: String) -> &'static str {
     Box::leak(name.into_boxed_str())
 }
 
+/// Apply `STRUCTURED_ZSTD_CPU=LEVEL`, the ceiling on the kernel tiers (see
+/// `structured_zstd::set_cpu_ceiling`), before the run chooses any kernel.
+/// Every bench entry calls this first; only the first call acts. A value that
+/// cannot be applied stops the run: measuring the wrong tier silently would be
+/// worse than not measuring.
+pub(crate) fn apply_cpu_ceiling_from_env() {
+    use std::sync::Once;
+    static APPLIED: Once = Once::new();
+    APPLIED.call_once(|| {
+        let value = match env::var("STRUCTURED_ZSTD_CPU") {
+            Ok(value) => value,
+            Err(env::VarError::NotPresent) => return,
+            Err(env::VarError::NotUnicode(raw)) => {
+                panic!("STRUCTURED_ZSTD_CPU={raw:?} is not a readable tier name")
+            }
+        };
+        let level: structured_zstd::CpuLevel = value
+            .trim()
+            .parse()
+            .unwrap_or_else(|err| panic!("STRUCTURED_ZSTD_CPU={value}: {err}"));
+        structured_zstd::set_cpu_ceiling(level)
+            .unwrap_or_else(|err| panic!("STRUCTURED_ZSTD_CPU={value}: {err}"));
+    });
+}
+
 /// The `REPORT_KERNEL` line for this run: the CPU kernel tier actually
 /// selected (the entropy / sequence dispatch is shared by encode and decode,
-/// see #247), plus arch / libc. Lets the dashboard attribute every measurement
+/// see #247), the match-finder tier, plus arch / libc. Lets the dashboard attribute every measurement
 /// to the kernel that produced it. Shared verbatim by both bench binaries so
 /// the format stays in lockstep; each caller decides when to print it.
 pub(crate) fn kernel_report_line() -> String {
@@ -354,8 +379,9 @@ pub(crate) fn kernel_report_line() -> String {
         "other"
     };
     format!(
-        "REPORT_KERNEL kernel={} arch={} target_env={}",
+        "REPORT_KERNEL kernel={} match_kernel={} arch={} target_env={}",
         structured_zstd::active_cpu_kernel_name(),
+        structured_zstd::encoding::active_match_kernel_name(),
         arch,
         target_env
     )
