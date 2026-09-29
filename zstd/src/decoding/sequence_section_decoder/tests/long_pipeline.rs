@@ -51,15 +51,27 @@ const BITSTREAM: &[u8] = &[
 
 fn supported_kernels() -> Vec<CpuKernelTag> {
     let mut kernels = alloc::vec![CpuKernelTag::Scalar];
-    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-sse"))]
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-sse"
+    ))]
     if std::is_x86_feature_detected!("sse2") {
         kernels.push(CpuKernelTag::Sse2);
     }
-    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-bmi2"
+    ))]
     if std::is_x86_feature_detected!("bmi2") {
         kernels.push(CpuKernelTag::Bmi2);
     }
-    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-avx2"))]
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2"
+    ))]
     if std::is_x86_feature_detected!("bmi2") && std::is_x86_feature_detected!("avx2") {
         kernels.push(CpuKernelTag::Avx2);
     }
@@ -107,7 +119,7 @@ fn check_pipeline<B: BufferBackend>(kernel: CpuKernelTag, fail_at: Option<usize>
     // Reserve before the checkpoint, as the block decoder does, so an error
     // can restore the cursor without an intervening allocation invalidating it.
     scratch.buffer.reserve_exact(4096);
-    scratch.buffer.push(PREFIX);
+    scratch.buffer.push::<ScalarKernel>(PREFIX);
     {
         let setup = init_sequence_stream::<B, ScalarKernel>(
             &header,

@@ -371,6 +371,122 @@ pub trait CpuKernel: Copy + 'static {
             Self::mask_lower_bits(packed, n3),
         )
     }
+
+    /// Width in bytes of [`Self::copy_chunks`]'s stores. The default is
+    /// portable code, a machine word (`simd128` on wasm, which has no run-time
+    /// tier); each SIMD tier overrides it with its own vector.
+    const COPY_CHUNK: usize = crate::decoding::simd_copy::PORTABLE_COPY_CHUNK;
+
+    /// Copy `len` bytes, a multiple of [`Self::COPY_CHUNK`], in whole chunks:
+    /// the wildcopy body of the decoder's buffer copies.
+    ///
+    /// # Safety
+    /// `src` readable and `dst` writable for `len` bytes; the regions do not
+    /// overlap; the running CPU supports this kernel's tier.
+    #[inline(always)]
+    unsafe fn copy_chunks(src: *const u8, dst: *mut u8, len: usize) {
+        unsafe { crate::decoding::simd_copy::copy_chunks_portable(src, dst, len) }
+    }
+
+    /// Width of [`Self::copy_step`], the chunk a wide tier steps down to when
+    /// the slack left does not fit its own; equal to [`Self::COPY_CHUNK`]
+    /// where there is nothing narrower to step to.
+    const STEP_CHUNK: usize = Self::COPY_CHUNK;
+
+    /// Copy `len` bytes, a multiple of [`Self::STEP_CHUNK`], in whole chunks.
+    ///
+    /// # Safety
+    /// As [`Self::copy_chunks`].
+    #[inline(always)]
+    unsafe fn copy_step(src: *const u8, dst: *mut u8, len: usize) {
+        unsafe { Self::copy_chunks(src, dst, len) }
+    }
+
+    /// Copy exactly 16 bytes in one transfer, for a short copy whose buffers
+    /// have the room to overshoot to 16.
+    ///
+    /// # Safety
+    /// `src` readable and `dst` writable for 16 bytes; the regions do not
+    /// overlap; the running CPU supports this kernel's tier.
+    #[inline(always)]
+    unsafe fn copy16(src: *const u8, dst: *mut u8) {
+        unsafe { crate::decoding::simd_copy::copy16_portable(src, dst) }
+    }
+}
+
+/// Copies at the build's baseline vector (SSE2 where the target guarantees it,
+/// NEON, `simd128`) and masks as the scalar tier does: for the copies that run
+/// outside any tier's dispatch, a raw block's or a literals-only block's, which
+/// every CPU the build runs on can take at that width.
+#[derive(Copy, Clone, Default)]
+pub(crate) struct BaselineKernel;
+
+impl CpuKernel for BaselineKernel {
+    #[inline(always)]
+    fn mask_lower_bits(value: u64, n: u8) -> u64 {
+        ScalarKernel::mask_lower_bits(value, n)
+    }
+
+    const COPY_CHUNK: usize = crate::decoding::simd_copy::BASELINE_COPY_CHUNK;
+
+    #[inline(always)]
+    unsafe fn copy_chunks(src: *const u8, dst: *mut u8, len: usize) {
+        // SAFETY: the baseline runs on every CPU the build does.
+        unsafe { crate::decoding::simd_copy::copy_chunks_baseline(src, dst, len) }
+    }
+
+    #[inline(always)]
+    unsafe fn copy16(src: *const u8, dst: *mut u8) {
+        // SAFETY: as above.
+        unsafe { crate::decoding::simd_copy::copy16_baseline(src, dst) }
+    }
+}
+
+/// The SSE2 copies every x86 SIMD tier shares: 16-byte chunks. A macro, so
+/// each kernel's methods expand them in place.
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-sse"
+))]
+macro_rules! sse2_copies {
+    () => {
+        const COPY_CHUNK: usize = 16;
+
+        #[inline(always)]
+        unsafe fn copy_chunks(src: *const u8, dst: *mut u8, len: usize) {
+            // SAFETY: every tier using this was selected with SSE2 confirmed.
+            unsafe { crate::decoding::simd_copy::copy_sse2(src, dst, len) }
+        }
+
+        #[inline(always)]
+        unsafe fn copy16(src: *const u8, dst: *mut u8) {
+            // SAFETY: as above.
+            unsafe { crate::decoding::simd_copy::copy_sse2(src, dst, 16) }
+        }
+    };
+}
+
+/// x86 SSE2 kernel: scalar masks (SSE2 has no bit extract) and 16-byte SSE2
+/// copies. Chosen at run time, so a 32-bit build whose baseline lacks SSE2
+/// still copies in vectors on a CPU that has it.
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-sse"
+))]
+#[derive(Copy, Clone, Default)]
+pub(crate) struct Sse2Kernel;
+
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-sse"
+))]
+impl CpuKernel for Sse2Kernel {
+    #[inline(always)]
+    fn mask_lower_bits(value: u64, n: u8) -> u64 {
+        ScalarKernel::mask_lower_bits(value, n)
+    }
+
+    sse2_copies!();
 }
 
 /// Scalar fallback — portable, no SIMD or BMI2 intrinsics. Selected
@@ -403,13 +519,6 @@ impl CpuKernel for ScalarKernel {
     }
 }
 
-// The SSE2 tier exists in `CpuKernelTag` (it carries the 128-bit copy-chunk
-// choice for the unified copy dispatch) but needs no `CpuKernel` ZST yet: the
-// only trait method, `mask_lower_bits`, has no SSE2-specific form (SSE2 has no
-// bit-extract), so the Sse2 tag routes through the scalar bodies for the
-// FSE/HUF paths. A dedicated `Sse2Kernel` lands when `copy_chunk` moves onto
-// the trait.
-
 /// BMI2-only kernel: `bzhi` for mask_lower_bits. Selected when the CPU has
 /// BMI2 but not the AVX2 SIMD width to upgrade to the Avx2 kernel. Treated as
 /// a stepping stone between Sse2 and Avx2 on hardware that has BMI2 but not
@@ -438,23 +547,68 @@ impl CpuKernel for Bmi2Kernel {
         // running CPU.
         unsafe { mask_lower_bits_bmi2_impl(value, n) }
     }
+
+    // Every BMI2 CPU has SSE2.
+    sse2_copies!();
 }
 
-/// x86_64 AVX2 + BMI2 kernel (x86-64-v3 baseline). The common modern
+/// x86 AVX2 + BMI2 kernel (x86-64-v3 baseline). The common modern
 /// x86 case — most CPUs released since 2013 (Haswell) have AVX2+BMI2.
-/// Uses `_bzhi_u64` for mask ops; future trait methods will use AVX2
-/// 256-bit moves for `copy_chunk` and pext for HUF burst.
-#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+/// Uses `bzhi` for mask ops and 256-bit moves for the buffer copies. Present
+/// on 32-bit x86 too, where the kernel's masks are the table ones and its
+/// copies are what it adds; the tier still decodes literals on the BMI2 path,
+/// so, like every tier, it requires the ones below it.
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-avx2"
+))]
 #[derive(Copy, Clone, Default)]
 pub(crate) struct Avx2Kernel;
 
-#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-avx2"
+))]
 impl CpuKernel for Avx2Kernel {
     #[inline(always)]
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
         // SAFETY: Avx2Kernel is selected only after runtime detect
         // confirmed both AVX2 and BMI2 — `_bzhi_u64` is callable.
-        unsafe { mask_lower_bits_bmi2_impl(value, n) }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            mask_lower_bits_bmi2_impl(value, n)
+        }
+        // 32-bit x86 has only a 32-bit `bzhi`: two of them and the branches
+        // choosing between them cost more than the table lookup in the
+        // sequence loop, which calls this three times a sequence (decoding
+        // z000033 on i686 measured 12.6% slower at level 1 with them).
+        #[cfg(target_arch = "x86")]
+        {
+            ScalarKernel::mask_lower_bits(value, n)
+        }
+    }
+
+    // 32 bytes, the width the buffers' trailing slack is sized for.
+    const COPY_CHUNK: usize = 32;
+
+    #[inline(always)]
+    unsafe fn copy_chunks(src: *const u8, dst: *mut u8, len: usize) {
+        // SAFETY: this kernel is selected only after detect confirmed AVX2.
+        unsafe { crate::decoding::simd_copy::copy_avx2(src, dst, len) }
+    }
+
+    const STEP_CHUNK: usize = 16;
+
+    #[inline(always)]
+    unsafe fn copy_step(src: *const u8, dst: *mut u8, len: usize) {
+        // SAFETY: an AVX2 CPU has SSE2.
+        unsafe { crate::decoding::simd_copy::copy_sse2(src, dst, len) }
+    }
+
+    #[inline(always)]
+    unsafe fn copy16(src: *const u8, dst: *mut u8) {
+        // SAFETY: as above.
+        unsafe { crate::decoding::simd_copy::copy_sse2(src, dst, 16) }
     }
 }
 
@@ -474,18 +628,36 @@ impl CpuKernel for Vbmi2Kernel {
         // at runtime before this kernel is instantiated.
         unsafe { mask_lower_bits_bmi2_impl(value, n) }
     }
+
+    // The AVX2 width: a 64-byte store would need twice the buffers' trailing
+    // slack to fire on the short copies that dominate.
+    const COPY_CHUNK: usize = 32;
+
+    #[inline(always)]
+    unsafe fn copy_chunks(src: *const u8, dst: *mut u8, len: usize) {
+        // SAFETY: the VBMI2 tier is selected only with AVX2 confirmed.
+        unsafe { crate::decoding::simd_copy::copy_avx2(src, dst, len) }
+    }
+
+    const STEP_CHUNK: usize = 16;
+
+    #[inline(always)]
+    unsafe fn copy_step(src: *const u8, dst: *mut u8, len: usize) {
+        // SAFETY: an AVX2 CPU has SSE2.
+        unsafe { crate::decoding::simd_copy::copy_sse2(src, dst, len) }
+    }
+
+    #[inline(always)]
+    unsafe fn copy16(src: *const u8, dst: *mut u8) {
+        // SAFETY: as above.
+        unsafe { crate::decoding::simd_copy::copy_sse2(src, dst, 16) }
+    }
 }
 
-/// aarch64 NEON baseline kernel. Used on all aarch64 hardware that
-/// exposes NEON (effectively universal on the supported targets).
-///
-/// `#[allow(dead_code)]`: scaffolding for the future aarch64 dispatch
-/// arm in `decompress_literals` / `decode_and_execute_sequences`.
-/// The struct + trait impl land first so the dispatch wiring can be
-/// added incrementally without churning the CpuKernel surface; until
-/// the dispatch arm uses it the type is reachable only as a phantom.
+/// aarch64 NEON kernel: scalar masks and 16-byte NEON copies. Used on all
+/// aarch64 hardware that exposes NEON (effectively universal on the
+/// supported targets).
 #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
-#[allow(dead_code)]
 #[derive(Copy, Clone, Default)]
 pub(crate) struct NeonKernel;
 
@@ -495,17 +667,28 @@ impl CpuKernel for NeonKernel {
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
         // aarch64 has no BMI2 equivalent that improves on the scalar
         // shift-and-mask sequence for this op; the codegen is
-        // identical to the Scalar kernel here. Other trait methods
-        // (huf_burst, copy_chunk) will diverge once they land.
+        // identical to the Scalar kernel here.
         ScalarKernel::mask_lower_bits(value, n)
+    }
+
+    const COPY_CHUNK: usize = BaselineKernel::COPY_CHUNK;
+
+    #[inline(always)]
+    unsafe fn copy_chunks(src: *const u8, dst: *mut u8, len: usize) {
+        // SAFETY: NEON is the aarch64 baseline.
+        unsafe { BaselineKernel::copy_chunks(src, dst, len) }
+    }
+
+    #[inline(always)]
+    unsafe fn copy16(src: *const u8, dst: *mut u8) {
+        // SAFETY: as above.
+        unsafe { BaselineKernel::copy16(src, dst) }
     }
 }
 
 /// aarch64 SVE kernel. Variable-vector-length SVE extends NEON for
 /// HUF burst / SIMD copy on Graviton3 / Apple M-series with SVE
-/// support. Mask op identical to NEON / Scalar.
-///
-/// `#[allow(dead_code)]`: same scaffolding rationale as `NeonKernel`.
+/// support. Masks and copies as the NEON kernel's.
 #[cfg(all(target_arch = "aarch64", feature = "kernel-sve"))]
 #[allow(dead_code)]
 #[derive(Copy, Clone, Default)]
@@ -516,6 +699,20 @@ impl CpuKernel for SveKernel {
     #[inline(always)]
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
         ScalarKernel::mask_lower_bits(value, n)
+    }
+
+    const COPY_CHUNK: usize = BaselineKernel::COPY_CHUNK;
+
+    #[inline(always)]
+    unsafe fn copy_chunks(src: *const u8, dst: *mut u8, len: usize) {
+        // SAFETY: NEON is the aarch64 baseline.
+        unsafe { BaselineKernel::copy_chunks(src, dst, len) }
+    }
+
+    #[inline(always)]
+    unsafe fn copy16(src: *const u8, dst: *mut u8) {
+        // SAFETY: as above.
+        unsafe { BaselineKernel::copy16(src, dst) }
     }
 }
 
@@ -614,7 +811,12 @@ const fn select_x86_kernel(
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CpuKernelTag {
     Scalar,
-    #[cfg(all(target_arch = "x86_64", feature = "kernel-sse"))]
+    /// Chosen at run time on 32-bit x86 too, where a build's baseline may
+    /// lack SSE2 while the CPU has it.
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-sse"
+    ))]
     Sse2,
     /// Reachable on 32-bit x86 as well: `bzhi` is there, and without the tier
     /// such a build would decode on the scalar bodies whatever the CPU offers.
@@ -623,7 +825,12 @@ pub(crate) enum CpuKernelTag {
         feature = "kernel-bmi2"
     ))]
     Bmi2,
-    #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+    /// On 32-bit x86 it runs the portable sequence walk with this kernel's
+    /// 32-byte copies.
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2"
+    ))]
     Avx2,
     #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
     Vbmi2,
@@ -678,16 +885,32 @@ fn detect_cpu_kernel_uncached() -> CpuKernelTag {
                 && is_x86_feature_detected!("sse2"),
         );
     }
-    // 32-bit x86 carries only the BMI2 tier: the wider tiers' kernels and
-    // their `target_feature` bodies are x86_64-only, so there is nothing
-    // above `bzhi` to select here.
+    // 32-bit x86 carries the SSE2, BMI2 and AVX2 tiers: SSE2 copies, `bzhi`
+    // for the entropy tables and the AVX2 buffer copies. The VBMI2 bodies are
+    // x86_64-only.
     #[cfg(target_arch = "x86")]
     {
-        #[cfg(feature = "kernel-bmi2")]
+        #[cfg(feature = "kernel-sse")]
         {
             use std::arch::is_x86_feature_detected;
-            if cpu_allows(CpuLevel::Bmi2) && is_x86_feature_detected!("bmi2") {
-                return CpuKernelTag::Bmi2;
+            #[cfg(feature = "kernel-bmi2")]
+            {
+                let bmi2 = cpu_allows(CpuLevel::Bmi2) && is_x86_feature_detected!("bmi2");
+                // The AVX2 tier sits above BMI2, as on x86_64: its literals take
+                // the BMI2 body, so an AVX2 CPU without BMI2 (in practice a
+                // virtual machine that hides it) runs the SSE2 tier. Its copies
+                // stay 16 bytes wide; a tier of AVX2 copies without BMI2 would be
+                // one more sequence decoder for a CPU no vendor ships.
+                #[cfg(feature = "kernel-avx2")]
+                if bmi2 && cpu_allows(CpuLevel::Avx2) && is_x86_feature_detected!("avx2") {
+                    return CpuKernelTag::Avx2;
+                }
+                if bmi2 {
+                    return CpuKernelTag::Bmi2;
+                }
+            }
+            if cpu_allows(CpuLevel::Sse2) && is_x86_feature_detected!("sse2") {
+                return CpuKernelTag::Sse2;
             }
         }
         return CpuKernelTag::Scalar;
@@ -733,12 +956,22 @@ pub(crate) fn detect_cpu_kernel() -> CpuKernelTag {
             cpu_allows(CpuLevel::Sse2) && cfg!(target_feature = "sse2"),
         );
     }
-    #[cfg(target_arch = "x86")]
+    // `cfg!` rather than `#[cfg]`, as `select_x86_kernel` does: the tests fold
+    // at compile time, and the tiers stay constructed in every build.
+    #[cfg(all(target_arch = "x86", feature = "kernel-bmi2"))]
     {
-        #[cfg(all(feature = "kernel-bmi2", target_feature = "bmi2"))]
-        if cpu_allows(CpuLevel::Bmi2) {
+        let bmi2 = cpu_allows(CpuLevel::Bmi2) && cfg!(target_feature = "bmi2");
+        #[cfg(feature = "kernel-avx2")]
+        if bmi2 && cpu_allows(CpuLevel::Avx2) && cfg!(target_feature = "avx2") {
+            return CpuKernelTag::Avx2;
+        }
+        if bmi2 {
             return CpuKernelTag::Bmi2;
         }
+    }
+    #[cfg(all(target_arch = "x86", feature = "kernel-sse"))]
+    if cpu_allows(CpuLevel::Sse2) && cfg!(target_feature = "sse2") {
+        return CpuKernelTag::Sse2;
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -763,14 +996,20 @@ impl CpuKernelTag {
     pub(crate) fn name(self) -> &'static str {
         match self {
             CpuKernelTag::Scalar => "scalar",
-            #[cfg(all(target_arch = "x86_64", feature = "kernel-sse"))]
+            #[cfg(all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                feature = "kernel-sse"
+            ))]
             CpuKernelTag::Sse2 => "sse2",
             #[cfg(all(
                 any(target_arch = "x86", target_arch = "x86_64"),
                 feature = "kernel-bmi2"
             ))]
             CpuKernelTag::Bmi2 => "bmi2",
-            #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
+            #[cfg(all(
+                any(target_arch = "x86", target_arch = "x86_64"),
+                feature = "kernel-avx2"
+            ))]
             CpuKernelTag::Avx2 => "avx2",
             #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
             CpuKernelTag::Vbmi2 => "vbmi2",

@@ -1,5 +1,17 @@
 use super::*;
 
+/// `CpuLevel::Scalar` is portable code only, so the scalar tier copies in
+/// 64-bit words whatever vector the build's baseline carries: a ceiling at
+/// Scalar, or a comparison against it, would otherwise still run SIMD copies.
+/// The word is 64 bits on 32-bit targets too, where a pointer-sized word halves
+/// every copy's stride. wasm has no run-time tier, so its build's `simd128` is
+/// the one it has.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn the_scalar_tier_copies_in_64_bit_words() {
+    assert_eq!(ScalarKernel::COPY_CHUNK, 8);
+}
+
 /// A ceiling admits its own rung and those below it on its own ladder, and
 /// nothing on the other ladder; scalar code is always admitted, and a scalar
 /// ceiling admits nothing else. No ceiling admits everything.
@@ -169,7 +181,11 @@ fn scalar_mask_lower_bits_mid_keeps_low_n_bits() {
 // `#[cfg(feature = "kernel-avx2")]`, so the test must also require
 // that feature or a `std`-only trimmed build (`kernel-avx2` off)
 // fails to compile against the undefined type.
-#[cfg(all(target_arch = "x86_64", feature = "std", feature = "kernel-avx2"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "std",
+    feature = "kernel-avx2"
+))]
 #[test]
 fn avx2_mask_lower_bits_matches_scalar_on_bmi2_hw() {
     // Only run when BMI2 actually available — otherwise constructing
