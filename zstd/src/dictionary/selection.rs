@@ -2,8 +2,9 @@
 //! scoring samples with it, and count the bytes (upstream zstd `cover.c`,
 //! `COVER_selectDict` and `COVER_checkTotalCompressedSize`).
 
+use super::FinalizeOptions;
+use super::finalize::{Analysis, finalize_into};
 use super::samples::SampleSet;
-use super::{FinalizeOptions, assemble_dict, finalize_raw_dict, sample_entropy_tables};
 use crate::encoding::{CompressionLevel, EncoderDictionary, FrameCompressor};
 use core::ops::Range;
 use std::{io, vec::Vec};
@@ -31,12 +32,7 @@ pub(super) struct Evaluator<'s> {
     /// Samples a dictionary is scored on.
     scoring: Range<usize>,
     capacity: usize,
-    level: i32,
     finalize: FinalizeOptions,
-    /// The entropy tables, built once: they come from the finalize samples,
-    /// the same for every candidate. `None` where the samples are too thin
-    /// and each candidate's content decides them.
-    tables: Option<Vec<u8>>,
     compressor: Option<FrameCompressor>,
     frame: Vec<u8>,
     /// The candidate being priced, and a shrunk one being tried against it:
@@ -44,6 +40,8 @@ pub(super) struct Evaluator<'s> {
     /// only by a candidate that wins.
     dict: Vec<u8>,
     shrunk: Vec<u8>,
+    /// The entropy analysis every candidate is finalized through.
+    analysis: Analysis<'s>,
 }
 
 impl<'s> Evaluator<'s> {
@@ -52,7 +50,6 @@ impl<'s> Evaluator<'s> {
         finalize_samples: usize,
         scoring: Range<usize>,
         capacity: usize,
-        level: i32,
         finalize: FinalizeOptions,
     ) -> Self {
         Self {
@@ -60,42 +57,33 @@ impl<'s> Evaluator<'s> {
             finalize_samples,
             scoring,
             capacity,
-            level,
             finalize,
-            tables: sample_entropy_tables(samples.leading(finalize_samples)),
             compressor: None,
             frame: Vec::new(),
             dict: Vec::new(),
             shrunk: Vec::new(),
+            analysis: Analysis::default(),
         }
     }
 
     /// `content` finalized into a dictionary of at most the capacity.
-    pub(super) fn finalize(&self, content: &[u8]) -> io::Result<Vec<u8>> {
+    pub(super) fn finalize(&mut self, content: &[u8]) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
         self.finalize_into(content, &mut out)?;
         Ok(out)
     }
 
     /// [`Self::finalize`] over `out`, keeping its allocation.
-    fn finalize_into(&self, content: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
-        if let Some(tables) = &self.tables {
-            if content.is_empty() {
-                // The full path owns that refusal and its wording.
-                *out = finalize_raw_dict(content, &[], self.capacity, self.finalize)?;
-                return Ok(());
-            }
-            return assemble_dict(out, content, tables, self.capacity, self.finalize);
-        }
-        // Samples too thin to decide the tables alone: the content decides
-        // them, a path a search takes only on corpora of a handful of bytes.
-        *out = finalize_raw_dict(
+    fn finalize_into(&mut self, content: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+        finalize_into(
+            out,
+            &mut self.analysis,
             content,
-            self.samples.leading(self.finalize_samples),
+            self.samples,
+            self.finalize_samples,
             self.capacity,
             self.finalize,
-        )?;
-        Ok(())
+        )
     }
 
     /// `content` finalized over `buffer` and priced.
@@ -114,7 +102,9 @@ impl<'s> Evaluator<'s> {
         // matcher for it, which belongs to the compressor, not here.
         let prepared = EncoderDictionary::from_bytes(dict)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let level = self.level;
+        // Scored at the level the dictionary is finalized for, as upstream uses
+        // its one `compressionLevel` for both.
+        let level = self.finalize.level;
         let compressor = self
             .compressor
             .get_or_insert_with(|| FrameCompressor::new(CompressionLevel::from_level(level)));
@@ -129,42 +119,48 @@ impl<'s> Evaluator<'s> {
         Ok(total)
     }
 
-    /// Finalize `content` and price it. With `shrink`, also try the content's
-    /// last 256, 512, ... bytes and keep the first that costs at most
-    /// `shrink` percent more than the whole: a smaller dictionary that does
-    /// nearly as well.
-    ///
-    /// Upstream zstd runs the same search but forces it off in the only path
-    /// that reaches it, so its `shrink` has no effect; here it takes effect.
-    pub(super) fn select(&mut self, content: &[u8], shrink: Option<u32>) -> io::Result<Priced<'_>> {
+    /// Finalize `content` and price it, in the evaluator's candidate buffer.
+    pub(super) fn score(&mut self, content: &[u8]) -> io::Result<Priced<'_>> {
         let mut dict = core::mem::take(&mut self.dict);
         let priced = self.finalize_and_price(content, &mut dict);
         self.dict = dict;
-        let total = priced?;
-        let Some(regression) = shrink else {
-            return Ok(Priced {
-                dict: &self.dict,
-                total,
-            });
-        };
+        Ok(Priced {
+            total: priced?,
+            dict: &self.dict,
+        })
+    }
+
+    /// Try the last 256, 512, ... bytes of `content` and keep the first that
+    /// costs at most `regression` percent more than `full`, the whole
+    /// content's score: a smaller dictionary that does nearly as well.
+    ///
+    /// Upstream zstd runs the same search for every candidate of its
+    /// parameter search, but forces it off in the only path that reaches it,
+    /// so its `shrink` has no effect. Here it runs once, on the winner: the
+    /// size a dictionary is cut to is a separate choice from the `k` and `d`
+    /// that built it, and searching it per candidate multiplies the cost of
+    /// the whole search by the number of sizes tried.
+    pub(super) fn shrink(
+        &mut self,
+        content: &[u8],
+        full: Scored,
+        regression: u32,
+    ) -> io::Result<Scored> {
         let mut size = SHRINK_START;
         while size < content.len() {
             let mut shrunk = core::mem::take(&mut self.shrunk);
             let priced = self.finalize_and_price(&content[content.len() - size..], &mut shrunk);
-            self.shrunk = shrunk;
-            let candidate_total = priced?;
-            if within_regression(candidate_total, total, regression) {
-                return Ok(Priced {
-                    dict: &self.shrunk,
-                    total: candidate_total,
+            let total = priced?;
+            if within_regression(total, full.total, regression) {
+                return Ok(Scored {
+                    dict: shrunk,
+                    total,
                 });
             }
+            self.shrunk = shrunk;
             size *= 2;
         }
-        Ok(Priced {
-            dict: &self.dict,
-            total,
-        })
+        Ok(full)
     }
 }
 
@@ -177,65 +173,108 @@ pub(super) fn within_regression(total: usize, full: usize, regression: u32) -> b
     total as u128 * 100 <= full as u128 * (u128::from(regression) + 100)
 }
 
-/// A candidate [`Evaluator::select`] priced, still in the evaluator's buffer.
+/// A candidate [`Evaluator::score`] priced, still in the evaluator's buffer.
 pub(super) struct Priced<'e> {
     pub(super) dict: &'e [u8],
     pub(super) total: usize,
 }
 
-/// The cheapest dictionary seen, and the parameters that built it. A tie keeps
+/// What a search hands back of its winner.
+#[derive(Clone, Copy)]
+pub(super) enum Keep {
+    /// The finalized dictionary, cut down with `shrink` when given.
+    Dictionary { shrink: Option<u32> },
+    /// The raw content the dictionary was finalized from.
+    Content,
+}
+
+impl Keep {
+    /// Whether the winner's content has to be kept through the search.
+    fn content(self) -> bool {
+        !matches!(self, Self::Dictionary { shrink: None })
+    }
+
+    /// Whether the winner's finalized dictionary is what is handed back.
+    fn dictionary(self) -> bool {
+        matches!(self, Self::Dictionary { .. })
+    }
+}
+
+/// The cheapest candidate seen, the parameters that built it, and what
+/// [`Keep`] asks for of it: its dictionary, its content, or both. A tie keeps
 /// the earlier one, as upstream's strict comparison does.
+///
+/// Candidates are ranked at full size and only the winner is shrunk: the size
+/// a dictionary is cut to is a separate choice from the `k` and `d` that built
+/// it (see [`Evaluator::shrink`]).
 pub(super) struct Best<P> {
-    found: Option<(Scored, P)>,
+    found: Option<(Scored, Vec<u8>, P)>,
     last_error: Option<io::Error>,
+    keep: Keep,
 }
 
 impl<P> Best<P> {
-    pub(super) fn new() -> Self {
+    /// A search handing back what `keep` names of its winner.
+    pub(super) fn new(keep: Keep) -> Self {
         Self {
             found: None,
             last_error: None,
+            keep,
         }
     }
 
-    /// Keep `candidate` if it beats the best so far, copying its bytes into the
-    /// buffer the previous winner held; a candidate that loses is not copied.
-    pub(super) fn offer(&mut self, candidate: io::Result<Priced<'_>>, params: P) {
+    /// Keep `candidate` if it is the cheapest so far. What [`Keep`] asks for
+    /// of it is copied only then, into the buffers the previous winner held;
+    /// a candidate that loses is not copied at all.
+    pub(super) fn offer(&mut self, candidate: io::Result<Priced<'_>>, content: &[u8], params: P) {
+        let content = if self.keep.content() { content } else { &[] };
+        let keep_dictionary = self.keep.dictionary();
         match candidate {
             Ok(priced) => {
-                if self
-                    .found
-                    .as_ref()
-                    .is_none_or(|(best, _)| priced.total < best.total)
-                {
-                    let mut dict = self
-                        .found
-                        .take()
-                        .map_or_else(Vec::new, |(previous, _)| previous.dict);
-                    dict.clear();
-                    dict.extend_from_slice(priced.dict);
-                    self.found = Some((
-                        Scored {
-                            dict,
+                let dict = if keep_dictionary { priced.dict } else { &[] };
+                match &mut self.found {
+                    Some((best, _, _)) if priced.total >= best.total => {}
+                    Some((best, kept, kept_params)) => {
+                        best.total = priced.total;
+                        best.dict.clear();
+                        best.dict.extend_from_slice(dict);
+                        kept.clear();
+                        kept.extend_from_slice(content);
+                        *kept_params = params;
+                    }
+                    None => {
+                        let best = Scored {
+                            dict: dict.to_vec(),
                             total: priced.total,
-                        },
-                        params,
-                    ));
+                        };
+                        self.found = Some((best, content.to_vec(), params));
+                    }
                 }
             }
             Err(err) => self.last_error = Some(err),
         }
     }
 
-    /// The winner, or why no candidate could be priced.
-    pub(super) fn finish(self) -> io::Result<(Vec<u8>, P)> {
-        match (self.found, self.last_error) {
-            (Some((scored, params)), _) => Ok((scored.dict, params)),
-            (None, Some(err)) => Err(err),
-            (None, None) => Err(super::samples::refuse(
-                super::TrainingError::Parameter,
-                "no parameter combination is valid for this dictionary size",
-            )),
+    /// What [`Keep`] asked for of the winner, and its parameters; or why no
+    /// candidate could be priced.
+    pub(super) fn finish(self, evaluator: &mut Evaluator<'_>) -> io::Result<(Vec<u8>, P)> {
+        let keep = self.keep;
+        let (full, content, params) = match (self.found, self.last_error) {
+            (Some(found), _) => found,
+            (None, Some(err)) => return Err(err),
+            (None, None) => {
+                return Err(super::samples::refuse(
+                    super::TrainingError::Parameter,
+                    "no parameter combination is valid for this dictionary size",
+                ));
+            }
+        };
+        match keep {
+            Keep::Content => Ok((content, params)),
+            Keep::Dictionary { shrink: None } => Ok((full.dict, params)),
+            Keep::Dictionary {
+                shrink: Some(regression),
+            } => Ok((evaluator.shrink(&content, full, regression)?.dict, params)),
         }
     }
 }

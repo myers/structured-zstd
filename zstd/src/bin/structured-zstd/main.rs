@@ -3288,10 +3288,10 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     // real bound is higher and depends on the entropy tables the corpus
     // produces, which is why the trainer still checks; this only settles the
     // part that is knowable without reading anything.
-    if opts.max_dict < structured_zstd::dictionary::TRAINER_DICT_SIZE_MIN {
+    if opts.max_dict < structured_zstd::dictionary::MIN_TRAINED_DICT_SIZE {
         bail!(
             "--maxdict must be at least {} bytes",
-            structured_zstd::dictionary::TRAINER_DICT_SIZE_MIN
+            structured_zstd::dictionary::MIN_TRAINED_DICT_SIZE
         );
     }
     // Whether the trainer takes the tuning it was given is a question about the
@@ -3303,8 +3303,8 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         Legacy,
     }
     let plan = match opts.trainer {
-        Trainer::FastCover => Plan::FastCover(fastcover_options(&opts.trainer_params, opts.level)?),
-        Trainer::Cover => Plan::Cover(cover_options(&opts.trainer_params, opts.level)?),
+        Trainer::FastCover => Plan::FastCover(fastcover_options(&opts.trainer_params)?),
+        Trainer::Cover => Plan::Cover(cover_options(&opts.trainer_params)?),
         // The legacy trainer is tuned by selectivity alone; a cover tuning list
         // given before `--train-legacy` names a trainer that no longer runs,
         // as it does in the reference.
@@ -3371,8 +3371,11 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         }
     }
 
+    // The dictionary is built for the command's level, as the reference's is
+    // for its `-#` (zstdcli.c, `dictCLevel`).
     let finalize = FinalizeOptions {
         dict_id: opts.dict_id,
+        level: opts.level,
     };
     // Every trainer counts samples, so they are loaded as the reference's
     // command loads them: shuffled, capped per file, and cut by `-B`. The same
@@ -3618,6 +3621,10 @@ fn load_training_samples(
     let budget = TRAINING_DATA_MAX.min(memory_limit.unwrap_or(u64::MAX));
     let (plan, bytes) = plan_training_load(&file_sizes, block_size, budget, samples);
     // What the budget keeps, not what the files hold, is what the trainer gets.
+    // The five-sample floor above is on the files, as upstream's is
+    // (dibio.c, `fs.nbSamples < 5`); the samples kept under the budget go to
+    // the trainer's own check, and the legacy trainer, as upstream's, has
+    // none.
     let retained: u64 = plan.iter().sum();
     enough_samples(usize::try_from(retained).unwrap_or(usize::MAX))?;
     // Both buffers are sized to exactly what the plan loads, which the budget
@@ -3722,17 +3729,12 @@ fn place_trained_dictionary(output: &Path, dict: &[u8], samples: &[fs::Metadata]
     placed
 }
 
-/// The COVER tuning `--train-cover=...` asked for, scored at `level` as the
-/// reference's command scores at its `-#` (zstdcli.c, `dictCLevel`). A listed
-/// tuning starts from zero, a bare flag from the command's defaults. `split`
-/// is a percentage and `k` at least `d` (the most a search over `d` tries,
-/// 8, when `d` is not given); both are settled here, before any sample is
-/// read.
-fn cover_options(
-    params: &TrainerParams,
-    level: i32,
-) -> Result<structured_zstd::dictionary::CoverOptions> {
-    cover_tuning(params, level, "--train-cover")
+/// The COVER tuning `--train-cover=...` asked for. A listed tuning starts from
+/// zero, a bare flag from the command's defaults. `split` is a percentage and
+/// `k` at least `d` (the most a search over `d` tries, 8, when `d` is not
+/// given); both are settled here, before any sample is read.
+fn cover_options(params: &TrainerParams) -> Result<structured_zstd::dictionary::CoverOptions> {
+    cover_tuning(params, "--train-cover")
 }
 
 /// The split a tuning report shows: the percentage `split=` was given as.
@@ -3744,7 +3746,6 @@ fn split_percent(split_point: f64) -> u32 {
 
 fn cover_tuning(
     params: &TrainerParams,
-    level: i32,
     flag: &str,
 ) -> Result<structured_zstd::dictionary::CoverOptions> {
     use structured_zstd::dictionary::CoverOptions;
@@ -3756,13 +3757,9 @@ fn cover_tuning(
             steps: 0,
             split_point: 0.0,
             shrink: None,
-            level,
         }
     } else {
-        CoverOptions {
-            level,
-            ..CoverOptions::default()
-        }
+        CoverOptions::default()
     };
     if let Some(split) = params.split_percent {
         if split > 100 {
@@ -3788,7 +3785,6 @@ fn cover_tuning(
 /// in `1..=10`, and the rest as [`cover_options`] checks it.
 fn fastcover_options(
     params: &TrainerParams,
-    level: i32,
 ) -> Result<structured_zstd::dictionary::FastCoverOptions> {
     use structured_zstd::dictionary::FastCoverOptions;
 
@@ -3800,7 +3796,7 @@ fn fastcover_options(
         bail!("{FLAG} d must be 6 or 8, got {d}");
     }
     let mut options = FastCoverOptions {
-        cover: cover_tuning(params, level, FLAG)?,
+        cover: cover_tuning(params, FLAG)?,
         ..FastCoverOptions::default()
     };
     if params.listed {

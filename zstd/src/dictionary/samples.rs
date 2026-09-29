@@ -61,10 +61,6 @@ impl<'a> SampleSet<'a> {
         &self.data[..self.offsets[count]]
     }
 
-    /// Divide the samples into those a dictionary is built from and those it
-    /// is scored on (upstream zstd `COVER_ctx_init`): below 1 the leading
-    /// `split_point` share builds and the rest scores; at 1 every sample does
-    /// both.
     /// Refuse the first `train` samples when none of them is `span` bytes
     /// long: a trainer counts a dmer only inside one sample, so none would be
     /// counted however long the samples run together. Known from the sizes,
@@ -82,6 +78,10 @@ impl<'a> SampleSet<'a> {
         ))
     }
 
+    /// Divide the samples into those a dictionary is built from and those it
+    /// is scored on (upstream zstd `COVER_ctx_init`): below 1 the leading
+    /// `split_point` share builds and the rest scores; at 1 every sample does
+    /// both.
     pub(super) fn split(&self, split_point: f64) -> io::Result<Split> {
         split_count(self.count(), split_point)
     }
@@ -128,9 +128,8 @@ pub(super) struct Split {
     pub(super) test: Range<usize>,
 }
 
-/// Why a segment trainer refused its input. It rides inside the
-/// `InvalidInput` error the trainer returns; [`TrainingError::of`] reads it
-/// back.
+/// Why a segment trainer or the finalizer refused its input. It rides inside
+/// the `InvalidInput` error returned; [`TrainingError::of`] reads it back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TrainingError {
@@ -140,7 +139,7 @@ pub enum TrainingError {
     /// bytes.
     Samples,
     /// The dictionary asked for is smaller than
-    /// [`TRAINER_DICT_SIZE_MIN`](super::TRAINER_DICT_SIZE_MIN).
+    /// [`MIN_TRAINED_DICT_SIZE`](super::MIN_TRAINED_DICT_SIZE).
     DictionaryTooSmall,
 }
 

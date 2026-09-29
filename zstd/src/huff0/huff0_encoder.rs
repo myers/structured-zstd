@@ -348,7 +348,8 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         self.weights_into(&mut buf).to_vec()
     }
 
-    fn write_table(&mut self) {
+    /// Write the table's description alone, ending on a byte boundary.
+    pub(crate) fn write_table(&mut self) {
         #[cfg(feature = "std")]
         {
             // Cached path: the size query that precedes every emit has already
@@ -918,8 +919,14 @@ impl HuffmanTable {
         };
     }
 
+    /// Encode the table's description into its own buffer, with `fse_table`
+    /// as the weights' FSE storage, so a writer that follows emits it without
+    /// encoding it again.
     #[cfg(feature = "std")]
-    fn fill_weight_description_from_codes(&mut self, fse_table: &mut fse_encoder::FSETable) {
+    pub(crate) fn fill_weight_description_from_codes(
+        &mut self,
+        fse_table: &mut fse_encoder::FSETable,
+    ) {
         // Before deriving the weights, not after: they cost a pass over the
         // whole alphabet, and a warm cache needs none of it.
         if self.cached_encoded_weight_description.state != DescriptionState::NotComputed {
@@ -992,6 +999,37 @@ impl HuffmanTable {
 
     pub fn build_from_weights(weights: &[usize]) -> Self {
         Self::build_from_weights_reusing(weights, None)
+    }
+
+    /// The optimal code for `counts` with no code longer than `max_bits`,
+    /// described at its longest code rather than at the limit (upstream zstd
+    /// `HUF_buildCTable_wksp`, whose returned `maxNbBits` the dictionary
+    /// finalizer hands to `HUF_writeCTable`). Unlike
+    /// [`Self::build_from_counts`] it runs no table-log search: the table
+    /// describes future literals, not these. The buffers come from
+    /// `scratch`, where [`WeightScratch::recycle`] returns the table.
+    #[cfg(feature = "dict-builder")]
+    pub(crate) fn build_limited_in(
+        counts: &[usize],
+        max_bits: usize,
+        scratch: &mut WeightScratch,
+    ) -> Self {
+        assert_histogram_fits_nodes::<false>(counts);
+        build_limited_weights_into(counts, max_bits, scratch);
+        // The smallest weight belongs to the longest code. Lowering every
+        // weight until it is one keeps each code's length and makes the table
+        // log the longest code's.
+        let step = scratch
+            .weights
+            .iter()
+            .copied()
+            .filter(|&weight| weight > 0)
+            .min()
+            .map_or(0, |weight| weight - 1);
+        for weight in scratch.weights.iter_mut().filter(|weight| **weight > 0) {
+            *weight -= step;
+        }
+        Self::build_from_weights_reusing(&scratch.weights, scratch.spare_table.take())
     }
 
     /// [`Self::build_from_weights`] filling a discarded table's buffers instead

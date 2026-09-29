@@ -1409,6 +1409,12 @@ pub(crate) struct CompressState<M: Matcher> {
     /// size and the encode cost in parity on the negative band. Set per frame
     /// alongside `strategy_tag`.
     pub(crate) literal_compression_disabled: bool,
+    /// Whether a matched block may be cut into several blocks after matching,
+    /// where its strategy and window call for it. `true` for every frame but a
+    /// dictionary's analysis, which has to see one written block per matched
+    /// block, as upstream's single-block analysis does (`ZDICT_countEStats`
+    /// compresses with `ZSTD_compressBlock`, which never splits).
+    pub(crate) post_split_allowed: bool,
 }
 
 /// Whether the HUF literal build should run the #167 table-log search for a
@@ -1781,6 +1787,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                     compression_level,
                     crate::encoding::CompressionLevel::Level(n) if n < 0
                 ),
+                post_split_allowed: true,
             },
             magicless: false,
             content_checksum: false,
@@ -2220,6 +2227,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     compression_level,
                     crate::encoding::CompressionLevel::Level(n) if n < 0
                 ),
+                post_split_allowed: true,
             },
             compression_level,
             magicless: false,
@@ -2481,6 +2489,49 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         );
         self.uncompressed_data = Some(source);
         self.finish_frame(all_blocks, total_uncompressed, &prep);
+    }
+
+    /// Write every matched block as one block, never cut after matching: what
+    /// a dictionary's analysis needs to tell each block's kind from the frame.
+    #[cfg(feature = "dict-builder")]
+    pub(crate) fn forbid_post_split(&mut self) {
+        self.state.post_split_allowed = false;
+    }
+
+    /// [`Self::compress`] for a source of `total` bytes, the frame written
+    /// over `out` rather than to the drain: with the content size known up
+    /// front the header goes first and the blocks straight after it, with no
+    /// block accumulator and no copy into the drain. The frame is the one
+    /// `compress` writes for the same source, hint and settings.
+    #[cfg(feature = "dict-builder")]
+    pub(crate) fn compress_known_into(&mut self, total: u64, out: &mut Vec<u8>) {
+        let prep = self.prepare_frame(crate::encoding::workspace::IngestPlan::Stream);
+        let mut source = self
+            .uncompressed_data
+            .take()
+            .expect("source must be set via set_source before compress_known_into()");
+        out.clear();
+        self.append_frame_header(total, &prep, out);
+        let header_len = out.len();
+        let mut block_source = ReaderBlockSource::new(&mut source);
+        let read = self.run_owned_block_loop(&mut block_source, prep.initial_size_hint, false, out);
+        self.uncompressed_data = Some(source);
+        assert_eq!(
+            read, total,
+            "the source held another length than its frame header"
+        );
+        #[cfg(feature = "hash")]
+        if self.content_checksum {
+            out.extend_from_slice(&(self.hasher.finish() as u32).to_le_bytes());
+        }
+        #[cfg(feature = "lsm")]
+        {
+            let emit_checksum = cfg!(feature = "hash") && self.content_checksum;
+            let blocks_end = out.len() - if emit_checksum { 4 } else { 0 };
+            self.populate_frame_emit_info(header_len, &out[header_len..blocks_end], emit_checksum);
+        }
+        #[cfg(not(feature = "lsm"))]
+        let _ = header_len;
     }
 
     /// Resets the compressor for the next frame, whose input reaches the
@@ -3229,6 +3280,19 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// Retrieve the drain
     pub fn take_drain(&mut self) -> Option<W> {
         self.compressed_data.take()
+    }
+
+    /// The matcher, for a caller that reads what it recorded between frames.
+    #[cfg(feature = "dict-builder")]
+    pub(crate) fn matcher_mut(&mut self) -> &mut M {
+        &mut self.state.matcher
+    }
+
+    /// Whether the last frame's blocks coded offsets with the fast matcher's
+    /// repeat policy, for a caller counting offset codes as they did.
+    #[cfg(feature = "dict-builder")]
+    pub(crate) fn uses_fast_offset_codes(&self) -> bool {
+        crate::encoding::blocks::uses_fast_offset_codes(self.state.strategy_tag)
     }
 
     /// Before calling [FrameCompressor::compress] you can replace the matcher

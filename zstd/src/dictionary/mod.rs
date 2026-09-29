@@ -17,61 +17,37 @@
 //! The `optimize_*` forms search segment and dmer sizes, scoring each candidate
 //! by the total size of the scoring samples compressed with it.
 //!
-//! [`create_raw_dict_from_slice`] and its reader forms build raw content from an
-//! undivided corpus instead, estimating segment value by k-mer frequency in a
-//! reservoir sample (Liao, Petri, Moffat and Wirth, "Effective construction of
-//! Relative Lempel-Ziv Dictionaries").
+//! [`create_raw_dict_from_slice`] and its reader and directory forms build raw
+//! content, with no entropy tables, from a corpus without sample sizes: the
+//! FastCOVER search `zstd --train` runs, over the corpus cut into samples.
 mod cover;
 mod fastcover;
-mod frequency;
+mod finalize;
 mod legacy;
-mod lmc;
-mod reservoir;
 mod samples;
 mod selection;
 mod suffix_array;
 
-use crate::bit_io::BitWriter;
-use crate::blocks::sequence_section::{
-    MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
-};
-use crate::decoding::dictionary::MAGIC_NUM as DICT_MAGIC_NUM;
-use crate::decoding::sequence_section_decoder::{LL_MAX_LOG, ML_MAX_LOG, OF_MAX_LOG};
-use crate::dictionary::reservoir::create_sample;
-use crate::fse::fse_encoder::{self, build_table_from_symbol_counts};
-use crate::huff0::HuffmanTable as HuffmanDecoderTable;
-use crate::huff0::huff0_encoder::{HuffmanEncoder, HuffmanTable as HuffmanEncoderTable};
-use core::cmp::Reverse;
 pub use legacy::DEFAULT_SELECTIVITY;
-use lmc::*;
 pub use samples::TrainingError;
 use samples::refuse;
 use std::{
-    boxed::Box,
-    collections::{BinaryHeap, HashMap},
     format,
     fs::{self, File},
     io::{self, Read},
     path::{Path, PathBuf},
-    // `vec` import covers the `vec![..]` macro used below: this crate is
-    // no_std-with-std-feature, so the std prelude isn't pulled in implicitly
-    // for top-level items in this module. Removing this import fails the
-    // build with `cannot find macro 'vec' in this scope` — verified.
-    vec,
     vec::Vec,
 };
 
 const MAX_TRAINING_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
-const MAX_HUFFMAN_STATS_BYTES: usize = 64 * 1024;
 
-/// Smallest size a trained dictionary can occupy, whatever it was trained on.
+/// Smallest `dict_size` a dictionary is trained or finalized into (upstream
+/// zstd `ZDICT_DICTSIZE_MIN`).
 ///
-/// The magic number, the dictionary ID, the three repeat offsets and the
-/// shortest content the writers emit are unconditional; a real dictionary is
-/// larger still, since the entropy tables between them are never empty. Use it
-/// to reject an impossible `dict_size` before spending the corpus: the training
-/// entry points can only discover the true bound once those tables are built.
-pub const MIN_TRAINED_DICT_SIZE: usize = DICT_MAGIC_NUM.len() + 4 + 12 + 8;
+/// Use it to reject an impossible `dict_size` before spending the corpus. A
+/// size at or above it can still be too small once the entropy tables the
+/// samples produce are built, which only training can tell.
+pub const MIN_TRAINED_DICT_SIZE: usize = finalize::DICT_SIZE_MIN;
 
 /// Tuning for COVER training, the knobs of the reference's
 /// `ZDICT_cover_params_t`.
@@ -94,10 +70,10 @@ pub struct CoverOptions {
     /// dictionary of its own, and keep the first whose scoring samples
     /// compress to at most this many percent more than with the whole content
     /// (upstream zstd `COVER_selectDict`). A dictionary so found is its header
-    /// plus that tail, so none is smaller than the header plus 256 bytes.
+    /// plus that tail, so none is smaller than the header plus 256 bytes. A
+    /// search cuts its winner down this way; the parameters it chooses are
+    /// unchanged.
     pub shrink: Option<u32>,
-    /// Compression level candidates are scored at; zero is the default level.
-    pub level: i32,
 }
 
 impl Default for CoverOptions {
@@ -108,7 +84,6 @@ impl Default for CoverOptions {
             steps: 4,
             split_point: 1.0,
             shrink: None,
-            level: 0,
         }
     }
 }
@@ -121,8 +96,8 @@ impl Default for CoverOptions {
 /// building and the rest scoring.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FastCoverOptions {
-    /// Segment size, dmer size, search, split, shrink and scoring level, as for
-    /// COVER. `d` is at least 4 here; the reference takes 6 and 8.
+    /// Segment size, dmer size, search, split and shrink, as for COVER. `d` is
+    /// at least 4 here; the reference takes 6 and 8.
     pub cover: CoverOptions,
     /// Width of the dmer frequency table in bits, `1..=31`; its memory grows
     /// as `2^f`. Zero is 20.
@@ -145,39 +120,29 @@ impl Default for FastCoverOptions {
     }
 }
 
-/// Header options for a finalized dictionary.
+/// How a dictionary is finalized and trained against, the reference's
+/// `ZDICT_params_t`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FinalizeOptions {
     /// The dictionary id; `None` derives one from the content.
     pub dict_id: Option<u32>,
+    /// The compression level the dictionary is built for: the entropy tables
+    /// come from samples compressed at it, and the trainers score candidates
+    /// at it. Zero is the default level.
+    pub level: i32,
 }
 
-/// A set of values that are used during dictionary construction.
+/// Create a "raw content" dictionary of at most `dict_size` bytes, with no
+/// entropy tables, from every file in this directory and its subdirectories,
+/// and write it to `output`.
 ///
-/// Changing these values can improve the resulting dictionary size for certain datasets.
-// TODO: move `k` here.
-pub(super) struct DictParams {
-    /// Segment size.
-    ///
-    /// As found under "4. Experiments - Varying Segment Size" in the original paper, a
-    /// segment size of 2 kiB was effective.
-    ///
-    /// "We explored a range of \[`segment_size`\] values and found the performance of LMC is insensitive
-    /// to \[`segment_size`\]. We fix \[`segment_size`\] to 2kiB
-    ///
-    /// Reasonable range: [16, 2048+]
-    pub segment_size: u32,
-}
-
-/// Creates a "raw content" dictionary, training off of every file in this directory and all
-/// sub-directories.
-///
-/// The resulting dictionary will be approximately `dict_size` or less, and written to `output`.
+/// Each file is one sample, and the content is what [`optimize_fastcover_dict`]
+/// picks at its defaults, as `zstd --train` does; too few files to search is
+/// trained as [`create_raw_dict_from_slice`] trains an undivided corpus.
 ///
 /// # Errors
-/// This function returns `Ok(())` if the dictionary was created successfully, and an
-/// `Err(io::Error)` if an error was encountered reading the input directory or
-/// writing dictionary bytes to `output`.
+/// Returns an error reading the directory or its files, writing to `output`,
+/// or allocating the trainer's tables.
 ///
 /// # Examples
 /// ```no_run
@@ -209,22 +174,15 @@ pub fn create_raw_dict_from_dir<P: AsRef<Path>, W: io::Write>(
     }
     recurse_read(dir, &mut file_paths)?;
 
-    // Open each file and chain the readers together
-    let mut total_file_len: u64 = 0;
-    let mut file_handles: Vec<fs::File> = Vec::new();
+    // Every file is one sample.
+    let mut corpus = Vec::new();
+    let mut sizes = Vec::with_capacity(file_paths.len());
     for path in file_paths {
-        let handle = File::open(path)?;
-        total_file_len += handle.metadata()?.len();
-        file_handles.push(handle);
+        let before = corpus.len();
+        File::open(path)?.read_to_end(&mut corpus)?;
+        sizes.push(corpus.len() - before);
     }
-    let empty_reader: Box<dyn Read> = Box::new(io::empty());
-    let chained_files = file_handles
-        .iter()
-        .fold(empty_reader, |acc, reader| Box::new(acc.chain(reader)));
-
-    // Create a dict using the new reader
-    create_raw_dict_from_source(chained_files, total_file_len as usize, output, dict_size)?;
-    Ok(())
+    output.write_all(&fastcover_raw_content(&corpus, Some(&sizes), dict_size)?)
 }
 
 /// Read from `source` to create a "raw content" dictionary of `dict_size`.
@@ -242,10 +200,11 @@ pub fn create_raw_dict_from_dir<P: AsRef<Path>, W: io::Write>(
 /// sources too large to fit comfortably in memory.
 ///
 /// A corpus already in memory trains without this copy through
-/// [`create_raw_dict_from_slice`].
+/// [`create_raw_dict_from_slice`], whose training this is.
 ///
-/// # API note
-/// This public API returns `io::Result<()>` and propagates source/output I/O failures.
+/// # Errors
+/// Returns an error reading `source`, writing to `output`, or allocating the
+/// trainer's tables.
 pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     mut source: R,
     source_size: usize,
@@ -261,15 +220,18 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     create_raw_dict_from_slice(&all, output, dict_size)
 }
 
-/// Create a "raw content" dictionary of at most `dict_size` bytes from a
-/// corpus already in memory, writing it to `output`.
+/// Create a "raw content" dictionary of at most `dict_size` bytes, with no
+/// entropy tables, from a corpus already in memory, writing it to `output`.
 ///
-/// The same training as [`create_raw_dict_from_source`], reading `source` in
-/// place: a caller that holds the samples anyway does not pay for a second
-/// copy of them.
+/// The corpus has no sample sizes, so it is cut into at least sixteen samples
+/// of at most 128 KiB, and the content is what [`optimize_fastcover_dict`]
+/// picks over them at its defaults, as `zstd --train` does. A corpus no larger
+/// than `dict_size` is its own content; one the trainer refuses (a
+/// `dict_size` under [`MIN_TRAINED_DICT_SIZE`], too little to search) gives
+/// its last `dict_size` bytes.
 ///
 /// # Errors
-/// Returns the error `output` reports while the dictionary is written.
+/// Returns an error writing to `output` or allocating the trainer's tables.
 ///
 /// # Examples
 /// ```
@@ -287,330 +249,132 @@ pub fn create_raw_dict_from_slice<W: io::Write>(
     output: &mut W,
     dict_size: usize,
 ) -> io::Result<()> {
-    if dict_size == 0 || all.is_empty() {
-        return Ok(());
-    }
-
-    if all.len() < K {
-        let keep = usize::min(all.len(), dict_size);
-        output.write_all(&all[all.len() - keep..])?;
-        return Ok(());
-    }
-
-    let source_size = all.len();
-    vprintln!("create_dict: creating {dict_size} byte dict from {source_size} byte source");
-
-    let params = DictParams { segment_size: 2048 };
-    let num_segments = usize::max(1, source_size / params.segment_size as usize);
-    // According to 4. Experiments - Varying Reservoir Sampler Thresholds,
-    // setting reservoir size to collection size / min{collection size / (2 * number of segments),
-    // 256} was effective
-    let denom = usize::max(1, source_size / (2 * num_segments));
-    let sample_scale = usize::max(1, usize::min(denom, 256));
-    let mut sample_size = source_size / sample_scale;
-    sample_size = usize::max(sample_size, usize::min(source_size, 16));
-    vprintln!("create_dict: creating {sample_size} byte sample of collection");
-    let mut sample_reader = all;
-    let collection_sample = create_sample(&mut sample_reader, sample_size);
-
-    // A collection of segments to be used in the final dictionary.
-    //
-    // Contains the best segment from every epoch.
-    // Reverse is used because we want a min heap, where
-    // the lowest scoring items come first
-    let mut pool: BinaryHeap<Reverse<Segment>> = BinaryHeap::new();
-    let (num_epochs, epoch_size_kmers) = compute_epoch_info(&params, dict_size, source_size / K);
-    // Plain `*`/`+` throughout the epoch walk below: epochs partition the
-    // training source, so `epoch_size_kmers * K`, `epoch_idx * epoch_size`, and
-    // `start + epoch_size` are all bounded by the source length (<= isize::MAX)
-    // and cannot overflow usize.
-    let epoch_size = usize::max(K, epoch_size_kmers * K);
-    vprintln!("create_dict: computed epoch info, using {num_epochs} epochs of {epoch_size} bytes");
-    let mut epoch_counter = 0;
-    let mut ctx = Context {
-        frequencies: HashMap::with_capacity(epoch_size / K),
-    };
-    // Score each segment in each planned epoch and select the highest-scoring
-    // segment for the pool. Keep exactly `num_epochs` windows to avoid
-    // emitting more segments than the requested dictionary budget allows.
-    for epoch_idx in 0..num_epochs {
-        let start = epoch_idx * epoch_size;
-        if start >= all.len() {
-            break;
-        }
-        let end = if epoch_idx + 1 == num_epochs {
-            all.len()
-        } else {
-            usize::min(start + epoch_size, all.len())
-        };
-        let epoch = &all[start..end];
-        epoch_counter += 1;
-        let best_segment = pick_best_segment(&params, &mut ctx, epoch, &collection_sample);
-        vprintln!(
-            "\tcreate_dict: epoch {epoch_counter}/{num_epochs} has best segment score {}",
-            best_segment.score
-        );
-        pool.push(Reverse(best_segment));
-        // Wipe frequency list for next epoch
-        ctx.frequencies.clear();
-    }
-    vprintln!(
-        "create_dict: {epoch_counter} epochs written, writing {} segments",
-        pool.len()
-    );
-    // Write the dictionary with the highest scoring segment last because
-    // closer items can be represented with a smaller offset
-    while let Some(segment) = pool.pop() {
-        output.write_all(&segment.0.raw)?;
-    }
-    Ok(())
+    output.write_all(&fastcover_raw_content(all, None, dict_size)?)
 }
 
-/// The `i`th of [`MAX_HUFFMAN_STATS_BYTES`] samples spread evenly over `len`
-/// bytes.
-///
-/// Computed in 64 bits: `i * len` reaches 2^48 for an addressable corpus, which
-/// a 32-bit `usize` cannot hold — the product overflows for any corpus past
-/// 64 KiB there, and the multiply panics rather than sampling. The quotient is
-/// always below `len`, so the narrowing back is exact.
-fn strided_index(i: usize, len: usize) -> usize {
-    ((i as u64 * len as u64) / MAX_HUFFMAN_STATS_BYTES as u64) as usize
-}
+/// Largest sample an undivided corpus is cut into: upstream zstd's largest
+/// block, the most of a sample a dictionary's statistics read.
+const RAW_SAMPLE_MAX: usize = 128 << 10;
+/// Fewest samples an undivided corpus is cut into, so the search has samples
+/// to build from and samples to score on.
+const RAW_SAMPLES_MIN: usize = 16;
 
-fn serialize_huffman_table(sample_data: &[u8], raw_content: &[u8]) -> io::Result<Vec<u8>> {
-    fn bounded_huffman_stats(data: &[u8]) -> Vec<u8> {
-        if data.len() <= MAX_HUFFMAN_STATS_BYTES {
-            return data.to_vec();
-        }
-
-        let mut stats = Vec::with_capacity(MAX_HUFFMAN_STATS_BYTES);
-        for i in 0..MAX_HUFFMAN_STATS_BYTES {
-            stats.push(data[strided_index(i, data.len())]);
-        }
-        stats
-    }
-
-    let source = if sample_data.len() >= 2 {
-        sample_data
-    } else {
-        raw_content
-    };
-    let mut stats = bounded_huffman_stats(source);
-    if stats.len() < 2 || stats.iter().all(|b| *b == stats[0]) {
-        // A corpus with no distribution to measure gets a synthetic one. It
-        // stops at 128 symbols because a perfectly flat alphabet gives every
-        // symbol the same weight: FSE cannot encode that (an RLE weight
-        // stream), and the direct nibble form addresses at most 128 symbols, so
-        // a full 0..=255 alphabet would have no description at all.
-        stats = (0u8..128).collect();
-    }
-
-    let mut table = HuffmanEncoderTable::build_from_data(stats.as_slice());
-    if table
-        .writeable_table_description_size(&mut crate::fse::fse_encoder::FSETable::blank())
-        .is_none()
-    {
-        // Sampled real data can land on the same shape: a flat alphabet wider
-        // than 128 symbols. Fall back to the synthetic narrow one, which always
-        // has a description.
-        stats = (0u8..128).collect();
-        table = HuffmanEncoderTable::build_from_data(stats.as_slice());
-    }
-    let mut writer = BitWriter::new();
-    let mut encoder = HuffmanEncoder::new(&table, &mut writer);
-    encoder.encode(&[stats[0]], true);
-    let encoded = writer.dump();
-
-    let mut decoder = HuffmanDecoderTable::new();
-    let table_size = decoder
-        .build_decoder(encoded.as_slice())
-        .map_err(|e| io::Error::other(format!("failed to decode generated huffman table: {e}")))?;
-    Ok(encoded[..table_size as usize].to_vec())
-}
-
-fn serialize_fse_table(table: &fse_encoder::FSETable) -> Vec<u8> {
-    let mut writer = BitWriter::new();
-    table.write_table(&mut writer);
-    writer.dump()
-}
-
-fn bounded_fse_symbols(data: &[u8], max_symbol: u8) -> Vec<u8> {
-    let modulo = u16::from(max_symbol) + 1;
-    if data.is_empty() {
-        return Vec::from([0u8]);
-    }
-    if data.len() <= MAX_HUFFMAN_STATS_BYTES {
-        return data
-            .iter()
-            .map(|b| (u16::from(*b) % modulo) as u8)
-            .collect();
-    }
-
-    let mut out = Vec::with_capacity(MAX_HUFFMAN_STATS_BYTES);
-    for i in 0..MAX_HUFFMAN_STATS_BYTES {
-        let idx = strided_index(i, data.len());
-        out.push((u16::from(data[idx]) % modulo) as u8);
-    }
-    out
-}
-
-fn serialize_fse_table_from_corpus(
-    sample_data: &[u8],
-    raw_content: &[u8],
-    max_symbol: u8,
-    max_log: u8,
+/// Raw content of at most `dict_size` bytes from `corpus`, as `zstd --train`
+/// picks it: FastCOVER searching `k` over the samples `sizes` cuts, or over
+/// even cuts of the corpus when there are none or too few to search.
+fn fastcover_raw_content(
+    corpus: &[u8],
+    sizes: Option<&[usize]>,
+    dict_size: usize,
 ) -> io::Result<Vec<u8>> {
-    fn counts_total_for_source(source: &[u8], max_symbol: u8, counts: &mut [usize]) -> usize {
-        counts.fill(0);
-        for symbol in bounded_fse_symbols(source, max_symbol) {
-            counts[usize::from(symbol)] += 1;
+    if corpus.len() <= dict_size {
+        return Ok(corpus.to_vec());
+    }
+    let refused =
+        |result: &io::Result<Vec<u8>>| result.as_ref().err().and_then(TrainingError::of).is_some();
+    if let Some(sizes) = sizes {
+        let trained = search_raw_content(corpus, sizes, dict_size);
+        if !refused(&trained) {
+            return trained;
         }
-        counts.iter().sum::<usize>()
     }
-
-    let mut counts = vec![0usize; usize::from(max_symbol) + 1];
-    let using_sample = !sample_data.is_empty();
-    let mut total = counts_total_for_source(
-        if using_sample {
-            sample_data
-        } else {
-            raw_content
-        },
-        max_symbol,
-        &mut counts,
-    );
-    if total <= 1 && using_sample && !raw_content.is_empty() {
-        total = counts_total_for_source(raw_content, max_symbol, &mut counts);
+    let cut = corpus.len().div_ceil(RAW_SAMPLES_MIN).min(RAW_SAMPLE_MAX);
+    let even: Vec<usize> = corpus.chunks(cut).map(<[u8]>::len).collect();
+    let trained = search_raw_content(corpus, &even, dict_size);
+    if refused(&trained) {
+        return Ok(corpus[corpus.len() - dict_size..].to_vec());
     }
-    if total <= 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "insufficient symbol statistics for FSE table",
-        ));
-    }
-    let table = build_table_from_symbol_counts(&counts, max_log, false);
-    Ok(serialize_fse_table(&table))
+    trained
 }
 
-fn derive_dict_id(raw_content: &[u8]) -> u32 {
-    let mut h = 0xcbf29ce484222325u64;
-    for &b in raw_content {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    let compliant = (h % ((1u64 << 31) - 32768)) + 32768;
-    compliant as u32
+/// The content of the dictionary [`optimize_fastcover_dict`] picks at its
+/// defaults: the search keeps its winner's content and hands that back.
+fn search_raw_content(corpus: &[u8], sizes: &[usize], dict_size: usize) -> io::Result<Vec<u8>> {
+    let options = FastCoverOptions::default();
+    let space = SearchSpace::optimizing(&options.cover, 0.75)?;
+    let (content, _) = run_fastcover(
+        corpus,
+        sizes,
+        dict_size,
+        &options,
+        FinalizeOptions::default(),
+        &space,
+        selection::Keep::Content,
+    )?;
+    Ok(content)
 }
 
-/// Finalize raw dictionary content into a full zstd dictionary binary
-/// (`magic + dict_id + entropy tables + offset history + content`).
+/// Finalize raw dictionary content into a dictionary of at most `dict_size`
+/// bytes: magic, id, entropy tables, repeat offsets and the content (the
+/// reference's `ZDICT_finalizeDictionary`).
+///
+/// The entropy tables are measured, not guessed: the first block of each
+/// sample is compressed with `raw_content` as a raw dictionary at
+/// [`FinalizeOptions::level`], and the tables describe the literals and
+/// sequences those blocks produced. `samples` is every sample back to back and
+/// `sample_sizes` their lengths. Content that does not fit after the header is
+/// cut from the front: trainers place their best segments last.
+///
+/// # Errors
+///
+/// `InvalidInput` when `raw_content` is empty, when `dict_size` is below
+/// [`MIN_TRAINED_DICT_SIZE`] or leaves less than eight bytes of content after
+/// the header, when the id is zero, or when `sample_sizes` does not add up to
+/// `samples.len()`; a size too small carries
+/// [`TrainingError::DictionaryTooSmall`].
+///
+/// # Examples
+///
+/// ```
+/// use structured_zstd::dictionary::{FinalizeOptions, finalize_raw_dict};
+///
+/// let mut samples = Vec::new();
+/// let mut sizes = Vec::new();
+/// for i in 0..50u32 {
+///     let line = format!("tenant=demo table=orders key={i} status=shipped\n");
+///     sizes.push(line.len());
+///     samples.extend_from_slice(line.as_bytes());
+/// }
+/// let content = b"tenant=demo table=orders key= status=shipped\n";
+/// let dict = finalize_raw_dict(content, &samples, &sizes, 1024, FinalizeOptions::default())
+///     .unwrap();
+/// assert!(dict.ends_with(content));
+/// ```
 pub fn finalize_raw_dict(
     raw_content: &[u8],
-    sample_data: &[u8],
+    samples: &[u8],
+    sample_sizes: &[usize],
     dict_size: usize,
     options: FinalizeOptions,
 ) -> io::Result<Vec<u8>> {
-    if raw_content.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "raw dictionary content must not be empty",
-        ));
-    }
-    let mut tables = serialize_huffman_table(sample_data, raw_content)?;
-    for (max_symbol, max_log) in ENTROPY_STREAMS {
-        tables.extend_from_slice(&serialize_fse_table_from_corpus(
-            sample_data,
-            raw_content,
-            max_symbol,
-            max_log,
-        )?);
-    }
-    let mut out = Vec::new();
-    assemble_dict(&mut out, raw_content, &tables, dict_size, options)?;
-    Ok(out)
+    check_finalize_dict_size(dict_size)?;
+    let set = samples::SampleSet::new(samples, sample_sizes)?;
+    finalize::finalize(raw_content, &set, set.count(), dict_size, options)
 }
 
-/// The offset, match-length and literal-length streams, in the order their
-/// tables follow the literals table in a dictionary.
-const ENTROPY_STREAMS: [(u8, u8); 3] = [
-    (MAX_OFFSET_CODE, OF_MAX_LOG),
-    (MAX_MATCH_LENGTH_CODE, ML_MAX_LOG),
-    (MAX_LITERAL_LENGTH_CODE, LL_MAX_LOG),
-];
-
-/// The entropy tables [`finalize_raw_dict`] writes, when `sample_data` alone
-/// decides them; `None` when the samples are too thin and the tables would
-/// fall back on the content, which then has to be finalized in full.
-fn sample_entropy_tables(sample_data: &[u8]) -> Option<Vec<u8>> {
-    if sample_data.len() < 2 {
-        return None;
-    }
-    let mut tables = serialize_huffman_table(sample_data, &[]).ok()?;
-    for (max_symbol, max_log) in ENTROPY_STREAMS {
-        tables.extend_from_slice(
-            &serialize_fse_table_from_corpus(sample_data, &[], max_symbol, max_log).ok()?,
-        );
-    }
-    Some(tables)
+/// Refuse a `dict_size` [`finalize_raw_dict`] cannot fill, from the size
+/// alone: below [`MIN_TRAINED_DICT_SIZE`]. Finalizing checks it first, before
+/// the samples; a caller holding the samples somewhere costly to walk can run
+/// it before that.
+///
+/// # Errors
+///
+/// `InvalidInput` carrying [`TrainingError::DictionaryTooSmall`].
+///
+/// # Examples
+///
+/// ```
+/// use structured_zstd::dictionary::{
+///     MIN_TRAINED_DICT_SIZE, TrainingError, check_finalize_dict_size,
+/// };
+///
+/// assert!(check_finalize_dict_size(MIN_TRAINED_DICT_SIZE).is_ok());
+/// let err = check_finalize_dict_size(MIN_TRAINED_DICT_SIZE - 1).unwrap_err();
+/// assert_eq!(TrainingError::of(&err), Some(TrainingError::DictionaryTooSmall));
+/// ```
+pub fn check_finalize_dict_size(dict_size: usize) -> io::Result<()> {
+    finalize::check_size(dict_size)
 }
-
-/// A dictionary of `raw_content` behind already serialized entropy `tables`,
-/// written over `out`, whose allocation a caller finalizing many candidates
-/// keeps from one to the next.
-fn assemble_dict(
-    out: &mut Vec<u8>,
-    raw_content: &[u8],
-    tables: &[u8],
-    dict_size: usize,
-    options: FinalizeOptions,
-) -> io::Result<()> {
-    out.clear();
-    out.reserve(dict_size.max(256));
-    out.extend_from_slice(&DICT_MAGIC_NUM);
-    let dict_id = options
-        .dict_id
-        .unwrap_or_else(|| derive_dict_id(raw_content));
-    if dict_id == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "dictionary id must be non-zero",
-        ));
-    }
-    out.extend_from_slice(&dict_id.to_le_bytes());
-    out.extend_from_slice(tables);
-
-    // Repeat offsets: keep default bootstrap history.
-    out.extend_from_slice(&1u32.to_le_bytes());
-    out.extend_from_slice(&4u32.to_le_bytes());
-    out.extend_from_slice(&8u32.to_le_bytes());
-
-    let min_content_size = 8usize;
-    let max_content_budget = dict_size.saturating_sub(out.len());
-    if max_content_budget < min_content_size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "dictionary size too small to fit header and offset history",
-        ));
-    }
-
-    let content = if raw_content.len() > max_content_budget {
-        &raw_content[raw_content.len() - max_content_budget..]
-    } else {
-        raw_content
-    };
-    if content.len() < min_content_size {
-        out.resize(out.len() + (min_content_size - content.len()), 0);
-    }
-    out.extend_from_slice(content);
-    Ok(())
-}
-
-/// Smallest dictionary, in bytes, any trainer here builds (upstream zstd
-/// `ZDICT_DICTSIZE_MIN`); a smaller one is refused with
-/// [`TrainingError::DictionaryTooSmall`]. Unlike [`MIN_TRAINED_DICT_SIZE`] it
-/// bounds a training request, so a caller can refuse one before loading the
-/// samples.
-pub const TRAINER_DICT_SIZE_MIN: usize = 256;
 
 /// The `k` and `d` values a training run tries, resolved from the options the
 /// way the reference's optimizers resolve theirs.
@@ -733,7 +497,7 @@ impl SearchSpace {
 /// `InvalidInput` for tuning out of range or for a `k` and `d` that no
 /// dictionary of `dict_size` bytes holds, where [`TrainingError::of`] reports
 /// [`TrainingError::Parameter`], and for a `dict_size` under
-/// [`TRAINER_DICT_SIZE_MIN`], where it reports
+/// [`MIN_TRAINED_DICT_SIZE`], where it reports
 /// [`TrainingError::DictionaryTooSmall`].
 ///
 /// # Examples
@@ -878,10 +642,10 @@ fn check_samples_and_dict_size<'s>(
 
 /// Refuse a dictionary smaller than any trainer builds.
 fn check_dict_size(dict_size: usize) -> io::Result<()> {
-    if dict_size < TRAINER_DICT_SIZE_MIN {
+    if dict_size < MIN_TRAINED_DICT_SIZE {
         return Err(refuse(
             TrainingError::DictionaryTooSmall,
-            &format!("a dictionary must be at least {TRAINER_DICT_SIZE_MIN} bytes"),
+            &format!("a dictionary must be at least {MIN_TRAINED_DICT_SIZE} bytes"),
         ));
     }
     Ok(())
@@ -898,7 +662,7 @@ fn check_dict_size(dict_size: usize) -> io::Result<()> {
 /// # Errors
 ///
 /// `InvalidInput` when `k` or `d` is zero or `d > k`, when `k` exceeds
-/// `dict_size`, when `dict_size` is under [`TRAINER_DICT_SIZE_MIN`], when there
+/// `dict_size`, when `dict_size` is under [`MIN_TRAINED_DICT_SIZE`], when there
 /// are fewer than five samples or they do not add up to `samples.len()`;
 /// [`TrainingError::of`] tells these causes apart.
 ///
@@ -995,15 +759,11 @@ fn run_cover(
     // A plain run with no shrinking prices nothing: its one dictionary is the
     // answer, as the reference's plain trainer returns it unscored.
     let scored = !plain || options.shrink.is_some() || space.split_point < 1.0;
-    let mut evaluator = selection::Evaluator::new(
-        &set,
-        split.train,
-        split.test.clone(),
-        dict_size,
-        options.level,
-        finalize,
-    );
-    let mut best = selection::Best::new();
+    let mut evaluator =
+        selection::Evaluator::new(&set, split.train, split.test.clone(), dict_size, finalize);
+    let mut best = selection::Best::new(selection::Keep::Dictionary {
+        shrink: options.shrink,
+    });
     let mut state = Vec::new();
     let mut content_scratch = Vec::new();
     // `None` beside a `d` is a dmer size these samples cannot index.
@@ -1033,7 +793,7 @@ fn run_cover(
             let built = match cover::CoverContext::new(&set, split.train, d) {
                 Ok(ctx) => Some(ctx),
                 Err(err) => {
-                    best.offer(Err(err), chosen);
+                    best.offer(Err(err), &[], chosen);
                     None
                 }
             };
@@ -1046,9 +806,13 @@ fn run_cover(
         if !scored {
             return Ok((evaluator.finalize(content)?, chosen));
         }
-        best.offer(evaluator.select(content, options.shrink), chosen);
+        // Ranked at full size; `finish` shrinks only the winner, as
+        // `CoverOptions::shrink` documents. Upstream's optimizer never applies
+        // its shrink at all, and cutting every candidate would multiply the
+        // search by the number of sizes tried.
+        best.offer(evaluator.score(content), content, chosen);
     }
-    best.finish()
+    best.finish(&mut evaluator)
 }
 
 /// Train a FastCOVER dictionary of at most `dict_size` bytes with the `k` and
@@ -1092,7 +856,18 @@ pub fn train_fastcover_dict(
     finalize: FinalizeOptions,
 ) -> io::Result<Vec<u8>> {
     let space = SearchSpace::fixed(&options.cover)?;
-    let (dict, _) = run_fastcover(samples, sample_sizes, dict_size, options, finalize, &space)?;
+    let keep = selection::Keep::Dictionary {
+        shrink: options.cover.shrink,
+    };
+    let (dict, _) = run_fastcover(
+        samples,
+        sample_sizes,
+        dict_size,
+        options,
+        finalize,
+        &space,
+        keep,
+    )?;
     Ok(dict)
 }
 
@@ -1138,7 +913,18 @@ pub fn optimize_fastcover_dict(
     finalize: FinalizeOptions,
 ) -> io::Result<(Vec<u8>, FastCoverOptions)> {
     let space = SearchSpace::optimizing(&options.cover, 0.75)?;
-    run_fastcover(samples, sample_sizes, dict_size, options, finalize, &space)
+    let keep = selection::Keep::Dictionary {
+        shrink: options.cover.shrink,
+    };
+    run_fastcover(
+        samples,
+        sample_sizes,
+        dict_size,
+        options,
+        finalize,
+        &space,
+        keep,
+    )
 }
 
 fn run_fastcover(
@@ -1148,6 +934,7 @@ fn run_fastcover(
     options: &FastCoverOptions,
     finalize: FinalizeOptions,
     space: &SearchSpace,
+    keep: selection::Keep,
 ) -> io::Result<(Vec<u8>, FastCoverOptions)> {
     let (f, accel) = fastcover_knobs(options, space)?;
     space.check_fits(dict_size)?;
@@ -1158,10 +945,16 @@ fn run_fastcover(
     let mut window = fastcover::WindowCounts::default();
     let mut freqs = Vec::new();
     let mut content_scratch = Vec::new();
-    let mut best = selection::Best::new();
+    let mut best = selection::Best::new(keep);
     // `None` beside a `d` is a dmer size these samples cannot count.
     let mut context: Option<(usize, Option<fastcover::FastCoverContext<'_>>)> = None;
-    let mut evaluator: Option<selection::Evaluator<'_>> = None;
+    let mut evaluator = selection::Evaluator::new(
+        &set,
+        fastcover::finalize_samples(split.train, accel),
+        split.test.clone(),
+        dict_size,
+        finalize,
+    );
     for (d, k) in space.pairs() {
         if !segment_fits(k, d, dict_size) {
             continue;
@@ -1188,7 +981,7 @@ fn run_fastcover(
             let built = match fastcover::FastCoverContext::new(&set, split.train, d, f, accel) {
                 Ok(ctx) => Some(ctx),
                 Err(err) => {
-                    best.offer(Err(err), chosen);
+                    best.offer(Err(err), &[], chosen);
                     None
                 }
             };
@@ -1197,24 +990,17 @@ fn run_fastcover(
         let Some(ctx) = context.as_ref().and_then(|(_, built)| built.as_ref()) else {
             continue;
         };
-        // The finalize share depends on `accel` alone, so every context agrees.
-        let evaluator = evaluator.get_or_insert_with(|| {
-            selection::Evaluator::new(
-                &set,
-                ctx.finalize_samples(split.train),
-                split.test.clone(),
-                dict_size,
-                options.cover.level,
-                finalize,
-            )
-        });
         let content = ctx.build(&mut freqs, &mut window, &mut content_scratch, dict_size, k)?;
         if !scored {
-            return Ok((evaluator.finalize(content)?, chosen));
+            return match keep {
+                selection::Keep::Content => Ok((content.to_vec(), chosen)),
+                selection::Keep::Dictionary { .. } => Ok((evaluator.finalize(content)?, chosen)),
+            };
         }
-        best.offer(evaluator.select(content, options.cover.shrink), chosen);
+        // Ranked at full size, the winner alone shrunk, as in the COVER search.
+        best.offer(evaluator.score(content), content, chosen);
     }
-    best.finish()
+    best.finish(&mut evaluator)
 }
 
 /// Train and finalize a dictionary with the reference's original trainer, the
@@ -1289,7 +1075,13 @@ pub fn create_legacy_dict_from_slice<W: io::Write>(
     // the corpus to its size limit inside the search alone, for its suffix
     // sort (zdict.c, `ZDICT_trainBuffer_legacy`), and builds the entropy tables
     // from all of them (`ZDICT_trainFromBuffer_unsafe_legacy`).
-    let finalized = finalize_raw_dict(content.as_slice(), samples, dict_size, finalize)?;
+    let finalized = finalize_raw_dict(
+        content.as_slice(),
+        samples,
+        sample_sizes,
+        dict_size,
+        finalize,
+    )?;
     output.write_all(finalized.as_slice())
 }
 

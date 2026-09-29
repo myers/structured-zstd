@@ -516,6 +516,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             pre_split: state.pre_split,
             huf_optimal_search: state.huf_optimal_search,
             literal_compression_disabled: state.literal_compression_disabled,
+            post_split_allowed: state.post_split_allowed,
         },
         workspace,
     };
@@ -773,10 +774,7 @@ fn encode_block_parts<M: Matcher>(
             ml: &mut ml_counts,
             of: &mut of_counts,
         };
-        let (ll_max, ml_max, of_max) = if matches!(
-            state.strategy_tag,
-            crate::encoding::strategy::StrategyTag::Fast
-        ) {
+        let (ll_max, ml_max, of_max) = if uses_fast_offset_codes(state.strategy_tag) {
             fill_and_count::<true>(raw_sequences, &mut state.offset_hist, counts, codes)
         } else {
             fill_and_count::<false>(raw_sequences, &mut state.offset_hist, counts, codes)
@@ -1266,7 +1264,7 @@ fn estimate_sequences_section_bytes(
         // Upstream zstd: OF code's value equals its additional-bits width.
         of_bits += of as usize;
     };
-    if matches!(strategy, crate::encoding::strategy::StrategyTag::Fast) {
+    if uses_fast_offset_codes(strategy) {
         for seq in sequences {
             count_offset(encode_offset_with_history_fast(
                 seq.off_base,
@@ -2932,7 +2930,7 @@ const ML_EXTRA_BITS: [u8; 53] = [
 /// table index. Every code's baseline is a multiple of its own extra-bit width,
 /// so masking off those bits is the same subtraction the ranges spelled out.
 #[inline]
-fn encode_literal_length(len: u32) -> (u8, u32, usize) {
+pub(crate) fn encode_literal_length(len: u32) -> (u8, u32, usize) {
     debug_assert!(len < 131_072, "literal length {len} out of encodable range");
     let code = if len < 64 {
         LL_CODE[len as usize]
@@ -2949,7 +2947,7 @@ fn encode_literal_length(len: u32) -> (u8, u32, usize) {
 ///
 /// Table-driven for the same reason as [`encode_literal_length`].
 #[inline]
-fn encode_match_len(len: u32) -> (u8, u32, usize) {
+pub(crate) fn encode_match_len(len: u32) -> (u8, u32, usize) {
     debug_assert!(
         (3..131_075).contains(&len),
         "match length {len} out of encodable range",
@@ -2968,7 +2966,7 @@ fn encode_match_len(len: u32) -> (u8, u32, usize) {
 /// history per RFC 8878 §3.1.2.5. Updates `offset_hist` in place.
 ///
 /// Encoded offset codes: 1/2/3 = repeat offsets, N+3 = new absolute offset N.
-pub(in crate::encoding) fn encode_offset_with_history(
+pub(crate) fn encode_offset_with_history(
     actual_offset: u32,
     lit_len: u32,
     offset_hist: &mut [u32; 3],
@@ -3033,6 +3031,14 @@ pub(in crate::encoding) fn encode_offset_with_history(
     encoded
 }
 
+/// Whether blocks at `strategy` code offsets with
+/// [`encode_offset_with_history_fast`] rather than the full repeat search of
+/// [`encode_offset_with_history`].
+#[inline]
+pub(crate) fn uses_fast_offset_codes(strategy: crate::encoding::strategy::StrategyTag) -> bool {
+    matches!(strategy, crate::encoding::strategy::StrategyTag::Fast)
+}
+
 /// Fast-matcher offset→offBase conversion, mirroring upstream zstd's
 /// `ZSTD_compressBlock_fast`: emit offBase 1 only for the immediate repeat
 /// offset (`rep[0]` when `lit_len > 0`, `rep[1]` when `lit_len == 0` — the
@@ -3045,7 +3051,7 @@ pub(in crate::encoding) fn encode_offset_with_history(
 /// per-sequence probe the fast matcher never pays and can shift the FSE symbol
 /// histogram the wrong way). The repeat-offset history update follows directly
 /// from the emitted code, identical to the full converter's rules.
-pub(in crate::encoding) fn encode_offset_with_history_fast(
+pub(crate) fn encode_offset_with_history_fast(
     actual_offset: u32,
     lit_len: u32,
     offset_hist: &mut [u32; 3],
@@ -3075,7 +3081,7 @@ fn low_bits(value: u32, bits: usize) -> u32 {
     value & ((1u32 << bits) - 1)
 }
 
-fn encode_offset(len: u32) -> (u8, u32, usize) {
+pub(crate) fn encode_offset(len: u32) -> (u8, u32, usize) {
     let log = len.ilog2();
     let lower = len & ((1 << log) - 1);
     (log as u8, lower, log as usize)

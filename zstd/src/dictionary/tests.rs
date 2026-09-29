@@ -3,41 +3,7 @@ use crate::decoding::Dictionary;
 use crate::encoding::{CompressionLevel, EncoderDictionary, FrameCompressor};
 use std::io::Cursor;
 use std::string::ToString;
-
-/// The Huffman statistics are gathered by striding across the corpus, and the
-/// stride is `i * len` — a product that reaches 2^48 for an addressable corpus
-/// and so cannot be held by a 32-bit `usize`. Past 64 KiB of samples it
-/// overflowed there and the multiply panicked instead of sampling, which no
-/// amount of 64-bit testing shows. The index is computed in 64 bits now: the
-/// last sample of a corpus far larger than the statistics buffer still lands
-/// inside it, and the spread is even.
-#[test]
-fn statistics_are_strided_without_overflowing_the_index() {
-    let len = 4 * MAX_HUFFMAN_STATS_BYTES + 12_345;
-    assert_eq!(
-        strided_index(0, len),
-        0,
-        "the first sample is the first byte"
-    );
-    assert!(
-        strided_index(MAX_HUFFMAN_STATS_BYTES - 1, len) < len,
-        "and the last one is still inside the corpus"
-    );
-    // Evenly spread: each step advances by the corpus over the sample count.
-    assert_eq!(strided_index(1, len), len / MAX_HUFFMAN_STATS_BYTES);
-    assert_eq!(
-        strided_index(MAX_HUFFMAN_STATS_BYTES / 2, len),
-        len / 2,
-        "the middle sample is the middle of the corpus"
-    );
-    // The product that overflows a 32-bit `usize`: 2^16 samples over a corpus
-    // of 2^32 bytes is 2^48, which only 64-bit arithmetic holds.
-    assert_eq!(
-        strided_index(MAX_HUFFMAN_STATS_BYTES - 1, u32::MAX as usize),
-        ((MAX_HUFFMAN_STATS_BYTES as u64 - 1) * u32::MAX as u64 / MAX_HUFFMAN_STATS_BYTES as u64)
-            as usize
-    );
-}
+use std::vec;
 
 fn training_data() -> Vec<u8> {
     training_samples().0
@@ -100,7 +66,10 @@ fn fixed_fastcover(k: u32, d: u32) -> FastCoverOptions {
 #[test]
 fn plain_trainers_write_a_parseable_dictionary() {
     let (data, sizes) = training_samples();
-    let finalize = FinalizeOptions { dict_id: Some(77) };
+    let finalize = FinalizeOptions {
+        dict_id: Some(77),
+        ..FinalizeOptions::default()
+    };
     let cover = train_cover_dict(&data, &sizes, 4096, &fixed_cover(128, 8), finalize).unwrap();
     let fast =
         train_fastcover_dict(&data, &sizes, 4096, &fixed_fastcover(128, 8), finalize).unwrap();
@@ -294,6 +263,38 @@ fn shrink_keeps_a_smaller_dictionary_within_the_regression() {
     assert!(price(&strict, &data, &sizes) <= full_price);
 }
 
+/// In a search, `shrink` cuts the winner down rather than weighing every
+/// candidate at every size: the parameters chosen are the ones the search
+/// chooses without it, and the dictionary is that winner's, cut or whole.
+#[test]
+fn shrink_cuts_the_search_winner() {
+    let (data, sizes) = training_samples();
+    let options = CoverOptions {
+        split_point: 0.75,
+        ..CoverOptions::default()
+    };
+    let (whole, chosen) =
+        optimize_cover_dict(&data, &sizes, 8192, &options, FinalizeOptions::default()).unwrap();
+    let (cut, chosen_with_shrink) = optimize_cover_dict(
+        &data,
+        &sizes,
+        8192,
+        &CoverOptions {
+            shrink: Some(1000),
+            ..options
+        },
+        FinalizeOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        (chosen_with_shrink.k, chosen_with_shrink.d),
+        (chosen.k, chosen.d)
+    );
+    let content = |dict: &[u8]| Dictionary::decode_dict(dict).unwrap().dict_content;
+    assert!(cut.len() < whole.len());
+    assert!(content(&whole).ends_with(&content(&cut)));
+}
+
 /// A split below 1 scores on the trailing samples only: a split that leaves
 /// none of them, or fewer than five to build from, is refused.
 #[test]
@@ -438,7 +439,7 @@ fn samples_too_short_for_a_dmer_are_refused() {
 #[test]
 fn the_preflight_names_the_cause_the_trainer_names() {
     let (data, sizes) = training_samples();
-    let dict_size = TRAINER_DICT_SIZE_MIN - 1;
+    let dict_size = MIN_TRAINED_DICT_SIZE - 1;
     let cover = CoverOptions {
         k: 300,
         d: 8,
@@ -471,7 +472,7 @@ fn the_preflight_names_the_cause_the_trainer_names() {
 #[test]
 fn the_preflight_refuses_a_dictionary_under_the_trainer_minimum() {
     let (data, sizes) = training_samples();
-    let dict_size = TRAINER_DICT_SIZE_MIN - 1;
+    let dict_size = MIN_TRAINED_DICT_SIZE - 1;
     let cover = CoverOptions::default();
     let fastcover = FastCoverOptions::default();
     let trained = optimize_cover_dict(&data, &sizes, dict_size, &cover, FinalizeOptions::default())
@@ -549,11 +550,10 @@ fn a_frequency_table_too_wide_for_the_target_is_an_error() {
     assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
 }
 
-/// A corpus of one repeated byte carries no symbol distribution to describe, so
-/// the serializer substitutes a synthetic alphabet. That substitute has to be
-/// one the Huffman table description can actually express: a flat alphabet
-/// wider than 128 symbols has neither an FSE nor a direct representation, and
-/// training on such a corpus must not take the process down with it.
+/// A corpus of one repeated byte leaves the literal counts flat: every symbol
+/// at eight bits, which no Huffman description can express. The finalizer then
+/// describes a mostly flat distribution that can be written, and training on
+/// such a corpus must not take the process down with it.
 #[test]
 fn training_on_a_single_repeated_byte_does_not_crash() {
     let sample = vec![7u8; 4096];
@@ -562,7 +562,10 @@ fn training_on_a_single_repeated_byte_does_not_crash() {
         &[512; 8],
         4096,
         &fixed_fastcover(256, 8),
-        FinalizeOptions { dict_id: Some(1) },
+        FinalizeOptions {
+            dict_id: Some(1),
+            ..FinalizeOptions::default()
+        },
     )
     .expect("a uniform corpus must train");
     Dictionary::decode_dict(&dict).expect("the trained dictionary must parse back");
@@ -678,60 +681,104 @@ fn create_raw_dict_from_source_never_exceeds_requested_size() {
     );
 }
 
-/// The entropy tables a search builds once finalize every candidate into the
-/// same bytes `finalize_raw_dict` writes for it, including the content cut
-/// to fit and an explicit id; and where the samples are too thin to decide the
-/// tables, each candidate's content still does.
+/// Raw content is what `zstd --train`'s search picks over the corpus cut into
+/// samples: the dictionary the search finalizes ends with it (the finalizer
+/// only cuts the front to make room for its header).
 #[test]
-fn cached_entropy_tables_finalize_as_the_full_path_does() {
-    let (data, sizes) = training_samples();
-    let set = samples::SampleSet::new(&data, &sizes).unwrap();
-    for finalize in [
+fn raw_content_is_the_fastcover_search_winner() {
+    let corpus = training_data();
+    let dict_size = 4096;
+    let mut raw = Vec::new();
+    create_raw_dict_from_slice(&corpus, &mut raw, dict_size).unwrap();
+    assert!(!raw.is_empty() && raw.len() <= dict_size);
+
+    let cut = corpus.len().div_ceil(RAW_SAMPLES_MIN).min(RAW_SAMPLE_MAX);
+    let sizes: Vec<usize> = corpus.chunks(cut).map(<[u8]>::len).collect();
+    let (dict, _) = optimize_fastcover_dict(
+        &corpus,
+        &sizes,
+        dict_size,
+        &FastCoverOptions::default(),
         FinalizeOptions::default(),
-        FinalizeOptions {
-            dict_id: Some(0x1234_5678),
-        },
-    ] {
-        let evaluator = selection::Evaluator::new(&set, sizes.len(), 0..0, 1024, 3, finalize);
-        for content in [&data[..300], &data[1000..5000], &data[..8]] {
-            assert_eq!(
-                evaluator.finalize(content).unwrap(),
-                finalize_raw_dict(content, &data, 1024, finalize).unwrap()
-            );
+    )
+    .unwrap();
+    let finalized = Dictionary::decode_dict(&dict).unwrap();
+    assert!(raw.ends_with(&finalized.dict_content));
+}
+
+/// A corpus no larger than the dictionary is all of its content.
+#[test]
+fn a_corpus_that_fits_is_its_own_raw_content() {
+    let corpus = &training_data()[..3000];
+    let mut raw = Vec::new();
+    create_raw_dict_from_slice(corpus, &mut raw, 4096).unwrap();
+    assert_eq!(raw, corpus);
+}
+
+/// A directory trains one sample per file, and its raw dictionary shortens a
+/// small frame of the same kind of data.
+#[test]
+fn raw_content_from_a_directory_helps_a_small_frame() {
+    let dir = std::env::temp_dir().join(std::format!("szstd-raw-dir-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    for file in 0..40u32 {
+        let mut body = std::string::String::new();
+        for line in 0..30u32 {
+            body.push_str(&std::format!(
+                "tenant=demo table=orders key={} region=eu status=shipped\n",
+                file * 30 + line
+            ));
         }
+        fs::write(dir.join(std::format!("s{file:02}")), body).unwrap();
     }
-    let thin = samples::SampleSet::new(&data[..1], &[1]).unwrap();
-    let evaluator = selection::Evaluator::new(&thin, 1, 0..0, 1024, 3, FinalizeOptions::default());
-    let content = &data[..600];
-    assert_eq!(
-        evaluator.finalize(content).ok(),
-        finalize_raw_dict(content, &data[..1], 1024, FinalizeOptions::default()).ok()
-    );
+    let mut raw = Vec::new();
+    let trained = create_raw_dict_from_dir(&dir, &mut raw, 2048);
+    fs::remove_dir_all(&dir).unwrap();
+    trained.unwrap();
+    assert!(!raw.is_empty() && raw.len() <= 2048);
+
+    let frame = b"tenant=demo table=orders key=77 region=eu status=shipped\n";
+    let compress = |dict: Option<&[u8]>| {
+        let mut out = Vec::new();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        if let Some(dict) = dict {
+            compressor
+                .set_dictionary(Dictionary::from_raw_content(7, dict.to_vec()).unwrap())
+                .unwrap();
+        }
+        compressor.set_source(&frame[..]);
+        compressor.set_drain(&mut out);
+        compressor.compress();
+        out.len()
+    };
+    assert!(compress(Some(&raw)) < compress(None));
 }
 
 #[test]
 fn finalize_raw_dict_rejects_empty_raw_content() {
-    let sample = training_data();
-    let err = finalize_raw_dict(&[], sample.as_slice(), 4096, FinalizeOptions::default())
+    let (data, sizes) = training_samples();
+    let err = finalize_raw_dict(&[], &data, &sizes, 4096, FinalizeOptions::default())
         .expect_err("empty raw dictionary must be rejected");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 }
 
 #[test]
 fn finalize_raw_dict_rejects_too_small_budget() {
-    let sample = training_data();
+    let (data, sizes) = training_samples();
     let raw = b"some-raw-bytes";
-    let err = finalize_raw_dict(raw, sample.as_slice(), 32, FinalizeOptions::default())
-        .expect_err("tiny dict_size must fail");
-    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    assert!(err.to_string().contains("dictionary size too small"));
+    for dict_size in [32, MIN_TRAINED_DICT_SIZE - 1] {
+        let err = finalize_raw_dict(raw, &data, &sizes, dict_size, FinalizeOptions::default())
+            .expect_err("tiny dict_size must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("dictionary size too small"));
+    }
 }
 
 #[test]
 fn finalize_raw_dict_pads_to_minimum_content_size() {
-    let sample = training_data();
+    let (data, sizes) = training_samples();
     let raw = b"x";
-    let finalized = finalize_raw_dict(raw, sample.as_slice(), 4096, FinalizeOptions::default())
+    let finalized = finalize_raw_dict(raw, &data, &sizes, 4096, FinalizeOptions::default())
         .expect("finalize should pad small raw content");
     let parsed = Dictionary::decode_dict(finalized.as_slice()).expect("finalized dict parses");
     assert!(parsed.dict_content.len() >= 8);
@@ -740,15 +787,54 @@ fn finalize_raw_dict_pads_to_minimum_content_size() {
 
 #[test]
 fn finalize_raw_dict_rejects_zero_dict_id() {
-    let sample = training_data();
+    let (data, sizes) = training_samples();
     let raw = b"raw-fastcover-bytes";
     let err = finalize_raw_dict(
         raw,
-        sample.as_slice(),
+        &data,
+        &sizes,
         4096,
-        FinalizeOptions { dict_id: Some(0) },
+        FinalizeOptions {
+            dict_id: Some(0),
+            ..FinalizeOptions::default()
+        },
     )
     .expect_err("dict_id=0 must be rejected");
     assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     assert_eq!(err.to_string(), "dictionary id must be non-zero");
+}
+
+/// A dictionary too small is refused before the samples are walked, as
+/// upstream's `ZDICT_finalizeDictionary` checks the capacity first: sizes that
+/// do not describe the samples are not what the refusal reports.
+#[test]
+fn finalize_raw_dict_refuses_an_undersized_dictionary_before_the_samples() {
+    let (data, sizes) = training_samples();
+    let err = finalize_raw_dict(
+        b"content",
+        &data,
+        &sizes[1..],
+        MIN_TRAINED_DICT_SIZE - 1,
+        FinalizeOptions::default(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        TrainingError::of(&err),
+        Some(TrainingError::DictionaryTooSmall)
+    );
+}
+
+/// The sample sizes must describe the samples exactly.
+#[test]
+fn finalize_raw_dict_rejects_sizes_that_do_not_add_up() {
+    let (data, sizes) = training_samples();
+    let err = finalize_raw_dict(
+        b"content",
+        &data,
+        &sizes[1..],
+        4096,
+        FinalizeOptions::default(),
+    )
+    .unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 }
