@@ -27,6 +27,7 @@ use super::match_generator::{
 use super::match_table::helpers::{common_prefix_len_with_kernel, extend_backwards_shared};
 use super::match_table::storage::{REBASE_RESET_FLOOR_CEILING, check_stream_abs_headroom};
 use super::opt::types::MatchCandidate;
+use super::util::hash_top_bits;
 use super::workspace::{HistoryBuf, RetiredHistory, Table, Workspace, region_bytes};
 
 /// Upstream zstd `HASH_READ_SIZE` (`zstd_compress_internal.h`): the largest probe
@@ -238,11 +239,31 @@ const DFAST_TAGGED_REBASE: u32 = 1 << 23;
 /// the rebase above keeps `DFAST_TAGGED_MAX_REL - DFAST_TAGGED_REBASE` bytes,
 /// a little under 2^23, which covers this window and a block.
 pub(crate) const DFAST_TAGGED_WINDOW_LIMIT: usize = 1 << 22;
+/// Smallest window whose frames tag the live tables. A tagged scan carries
+/// three tags across its loop; x86_64 holds them in registers, i686 with seven
+/// general registers spills them, and there the tag only pays once the window
+/// is large enough for the candidate load it skips to miss the cache. Measured
+/// on i686: bare slots 3-5% faster at a 16 KiB window and 1.5% at 64 KiB, tags
+/// 1-2.5% faster from 256 KiB; x86_64 tags win at every size.
+#[cfg(target_arch = "x86")]
+pub(crate) const DFAST_TAGGED_WINDOW_FLOOR: usize = 1 << 18;
+/// See the i686 definition: elsewhere every eligible window is tagged, the
+/// policy measured on x86_64 and the one targets without a measurement of their
+/// own take.
+#[cfg(not(target_arch = "x86"))]
+pub(crate) const DFAST_TAGGED_WINDOW_FLOOR: usize = 0;
 const _: () = assert!(
     DFAST_TAGGED_MAX_REL - DFAST_TAGGED_REBASE as usize
         >= DFAST_TAGGED_WINDOW_LIMIT + crate::common::MAX_BLOCK_SIZE as usize,
     "a tagged rebase must keep the whole window",
 );
+
+/// The slot index a hash product's top `64 - shift` bits form (a table holds
+/// at most 2^30 slots, so the width stays within the helper's 32 bits).
+#[inline(always)]
+fn dfast_slot(mixed: u64, shift: usize) -> usize {
+    hash_top_bits(mixed, (64 - shift) as u32) as usize
+}
 
 /// The tag of a hash product whose top bits (above `shift`) form the slot
 /// index: the `DFAST_TAG_BITS` bits right below the index.
@@ -1043,10 +1064,10 @@ impl DfastMatchGenerator {
                 let v8 = (load_ptr as *const u64).read_unaligned();
                 // Upstream zstd 5-byte short hash (ZSTD_hash5 shape): low 5 bytes in
                 // the high 40 bits (`v8 << 24`), matching `short_hash_index`.
-                let short_idx = ((v8 << 24).wrapping_mul(PRIME) >> short_shift) as usize;
                 let long_mixed = v8.wrapping_mul(PRIME);
                 let short_mixed = (v8 << 24).wrapping_mul(PRIME);
-                let long_idx = (long_mixed >> long_shift) as usize;
+                let short_idx = dfast_slot(short_mixed, short_shift);
+                let long_idx = dfast_slot(long_mixed, long_shift);
                 // Upstream `ZSTD_writeTaggedIndex`: the slot packs the index
                 // with the next `DFAST_TAG_BITS` bits of the hash, so a
                 // probe rejects a colliding slot on the tag alone, without
@@ -1067,7 +1088,7 @@ impl DfastMatchGenerator {
                 let b5 = *load_ptr.add(4) as u64;
                 let v5 = (lo4 | (b5 << 32)) << 24;
                 let short_mixed = v5.wrapping_mul(PRIME);
-                let short_idx = (short_mixed >> short_shift) as usize;
+                let short_idx = dfast_slot(short_mixed, short_shift);
                 *short_ptr.add(short_idx) =
                     (((pos as u32) + 1) << DFAST_TAG_BITS) | dfast_tag(short_mixed, short_shift);
             }
@@ -1297,8 +1318,8 @@ impl DfastMatchGenerator {
         let v4_0 = v8_0 & 0xFFFF_FFFF;
         let mixed_l0 = v8_0.wrapping_mul(PRIME);
         let mixed_s0 = (v8_0 << 24).wrapping_mul(PRIME);
-        let hl0_idx = (mixed_l0 >> long_shift) as usize;
-        let hs0_idx = (mixed_s0 >> short_shift) as usize;
+        let hl0_idx = dfast_slot(mixed_l0, long_shift);
+        let hs0_idx = dfast_slot(mixed_s0, short_shift);
 
         // Read-only on the hash tables here — unlike the inner loop's
         // "update-before-check" pattern, the writes at `hl0_idx` /
@@ -1884,12 +1905,12 @@ impl DfastMatchGenerator {
                         // a single mul on the per-byte insert path. Short hash keys
                         // on the upstream zstd 5-byte window (`v8 << 24`, ZSTD_hash5 shape).
                         let mixed_short = (v8 << 24).wrapping_mul(0xCF1BBCDCB7A56463_u64);
-                        let short_idx = (mixed_short >> short_shift) as usize;
+                        let short_idx = dfast_slot(mixed_short, short_shift);
                         *short_hash_ptr.add(short_idx) =
                             live_slot::<TAGGED>(packed, mixed_short, short_shift);
                         if $dense {
                             let mixed_long = v8.wrapping_mul(0xCF1BBCDCB7A56463_u64);
-                            let long_idx = (mixed_long >> long_shift) as usize;
+                            let long_idx = dfast_slot(mixed_long, long_shift);
                             *long_hash_ptr.add(long_idx) =
                                 live_slot::<TAGGED>(packed, mixed_long, long_shift);
                         }
@@ -1915,7 +1936,7 @@ impl DfastMatchGenerator {
                 let lo4 = (load_ptr as *const u32).read_unaligned() as u64;
                 let b5 = *load_ptr.add(4) as u64;
                 let mixed_short = ((lo4 | (b5 << 32)) << 24).wrapping_mul(0xCF1BBCDCB7A56463_u64);
-                let short_idx = (mixed_short >> short_shift) as usize;
+                let short_idx = dfast_slot(mixed_short, short_shift);
                 *short_hash_ptr.add(short_idx) =
                     live_slot::<TAGGED>(packed, mixed_short, short_shift);
             }
@@ -2014,7 +2035,7 @@ impl DfastMatchGenerator {
                 // SAFETY: the gate above puts `idx + 8` inside `concat_len`.
                 let value = unsafe { (src.add(idx) as *const u64).read_unaligned() };
                 let mixed = value.wrapping_mul(PRIME);
-                let slot = (mixed >> long_shift) as usize;
+                let slot = dfast_slot(mixed, long_shift);
                 debug_assert!(slot < self.long_len());
                 // SAFETY: `long_shift = 64 - long_hash_bits`, so `slot` is
                 // below `1 << long_hash_bits`, the long table's length.
@@ -2036,7 +2057,7 @@ impl DfastMatchGenerator {
                     )
                 };
                 let mixed = ((lo4 | (b5 << 32)) << 24).wrapping_mul(PRIME);
-                let slot = (mixed >> short_shift) as usize;
+                let slot = dfast_slot(mixed, short_shift);
                 debug_assert!(slot < self.short_len());
                 // SAFETY: `short_shift = 64 - short_hash_bits`, so `slot` is
                 // below the short table's length, and `short_mut_ptr` already
@@ -2105,7 +2126,7 @@ impl DfastMatchGenerator {
         if idx + 5 <= concat_len {
             let short_shift = 64 - self.short_hash_bits;
             let mixed = short_hash_key(&concat[idx..]).wrapping_mul(DFAST_HASH_PRIME);
-            let short = (mixed >> short_shift) as usize;
+            let short = dfast_slot(mixed, short_shift);
             debug_assert!(short < self.short_len());
             // Short region starts at `long_len`.
             let slot = self.long_len() + short;
@@ -2119,7 +2140,7 @@ impl DfastMatchGenerator {
             let long_shift = 64 - self.long_hash_bits;
             let key = u64::from_le_bytes(concat[idx..idx + 8].try_into().unwrap());
             let mixed = key.wrapping_mul(DFAST_HASH_PRIME);
-            let long = (mixed >> long_shift) as usize;
+            let long = dfast_slot(mixed, long_shift);
             debug_assert!(long < self.long_len());
             unsafe {
                 *self.tables.get_unchecked_mut(long) =
@@ -2507,7 +2528,7 @@ macro_rules! start_matching_fast_loop_body {
                 let v8 = (history_base_ptr.add(history_start_offset + concat_idx) as *const u64)
                     .read_unaligned();
                 let mixed = v8.wrapping_mul(PRIME);
-                hl0_idx = (mixed >> long_shift) as usize;
+                hl0_idx = dfast_slot(mixed, long_shift);
                 tl0 = if $tagged { dfast_tag(mixed, long_shift) } else { 0 };
                 idxl0 = *long_hash_ptr.add(hl0_idx);
             }
@@ -2608,7 +2629,7 @@ macro_rules! start_matching_fast_loop_body {
                 // second load competing with the probe loads for the same ports.
                 let v4_0 = v8_0 & 0xFFFF_FFFF;
                 let mixed_s0 = (v8_0 << 24).wrapping_mul(PRIME);
-                let hs0_idx = (mixed_s0 >> short_shift) as usize;
+                let hs0_idx = dfast_slot(mixed_s0, short_shift);
                 let ts0 = if $tagged { dfast_tag(mixed_s0, short_shift) } else { 0 };
                 let idxs0 = unsafe { *short_hash_ptr.add(hs0_idx) };
 
@@ -2746,7 +2767,7 @@ macro_rules! start_matching_fast_loop_body {
                         .read_unaligned()
                 };
                 let mixed_l1 = v8_1.wrapping_mul(PRIME);
-                let hl1_idx = (mixed_l1 >> long_shift) as usize;
+                let hl1_idx = dfast_slot(mixed_l1, long_shift);
                 let tl1 = if $tagged { dfast_tag(mixed_l1, long_shift) } else { 0 };
 
                 // Prefetch the RANDOM-ACCESS long slot the loop is about to
@@ -3227,8 +3248,8 @@ macro_rules! start_matching_dict_loop_body {
                 // SAFETY: the loop guard keeps `ip + 8 <= block_len`.
                 let v8 = unsafe { (block_ptr.add(ip) as *const u64).read_unaligned() };
                 let v4 = v8 as u32;
-                let hl_idx = (v8.wrapping_mul(PRIME) >> long_shift) as usize;
-                let hs_idx = ((v8 << 24).wrapping_mul(PRIME) >> short_shift) as usize;
+                let hl_idx = dfast_slot(v8.wrapping_mul(PRIME), long_shift);
+                let hs_idx = dfast_slot((v8 << 24).wrapping_mul(PRIME), short_shift);
                 // SAFETY: both indices are below their table's length.
                 let (idxl, idxs) =
                     unsafe { (*long_hash_ptr.add(hl_idx), *short_hash_ptr.add(hs_idx)) };
@@ -3471,7 +3492,7 @@ macro_rules! start_matching_dict_loop_body {
                 if ip + 1 + HASH_READ_SIZE <= block_len {
                     // SAFETY: guarded directly above.
                     let v8_1 = unsafe { (block_ptr.add(ip + 1) as *const u64).read_unaligned() };
-                    let hl1_idx = (v8_1.wrapping_mul(PRIME) >> long_shift) as usize;
+                    let hl1_idx = dfast_slot(v8_1.wrapping_mul(PRIME), long_shift);
                     // SAFETY: the index is below the long table's length.
                     let idxl1 = unsafe { *long_hash_ptr.add(hl1_idx) };
                     let packed_next = packed_curr + 1;

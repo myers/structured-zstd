@@ -18,7 +18,18 @@ fn reset_in(
         crate::encoding::workspace::IngestPlan::Stream,
     );
     ws.open(FastHashTable::workspace_bytes(hash_log), 0);
-    m.reset(window_log, hash_log, mls, step_size, carry, ws);
+    // A frame of unknown size without a dictionary: the window is the input
+    // it can write.
+    m.reset(
+        window_log,
+        hash_log,
+        mls,
+        step_size,
+        1usize << window_log,
+        0,
+        carry,
+        ws,
+    );
 }
 
 const LEVEL_1_SHAPE: (u8, u32, u32, usize) = (
@@ -234,12 +245,15 @@ fn reset_keeps_table_when_overwritten_by_restore() {
     // SAFETY: hash 7 < (1 << hash_log = 1024) table entries.
     unsafe { m.hash_table.put(probe_hash, 0xCAFE) };
 
-    // Same shape + restore-pending: contents survive the reset.
+    // This geometry fills its table enough to be tagged.
+    assert!(m.slots_tagged());
+
+    // Same shape + restore-pending in the same slot format: contents survive.
     reset_in(
         &mut m,
         &mut ws,
         (16, 10, 4, 2),
-        TableCarry::OverwrittenByRestore,
+        TableCarry::OverwrittenByRestore { tagged: true },
     );
     // SAFETY: same bounds as the put above.
     assert_eq!(
@@ -247,6 +261,23 @@ fn reset_keeps_table_when_overwritten_by_restore() {
         0xCAFE,
         "restore-pending reset must not clear the table"
     );
+
+    // A snapshot in the other slot format will not be restored (its key
+    // differs), so a reset that claims it anyway must still empty the table.
+    reset_in(
+        &mut m,
+        &mut ws,
+        (16, 10, 4, 2),
+        TableCarry::OverwrittenByRestore { tagged: false },
+    );
+    // SAFETY: same bounds as the put above.
+    assert_eq!(
+        unsafe { m.hash_table.get(probe_hash) },
+        0,
+        "a restore in the other slot format must not leave the table uncleared"
+    );
+    // SAFETY: same bounds as the put above.
+    unsafe { m.hash_table.put(probe_hash, 0xCAFE) };
 
     // Plain same-shape reset: contents are memset back to empty.
     reset_in(&mut m, &mut ws, (16, 10, 4, 2), TableCarry::Clear);
@@ -264,7 +295,7 @@ fn reset_keeps_table_when_overwritten_by_restore() {
         &mut m,
         &mut ws,
         (16, 11, 4, 2),
-        TableCarry::OverwrittenByRestore,
+        TableCarry::OverwrittenByRestore { tagged: true },
     );
     assert_eq!(m.hash_table.hash_log(), 11);
     // SAFETY: hash 7 < (1 << 11) table entries.
@@ -1444,4 +1475,27 @@ fn block_zero_prologue_preserves_default_rep_offset_one() {
              so literals = data[0..2]. A different prefix length \
              would indicate the explicit-match catch-up fired instead",
     );
+}
+
+/// Tags go on from a table fill `(2 * input / step + dict / 3) >> log` of
+/// exactly 3/2, or 5/4 on i686: at step 8 over 4096 slots that is 24 KiB and
+/// 20 KiB of input alone, or 18 KiB and 15 KiB of copy-mode dictionary alone,
+/// and one byte less stays bare. The sizes may be anything up to `usize::MAX`
+/// without overflow.
+#[test]
+fn fast_tags_start_at_the_target_fill() {
+    let (input, dictionary) = if cfg!(target_arch = "x86") {
+        (5 * 8 * 4096 / 8, 3 * 5 * 4096 / 4)
+    } else {
+        (3 * 8 * 4096 / 4, 3 * 3 * 4096 / 2)
+    };
+    assert!(fast_slots_pay_for_tags(input, 0, 8, 12));
+    assert!(!fast_slots_pay_for_tags(input - 1, 0, 8, 12));
+    assert!(fast_slots_pay_for_tags(0, dictionary, 8, 12));
+    assert!(!fast_slots_pay_for_tags(0, dictionary - 1, 8, 12));
+    // Extremes on either side of the comparison must not overflow, on a 32-bit
+    // `usize` as on a 64-bit one.
+    assert!(fast_slots_pay_for_tags(usize::MAX, usize::MAX, 2, 30));
+    assert!(!fast_slots_pay_for_tags(1, 0, usize::MAX, 30));
+    assert!(!fast_slots_pay_for_tags(0, 0, 2, 10));
 }

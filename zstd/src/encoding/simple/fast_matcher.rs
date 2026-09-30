@@ -54,6 +54,7 @@
 
 use crate::encoding::Sequence;
 use crate::encoding::dict_attach::DictAttach;
+use crate::encoding::match_table::storage::MAX_PRIMED_WINDOW_SIZE;
 use crate::encoding::workspace::HistoryBuf;
 
 use super::fast_kernel::hash_table::{
@@ -117,6 +118,48 @@ pub(crate) const HISTORY_DRAIN_BASE: usize = 0;
 /// position-0 emit rate is too small to be worth that breakage.
 const INITIAL_PREFIX_START_INDEX: u32 = 1;
 
+/// Whether a frame's main table pays for short-cache tags. A tag rejects a
+/// probe that lands on a slot another position holds, before its candidate is
+/// selected and loaded; that saves work only as often as such a slot is hit,
+/// so the gate is how full the frame leaves the table. The scan stores two
+/// positions per `step_size` bytes, and a copy-mode dictionary fill at least
+/// one per three dictionary bytes, so the fill is
+/// `(2 * expected_input / step_size + dictionary_len / 3) >> hash_log`, and the
+/// tags go on from [`FAST_TAG_MIN_FILL`]. Upstream zstd's no-dictionary Fast
+/// table carries none (`zstd_fast.c`, `ZSTD_compressBlock_fast_noDict_generic`).
+fn fast_slots_pay_for_tags(
+    expected_input: usize,
+    dictionary_len: usize,
+    step_size: usize,
+    hash_log: u32,
+) -> bool {
+    let (num, den) = FAST_TAG_MIN_FILL;
+    // (2 * input / step + dict / 3) / slots >= num / den
+    //   <=>  den * (6 * input + step * dict) >= 3 * num * step * slots,
+    // in u128 so no factor overflows whatever the sizes.
+    let step = step_size as u128;
+    den * (6 * expected_input as u128 + step * dictionary_len as u128)
+        >= 3 * num * step * (1u128 << hash_log)
+}
+
+/// Table fill, as `(numerator, denominator)`, from which Fast slots are tagged.
+///
+/// Measured on x86_64 (bare against tagged): a fill of 0.31 (10 KiB at levels
+/// 1 and -7) and 1.25 (20 KiB at -7, 10 KiB at -1) ran 3-11% faster bare; 2.0
+/// (32 KiB at -7) and up ran 7-16% faster tagged, and a 10 KiB frame at level 1
+/// over a 110 KiB copy-mode dictionary, whose fill takes the table past it, ran
+/// 4% faster tagged. Targets without a measurement of their own take this one.
+#[cfg(not(target_arch = "x86"))]
+const FAST_TAG_MIN_FILL: (u128, u128) = (3, 2);
+
+/// Table fill, as `(numerator, denominator)`, from which Fast slots are tagged.
+///
+/// Measured on i686: at a fill of 1.25 (20 KiB at level -7, 10 KiB at -1) the
+/// tagged table ran 2% faster, where x86_64 ran it 3-11% slower; with seven
+/// general registers the candidate load a tag skips costs more.
+#[cfg(target_arch = "x86")]
+const FAST_TAG_MIN_FILL: (u128, u128) = (5, 4);
+
 /// What a reset does with a hash table that continues the previous frame's
 /// (a new table always starts empty).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -128,10 +171,12 @@ pub(crate) enum TableCarry {
     /// full-table memset (upstream zstd `ZSTD_continueCCtx`), provided the
     /// cached dict table is still primed; otherwise empty it.
     AdvanceEpoch,
-    /// A primed snapshot matching this exact shape is copied over the table
-    /// right after the reset (the copy-mode dictionary restore), replacing its
-    /// contents and bias wholesale: leave it.
-    OverwrittenByRestore,
+    /// A primed snapshot of this geometry, its slots `tagged` or bare, is
+    /// copied over the table right after the reset (the copy-mode dictionary
+    /// restore), replacing its contents and bias wholesale: leave it. The
+    /// restore only lands when the reset chooses the same slot format, so a
+    /// reset that chooses the other one empties the table instead.
+    OverwrittenByRestore { tagged: bool },
 }
 
 /// Upstream zstd-shape Fast-strategy matcher state.
@@ -383,6 +428,23 @@ impl FastKernelMatcher {
         self.hash_table.hash_log()
     }
 
+    /// Raw content of main-table slot `hash`. Test-only crate helper for
+    /// verifying what a driver reset carries over.
+    #[cfg(test)]
+    pub(crate) fn table_slot(&self, hash: u32) -> u32 {
+        assert!(hash < 1 << self.hash_table.hash_log());
+        // SAFETY: `hash` is below the table's `1 << hash_log` entries.
+        unsafe { self.hash_table.get(hash) }
+    }
+
+    /// Store `value` in main-table slot `hash`. Test-only crate helper.
+    #[cfg(test)]
+    pub(crate) fn set_table_slot(&mut self, hash: u32, value: u32) {
+        assert!(hash < 1 << self.hash_table.hash_log());
+        // SAFETY: `hash` is below the table's `1 << hash_log` entries.
+        unsafe { self.hash_table.put(hash, value) }
+    }
+
     /// Whether a dictionary table is attached (drives the dual-probe dispatch:
     /// the borrowed scan must consult the dict when set). Mirrors the owned
     /// path's `self.dict.is_attached()` gate.
@@ -579,13 +641,20 @@ impl FastKernelMatcher {
     /// hash table out in `workspace` at `(hash_log, mls)`. A table that
     /// continues the previous frame's is then handled as `carry` says; a new
     /// one starts empty. The window_log update redirects the soft-eviction
-    /// bound and the decoder-side reported window.
+    /// bound and the decoder-side reported window. `expected_input` is the
+    /// input the frame can write into its table (its size when known), and
+    /// `dictionary_len` the dictionary priming will put in front of it.
+    // Each argument is an independent axis of the frame, resolved by the driver
+    // from different sources (level, source size, dictionary state, workspace).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn reset(
         &mut self,
         window_log: u8,
         hash_log: u32,
         mls: u32,
         step_size: usize,
+        expected_input: usize,
+        dictionary_len: usize,
         carry: TableCarry,
         workspace: &mut crate::encoding::workspace::Workspace,
     ) {
@@ -607,19 +676,36 @@ impl FastKernelMatcher {
         // Re-borrow detection: set to the resident dict region when the
         // epoch-reuse branch below keeps the dict bytes in place (see there).
         let mut reborrow_region: Option<usize> = None;
-        // Tagged slots unless the frame attaches a dictionary (its epoch bias
-        // needs the position range the tag takes) or its history could reach
-        // past what a tagged slot holds.
-        let tagged = carry != TableCarry::AdvanceEpoch
+        // Tagged slots when the scan fills the table enough for tags to pay
+        // (see `fast_slots_pay_for_tags`), unless the frame attaches a
+        // dictionary (its epoch bias needs the position range the tag takes)
+        // or its history could reach past what a tagged slot holds. That
+        // history is the window widened by the dictionary exactly as priming
+        // widens it, so priming never has to change the format recorded here.
+        //
+        // The format is not free of output: with `mls` above 4 a tag rejects a
+        // candidate whose first four bytes match but whose later hashed bytes
+        // do not, which a bare slot accepts as a four-byte match. Bare slots
+        // take exactly upstream zstd's decisions (its no-dictionary table has
+        // no tags), so a frame this gate leaves bare encodes as upstream does.
+        // Measured on levels -7..2 over z000033 prefixes, random input and
+        // records sharing a four-byte prefix: identical sizes bare and tagged.
+        let primed_window = (1usize << window_log)
+            .checked_add(dictionary_len)
+            .map_or(MAX_PRIMED_WINDOW_SIZE, |window| {
+                window.min(MAX_PRIMED_WINDOW_SIZE)
+            });
+        let tagged = fast_slots_pay_for_tags(expected_input, dictionary_len, step_size, hash_log)
+            && carry != TableCarry::AdvanceEpoch
             && hash_log + TAG_BITS <= 32
-            && tagged_positions_fit(1usize << window_log);
+            && tagged_positions_fit(primed_window);
         if !self.hash_table.bind(workspace, hash_log, mls, tagged) {
             // A new table: the first frame, a new shape, or a workspace that
             // moved. It starts empty, so there is nothing to clear, and the
             // cached dict table goes with it: its absolute positions index a
             // table this one no longer continues.
             self.dict.invalidate();
-        } else if carry == TableCarry::OverwrittenByRestore {
+        } else if carry == (TableCarry::OverwrittenByRestore { tagged }) {
             // Leave the table untouched: the snapshot restore copies the
             // primed contents (and bias) over it immediately after.
         } else if carry == TableCarry::AdvanceEpoch && self.dict.is_primed() {
@@ -1976,6 +2062,11 @@ impl FastKernelMatcher {
     pub(crate) fn skip_matching_for_dict_prime(&mut self, dict_len: usize) {
         let block_start = self.take_staged_block();
         self.prime_dict_table_for_range(block_start, dict_len);
+    }
+
+    /// Whether the main table's slots are tagged.
+    pub(crate) fn slots_tagged(&self) -> bool {
+        self.hash_table.is_tagged()
     }
 
     /// Stops tagging the main table when a dictionary has widened the window

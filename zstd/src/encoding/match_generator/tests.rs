@@ -3093,6 +3093,96 @@ fn primed_snapshot_not_restored_when_window_hint_differs() {
     );
 }
 
+/// The Fast slot format is chosen per frame from how full the scan will leave
+/// the table, which depends on the input size and not only on the window. Two
+/// hints in one window bucket (17 KiB and 32 KiB at level -7: fills of 1.06
+/// and 2.0) resolve to the same geometry but to opposite formats; a dictionary
+/// snapshot captured at the tagged one must not hand its format to the bare
+/// one, which is what a restore keyed on the geometry alone would do.
+#[test]
+fn primed_snapshot_keeps_the_frames_own_fast_slot_format() {
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    let level = CompressionLevel::Level(-7);
+    let dict: Vec<u8> = (0..4096u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+
+    driver.set_source_size_hint(32 * 1024);
+    driver.reset(level);
+    assert!(
+        driver.simple_mut().slots_tagged(),
+        "precondition: 32 KiB is tagged"
+    );
+    driver.prime_with_dictionary(&dict, [1, 4, 8]);
+    driver.capture_primed_dictionary(level);
+
+    driver.set_source_size_hint(17 * 1024);
+    driver.reset(level);
+    assert!(
+        !driver.simple_mut().slots_tagged(),
+        "precondition: 17 KiB is bare"
+    );
+    let _ = driver.restore_primed_dictionary(level);
+    assert!(
+        !driver.simple_mut().slots_tagged(),
+        "a restored snapshot must not replace the frame's bare slots with the \
+         tagged ones of the frame it was captured on"
+    );
+}
+
+#[test]
+fn the_fast_slot_format_chosen_at_reset_survives_the_dictionary() {
+    // The reset records its slot format in the snapshot key, so priming must
+    // not change it afterwards. A 512 KiB window fits tagged positions on its
+    // own; with an 8 MiB dictionary in front of it the history no longer does,
+    // and the reset has to see that rather than leave it to priming.
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    let level = CompressionLevel::Level(1);
+    let dict: Vec<u8> = (0..8u32 << 20)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+    driver.set_source_size_hint(1 << 20);
+    driver.reset(level);
+    let chosen = driver.simple_mut().slots_tagged();
+    driver.prime_with_dictionary(&dict, [1, 4, 8]);
+    assert_eq!(
+        driver.simple_mut().slots_tagged(),
+        chosen,
+        "priming changed the slot format the reset recorded"
+    );
+}
+
+#[test]
+fn a_frame_the_snapshot_is_not_restored_into_gets_a_cleared_table() {
+    // A dictionary past the attach region forces copy mode at any frame size,
+    // and a frame of unknown size resolves the level's own parameters, which a
+    // 1 MiB frame resolves too: both frames share one snapshot key. The frame
+    // compressor restores only a known size above the Fast cutoff, so the
+    // unknown-size frame primes into its table without a restore; a reset that
+    // left the 1 MiB frame's slots in place would hand the kernel positions
+    // past this frame's end.
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    let level = CompressionLevel::Level(1);
+    let dict = b"small dict content with some padding here";
+    let oversized = crate::encoding::DictionarySizes::raw_content(MAX_FAST_ATTACH_DICT_REGION + 1);
+    driver.set_dictionary_size_hint(oversized);
+    driver.set_source_size_hint(1 << 20);
+    driver.reset(level);
+    driver.prime_with_dictionary(dict, [1, 4, 8]);
+    driver.capture_primed_dictionary(level);
+    driver.simple_mut().set_table_slot(7, 0xCAFE);
+
+    driver.set_dictionary_size_hint(oversized);
+    driver.reset(level);
+    assert_eq!(
+        driver.simple_mut().table_slot(7),
+        0,
+        "a frame the snapshot will not be restored into must start from an \
+         empty table"
+    );
+}
+
 #[test]
 fn primed_snapshot_restored_for_hints_in_same_window_bucket() {
     // The snapshot key must normalize the source-size hint to the resolved
@@ -5340,6 +5430,86 @@ fn a_borrowed_slice_past_the_tagged_range_is_laid_out_untagged() {
         "fixture: the window alone would allow tagged slots"
     );
     assert!(!driver.dfast_matcher().tagged);
+}
+
+/// A short-cache tag pays only when a probe tends to land on a slot another
+/// position holds, which takes a table the scan fills past what a sparse
+/// step writes: a 32 KiB frame at level -7 and a 20 KiB frame at level 1 are
+/// tagged, a 10 KiB frame at level 1 (32768 slots) stays bare, and a fill of
+/// 5/4 (20 KiB at level -7, step 8, 4096 slots; 10 KiB at level -1) is tagged
+/// only on i686, whose seven general registers make the skipped candidate load
+/// worth more.
+#[test]
+fn fast_slots_are_tagged_by_how_full_the_scan_leaves_the_table() {
+    use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
+    let tagged = |level: i32, source: usize| {
+        let mut driver = MatchGeneratorDriver::new(1 << 17, 1);
+        driver.set_source_size_hint(source as u64);
+        let mut context = Workspace::new();
+        context.begin_layout(source.min(1 << 17), no_trailing, IngestPlan::Stream);
+        driver.reset_in_workspace(CompressionLevel::from_level(level), &mut context);
+        driver.simple_mut().slots_tagged()
+    };
+    let five_quarters_tagged = cfg!(target_arch = "x86");
+    assert_eq!(
+        tagged(-7, 20 * 1024),
+        five_quarters_tagged,
+        "level -7, 20 KiB"
+    );
+    assert_eq!(
+        tagged(-1, 10 * 1024),
+        five_quarters_tagged,
+        "level -1, 10 KiB"
+    );
+    assert!(tagged(-7, 32 * 1024), "level -7, 32 KiB: filled table");
+    assert!(tagged(1, 20 * 1024), "level 1, 20 KiB: filled table");
+    assert!(!tagged(1, 10 * 1024), "level 1, 10 KiB: sparse table");
+
+    // The same 10 KiB frame over a copy-mode dictionary: the dictionary fill
+    // takes the table past the target on its own.
+    let mut driver = MatchGeneratorDriver::new(1 << 17, 1);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(110 * 1024));
+    driver.set_source_size_hint(10 * 1024);
+    let mut context = Workspace::new();
+    context.begin_layout(10 * 1024, no_trailing, IngestPlan::Stream);
+    driver.reset_in_workspace(CompressionLevel::Level(1), &mut context);
+    assert!(
+        driver.simple_mut().slots_tagged(),
+        "level 1, 10 KiB over a 110 KiB copy-mode dictionary: filled table"
+    );
+}
+
+/// i686 keeps the dfast tables bare below `DFAST_TAGGED_WINDOW_FLOOR`: its loop
+/// spills the three tags a tagged scan carries. Every other target tags every
+/// eligible window, and all tag a window past the floor.
+#[test]
+fn a_small_dfast_window_is_tagged_except_on_i686() {
+    use crate::encoding::workspace::{IngestPlan, Workspace, no_trailing};
+    let layout = |source: usize| {
+        let mut driver = MatchGeneratorDriver::new(1 << 17, 1);
+        driver.set_source_size_hint(source as u64);
+        let mut context = Workspace::new();
+        context.begin_layout(source.min(1 << 17), no_trailing, IngestPlan::Stream);
+        driver.reset_in_workspace(CompressionLevel::Level(3), &mut context);
+        (
+            driver.dfast_matcher().max_window_size,
+            driver.dfast_matcher().tagged,
+        )
+    };
+
+    let (window, tagged) = layout(10 * 1024);
+    assert!(
+        window < 1 << 18,
+        "fixture: a 10 KiB frame's window is under the i686 floor",
+    );
+    assert_eq!(tagged, !cfg!(target_arch = "x86"));
+
+    let (window, tagged) = layout(1 << 20);
+    assert!(
+        window >= 1 << 18,
+        "fixture: a 1 MiB frame's window is past the i686 floor",
+    );
+    assert!(tagged, "a window past the floor is tagged on every target");
 }
 
 /// A driver reset on its own and then laid out in a context's workspace lets go
