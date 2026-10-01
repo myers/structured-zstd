@@ -580,6 +580,73 @@ fn code_buffer(ws: &mut Workspace, count: usize) -> RegionVec<u32> {
     ws.buffer(count)
 }
 
+/// The Fast band codes offsets as the sequences are collected. The codes and
+/// the final history must be what the fast derivation gives over the raw
+/// offsets in order, including the explicit offset that equals `rep[0]`
+/// (coded as offBase 1) and the litLength-0 match of `rep[1]` (offBase 1,
+/// rotating); without coding, the raw offsets are kept and the history is left
+/// alone.
+#[test]
+fn collected_fast_band_sequences_carry_the_fast_derivation() {
+    use super::{Sequence, encode_offset_with_history_fast, record_sequence};
+    let reported = [
+        (5usize, 100usize, 9usize),
+        (3, 100, 6),
+        (0, 4, 7),
+        (2, 4, 5),
+        (0, 100, 8),
+        (7, 250, 4),
+        (1, 1, 4),
+    ];
+    let mut expected_hist = [1u32, 4, 8];
+    let expected: Vec<u32> = reported
+        .iter()
+        .map(|&(ll, off, _)| {
+            encode_offset_with_history_fast(off as u32, ll as u32, &mut expected_hist)
+        })
+        .collect();
+    assert!(expected.contains(&1) && expected.iter().any(|&code| code > 3));
+
+    for coded in [true, false] {
+        let mut ws = Workspace::new();
+        ws.begin_layout(
+            region_bytes::<RawSequence>(reported.len()),
+            |bytes| bytes,
+            crate::encoding::workspace::IngestPlan::Stream,
+        );
+        ws.open(0, usize::MAX);
+        let mut sequences: RegionVec<RawSequence> = ws.buffer(reported.len());
+        let mut tail = 0usize;
+        let mut hist = [1u32, 4, 8];
+        for &(literal_len, offset, match_len) in &reported {
+            let seq = Sequence::Triple {
+                literal_len,
+                offset,
+                match_len,
+            };
+            record_sequence(seq, &mut tail, &mut sequences, coded, &mut hist);
+        }
+        let trailing = Sequence::Literals { len: 11 };
+        record_sequence(trailing, &mut tail, &mut sequences, coded, &mut hist);
+        assert_eq!(tail, 11);
+        let off_bases: Vec<u32> = sequences.iter().map(|seq| seq.off_base).collect();
+        if coded {
+            assert_eq!(off_bases, expected);
+            assert_eq!(hist, expected_hist);
+        } else {
+            let raw: Vec<u32> = reported.iter().map(|&(_, off, _)| off as u32).collect();
+            assert_eq!(off_bases, raw);
+            assert_eq!(hist, [1, 4, 8]);
+        }
+        let lengths: Vec<(u32, u32)> = sequences.iter().map(|seq| (seq.ll, seq.ml)).collect();
+        let reported_lengths: Vec<(u32, u32)> = reported
+            .iter()
+            .map(|&(ll, _, ml)| (ll as u32, ml as u32))
+            .collect();
+        assert_eq!(lengths, reported_lengths);
+    }
+}
+
 /// The estimator prices a block the splitter is thinking about; the emitter
 /// writes the one it chose. They walk the sequences by different routes: the
 /// emitter derives each offset code, packs it with the extra-bit widths and
@@ -613,7 +680,9 @@ fn estimator_and_emitter_agree_on_a_block_with_sequences() {
         })
         .collect();
 
-    for strat in [StrategyTag::Fast, StrategyTag::Lazy, StrategyTag::BtUltra2] {
+    // Not the Fast band: it never post-splits, so it is never estimated, and
+    // its sequences reach the emitter already coded.
+    for strat in [StrategyTag::Lazy, StrategyTag::BtUltra2] {
         let make_state = || CompressState::<EntropyOnlyMatcher> {
             matcher: EntropyOnlyMatcher,
             copy_kernel: crate::encoding::fastpath::select_kernel(),
@@ -691,7 +760,11 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
         block_scratch: super::CompressedBlockScratch::new(),
         workspace: Workspace::new(),
         offset_hist: [10, 20, 30],
-        strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
+        // A post-split strategy, the only kind whose partitions reach this
+        // emitter, so the offset is coded here and moves the history (offset 20
+        // at litLength 0 is `rep[1]`, which rotates) before the raw fallback
+        // has to put it back.
+        strategy_tag: crate::encoding::strategy::StrategyTag::BtUltra2,
         pre_split: None,
         huf_optimal_search: true,
         literal_compression_disabled: false,
