@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 #[cfg(not(target_has_atomic = "ptr"))]
 use alloc::rc::Rc;
 #[cfg(target_has_atomic = "ptr")]
@@ -26,8 +27,10 @@ pub struct Dictionary {
     /// therefore still requires a non-zero one.
     pub id: u32,
     /// A dictionary can contain an entropy table, either FSE or
-    /// Huffman.
-    pub fse: FSEScratch,
+    /// Huffman. Boxed for the same reason as `DecoderScratch::fse`: the
+    /// ~12 KiB of inline tables must not ride the stack through
+    /// construction.
+    pub fse: Box<FSEScratch>,
     /// A dictionary can contain an entropy table, either FSE or
     /// Huffman.
     pub huf: HuffmanScratch,
@@ -98,7 +101,7 @@ impl Dictionary {
 
         Ok(Dictionary {
             id,
-            fse: FSEScratch::new(),
+            fse: Box::new(FSEScratch::new()),
             huf: HuffmanScratch::new(),
             dict_content,
             offset_hist: [1, 4, 8],
@@ -131,7 +134,7 @@ impl Dictionary {
             // caller asking for a dictionary that cannot exist.
             Ok(Dictionary {
                 id: 0,
-                fse: FSEScratch::new(),
+                fse: Box::new(FSEScratch::new()),
                 huf: HuffmanScratch::new(),
                 dict_content: Vec::new(),
                 offset_hist: [1, 4, 8],
@@ -186,7 +189,7 @@ impl Dictionary {
 
         let mut new_dict = Dictionary {
             id: 0,
-            fse: FSEScratch::new(),
+            fse: Box::new(FSEScratch::new()),
             huf: HuffmanScratch::new(),
             dict_content: Vec::new(),
             offset_hist: [1, 4, 8],
