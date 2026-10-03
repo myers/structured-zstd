@@ -3579,3 +3579,24 @@ fn a_zero_offset_sequence_is_refused_rather_than_executed() {
         .decode_all_to_vec(frame.as_slice(), &mut collected)
         .expect_err("decode_all_to_vec must refuse the frame");
 }
+
+/// A `FrameDecoder` and everything it owns inline must stay small enough to
+/// live in a kernel task's stack frame. With the FSE sequence tables held by
+/// value the decoder was ~14 KiB, and a `panic = "abort"` build (every
+/// `*-none` target) built a second copy of the state inside `decode_all`'s
+/// frame: ~42 KiB of stack between the caller and `decode_all`, which
+/// overflows a 32 KiB kernel stack. `cargo test` runs `panic = "unwind"`,
+/// where LLVM happens to elide the copy, so pin the root cause instead:
+/// the inline size of the types every decode entry point moves around.
+#[test]
+fn frame_decoder_stays_small_enough_for_a_kernel_stack() {
+    use crate::decoding::scratch::DecoderScratch;
+    const BUDGET: usize = 2 * 1024;
+    let decoder = core::mem::size_of::<FrameDecoder>();
+    let state = core::mem::size_of::<super::FrameDecoderState>();
+    let scratch = core::mem::size_of::<DecoderScratch>();
+    std::eprintln!("FrameDecoder={decoder} FrameDecoderState={state} DecoderScratch={scratch}");
+    assert!(decoder <= BUDGET, "FrameDecoder is {decoder} B inline");
+    assert!(state <= BUDGET, "FrameDecoderState is {state} B inline");
+    assert!(scratch <= BUDGET, "DecoderScratch is {scratch} B inline");
+}
