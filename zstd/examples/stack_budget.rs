@@ -76,9 +76,13 @@ fn main() {
     });
 
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../zstd/dict_tests");
-    let dict = std::fs::read(format!("{dir}/dictionary")).expect("dictionary");
-    let frame = std::fs::read(format!("{dir}/files/ModemManager.service.zst")).expect("frame");
-    let expected = std::fs::read(format!("{dir}/files/ModemManager.service")).expect("original");
+    let read = |name: &str| {
+        let path = format!("{dir}/{name}");
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
+    };
+    let dict = read("dictionary");
+    let frame = read("files/ModemManager.service.zst");
+    let expected = read("files/ModemManager.service");
     on_budget(kib, "FrameDecoder::decode_all_with_dict_bytes", move || {
         let mut out = vec![0u8; expected.len()];
         let n = FrameDecoder::new()
