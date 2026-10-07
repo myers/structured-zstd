@@ -688,14 +688,31 @@ impl FastKernelMatcher {
         // do not, which a bare slot accepts as a four-byte match. Bare slots
         // take exactly upstream zstd's decisions (its no-dictionary table has
         // no tags), so a frame this gate leaves bare encodes as upstream does.
-        // Measured on levels -7..2 over z000033 prefixes, random input and
-        // records sharing a four-byte prefix: identical sizes bare and tagged.
+        // Measured on 1 MiB inputs at levels -7..2 (z000033, source text, logs,
+        // records sharing a four-byte prefix, random, z000033 over 1.25 and
+        // 110 KiB copy-mode dictionaries): bare and tagged sizes stay within
+        // 0.2% of each other, except the shared-prefix records at level 1,
+        // where bare output is 1.1% smaller.
         let primed_window = (1usize << window_log)
             .checked_add(dictionary_len)
             .map_or(MAX_PRIMED_WINDOW_SIZE, |window| {
                 window.min(MAX_PRIMED_WINDOW_SIZE)
             });
-        let tagged = fast_slots_pay_for_tags(expected_input, dictionary_len, step_size, hash_log)
+        // Only under the cmov probe (`window_log < 19`, upstream zstd's
+        // `useCmov`). The branch probe keeps the data base, the hash shift and
+        // the table base in registers bare; the tag's extra live values push
+        // them to the stack, so a tagged branch probe ran about 13 more
+        // instructions per position (46 against 33) at the same probe count,
+        // and 4-10% slower on z000033 from 512 KiB at levels 1, -1 and -7
+        // (upstream zstd runs this probe bare too: the distance to it there is
+        // the same with or without tags, so it is not this choice's). The
+        // cmov probe is register-bound bare as well, and there the tag's halved
+        // D1 misses pay: 4-17% faster tagged from 32 to 256 KiB. A copy-mode
+        // dictionary counts toward the fill at any length: on 10 KiB frames at
+        // level 1 with a 1.25 KiB dictionary the bare scan took five times the
+        // branch misses and 9% more time, and from 16 to 110 KiB the two tied.
+        let tagged = window_log < 19
+            && fast_slots_pay_for_tags(expected_input, dictionary_len, step_size, hash_log)
             && carry != TableCarry::AdvanceEpoch
             && hash_log + TAG_BITS <= 32
             && tagged_positions_fit(primed_window);
@@ -2403,8 +2420,10 @@ fn run_fast_kernel_block(
         window_low,
     };
     // Dispatch on (mls, use_cmov, tagged) — each triple monomorphises the
-    // kernel hot loop independently. `_` is unreachable: `FastHashTable::new`
-    // rejects mls outside 4..=8 at construction.
+    // kernel hot loop independently. A table is tagged only under the cmov
+    // probe (see `reset`), so the tagged branch-probe copies are never built.
+    // `_` is unreachable: `FastHashTable::new` rejects mls outside 4..=8 at
+    // construction.
     let tagged = hash_table.is_tagged();
     macro_rules! run {
         ($mls:literal, $cmov:literal, $tagged:literal) => {
@@ -2421,25 +2440,21 @@ fn run_fast_kernel_block(
     }
     let result = match (mls, use_cmov, tagged) {
         (4, false, false) => run!(4, false, false),
-        (4, false, true) => run!(4, false, true),
         (4, true, false) => run!(4, true, false),
         (4, true, true) => run!(4, true, true),
         (5, false, false) => run!(5, false, false),
-        (5, false, true) => run!(5, false, true),
         (5, true, false) => run!(5, true, false),
         (5, true, true) => run!(5, true, true),
         (6, false, false) => run!(6, false, false),
-        (6, false, true) => run!(6, false, true),
         (6, true, false) => run!(6, true, false),
         (6, true, true) => run!(6, true, true),
         (7, false, false) => run!(7, false, false),
-        (7, false, true) => run!(7, false, true),
         (7, true, false) => run!(7, true, false),
         (7, true, true) => run!(7, true, true),
         (8, false, false) => run!(8, false, false),
-        (8, false, true) => run!(8, false, true),
         (8, true, false) => run!(8, true, false),
         (8, true, true) => run!(8, true, true),
+        (_, false, true) => unreachable!("a tagged table under the branch probe"),
         _ => unreachable!(
             "FastHashTable construction rejects mls outside 4..=8 — \
              got mls={mls} which means the table was bypassed",
