@@ -5140,16 +5140,14 @@ const SKIPPABLE_MAGIC_BASE: u32 = 0x184D_2A50;
 ///
 /// A zstd stream is a sequence of frames: `cat a.zst b.zst` is a valid archive
 /// that decodes to `a` then `b`, and skippable frames may sit between them. The
-/// decoder's `Read` ends at the first frame, so the loop below re-initialises it
-/// on whatever follows until the source is exhausted. The library's
-/// `read_to_end` walks frames too, but only by buffering the whole stream in
-/// memory, which a command-line tool handed a multi-gigabyte archive cannot do.
+/// decoder's `Read` walks them itself, streaming, so one decoder takes the
+/// whole archive whatever its size.
 ///
-/// Each frame is recognised by its magic number before a decoder is built on
+/// The input is recognised by its magic number before a decoder is built on
 /// it, the way the reference command looks before it decodes: input that is
 /// not a zstd stream is then copied through under `--pass-through`, or
 /// refused as an unknown format. Bytes after a frame that are not a frame are
-/// refused either way.
+/// refused either way, with the reference command's message.
 fn decompress_stream<R: Read, W: Write>(
     reader: R,
     mut writer: W,
@@ -5157,7 +5155,7 @@ fn decompress_stream<R: Read, W: Write>(
     settings: &DecodeSettings,
 ) -> Result<u64> {
     use structured_zstd::decoding::StreamingDecoder;
-    use structured_zstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+    use structured_zstd::decoding::errors::FrameDecoderError;
 
     // Parsed once for the whole run rather than per stream or per frame, and
     // decoded against by one decoder: the decoder keeps its buffers and, for
@@ -5227,25 +5225,32 @@ fn decompress_stream<R: Read, W: Write>(
             ),
             None => StreamingDecoder::new_with_decoder(&mut stream, &mut *decompressor),
         };
+        // Skippable frames in front of the first frame are stepped over by the
+        // constructor itself, and the ones after it by the decoder's `Read`;
+        // what follows either is reported the same way.
         let mut decoder = match built {
             Ok(decoder) => decoder,
-            Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
-                length,
-                ..
-            })) => {
-                // Metadata a decoder is required to step over. The header is
-                // already consumed, so only the payload is left to discard.
-                let skipped = io::copy(
-                    &mut stream.by_ref().take(u64::from(length)),
-                    &mut io::sink(),
-                )
-                .wrap_err("failed to skip a skippable frame")?;
-                if skipped != u64::from(length) {
-                    bail!("skippable frame is truncated: {skipped} of {length} bytes");
+            Err(err) => {
+                // A source that fails where a frame would start is a read
+                // failure, whatever the parser was reading at the time.
+                if let FrameDecoderError::ReadFrameHeaderError(
+                    structured_zstd::decoding::errors::ReadFrameHeaderError::MagicNumberReadError(
+                        e,
+                    ),
+                ) = &err
+                    && e.kind() != io::ErrorKind::UnexpectedEof
+                {
+                    bail!("failed to read the input: {e}");
                 }
-                continue;
+                // The same inside a leading skippable frame's content.
+                if let FrameDecoderError::FailedToReadSkippableFrame(e) = &err {
+                    bail!("failed to read the input: {e}");
+                }
+                match after_frame_message(&err) {
+                    Some(message) => bail!("{message}"),
+                    None => bail!("invalid zstd frame: {err:?}"),
+                }
             }
-            Err(err) => bail!("invalid zstd frame: {err:?}"),
         };
         // The library computes the digest but does not compare it, leaving the
         // decision to the caller. For a command-line tool that decision is
@@ -5261,8 +5266,43 @@ fn decompress_stream<R: Read, W: Write>(
             } else {
                 structured_zstd::decoding::ContentChecksum::None
             });
-        written +=
-            io::copy(&mut decoder, &mut writer).wrap_err("streaming decompression failed")?;
+        let err = match io::copy(&mut decoder, &mut writer) {
+            Ok(n) => {
+                written += n;
+                continue;
+            }
+            Err(err) => err,
+        };
+        match err
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<FrameDecoderError>())
+            .and_then(after_frame_message)
+        {
+            Some(message) => bail!("{message}"),
+            None => return Err(err).wrap_err("streaming decompression failed"),
+        }
+    }
+}
+
+/// The reference command's message for what follows a frame and is not one:
+/// fewer than four bytes, a magic number that is no frame's, or a skippable
+/// frame cut short. `None` for a damaged frame, and for a source that failed
+/// rather than ended.
+fn after_frame_message(
+    err: &structured_zstd::decoding::errors::FrameDecoderError,
+) -> Option<&'static str> {
+    use structured_zstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+    match err {
+        FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::BadMagicNumber(_)) => {
+            Some("unsupported format")
+        }
+        FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::MagicNumberReadError(e))
+            if e.kind() == io::ErrorKind::UnexpectedEof =>
+        {
+            Some("unknown header")
+        }
+        FrameDecoderError::FailedToSkipFrame => Some("skippable frame is truncated"),
+        _ => None,
     }
 }
 
