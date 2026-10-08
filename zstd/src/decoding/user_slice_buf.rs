@@ -820,7 +820,6 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             Err(e) => Err(e),
         }
     }
-
     // Keep `#[inline]` (hint, not force). An earlier experiment with
     // `#[inline(always)]` regressed primary bench by +2.96% — body
     // is materially larger than `extend` (assert + readable/writable

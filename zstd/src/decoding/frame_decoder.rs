@@ -690,13 +690,34 @@ impl DecoderScratchKind {
     }
 
     /// Total decompressed bytes produced so far (the buffer's running output
-    /// counter, unaffected by window drops / drains). Used to stamp a captured
-    /// [`ResumeState`]'s `output_offset`.
-    #[cfg(feature = "lsm")]
+    /// counter, unaffected by window drops / drains): the frame's length once
+    /// its last block is decoded, and a captured resume state's offset.
     fn total_output(&self) -> u64 {
         match self {
             Self::Ring(s) => s.buffer.total_output(),
             Self::Flat(s) => s.buffer.total_output(),
+        }
+    }
+
+    /// Set the output counter to the length of a frame the direct path decoded
+    /// into the caller's slice, which never passes through this buffer.
+    fn set_total_output(&mut self, produced: u64) {
+        match self {
+            Self::Ring(s) => s.buffer.set_total_output(produced),
+            Self::Flat(s) => s.buffer.set_total_output(produced),
+        }
+    }
+
+    /// Append `data` to the buffer, copied under the kernel a literals-only
+    /// block takes: the scalar tier stays portable.
+    fn buffer_push(&mut self, data: &[u8], kernel: crate::cpu_kernel::CpuKernelTag) {
+        use crate::cpu_kernel::{BaselineKernel, CpuKernelTag, ScalarKernel};
+        let scalar = kernel == CpuKernelTag::Scalar;
+        match self {
+            Self::Ring(s) if scalar => s.buffer.push::<ScalarKernel>(data),
+            Self::Ring(s) => s.buffer.push::<BaselineKernel>(data),
+            Self::Flat(s) if scalar => s.buffer.push::<ScalarKernel>(data),
+            Self::Flat(s) => s.buffer.push::<BaselineKernel>(data),
         }
     }
 
@@ -774,6 +795,22 @@ impl DecoderScratchKind {
         match self {
             Self::Ring(s) => decoder.decode_block_content(header, s, dict, source),
             Self::Flat(s) => decoder.decode_block_content(header, s, dict, source),
+        }
+    }
+
+    /// [`Self::decode_block_content`] for a block whose content is already in
+    /// memory: a compressed block is decoded from `source` in place instead of
+    /// being copied into the block buffer first. Advances `source` past it.
+    fn decode_block_content_from_slice(
+        &mut self,
+        decoder: &mut BlockDecoder,
+        header: &crate::blocks::block::BlockHeader,
+        source: &mut &[u8],
+        dict: Option<&crate::decoding::dictionary::Dictionary>,
+    ) -> Result<u64, DecodeBlockContentError> {
+        match self {
+            Self::Ring(s) => decoder.decode_block_content_from_slice(header, s, dict, source),
+            Self::Flat(s) => decoder.decode_block_content_from_slice(header, s, dict, source),
         }
     }
 
@@ -1310,6 +1347,188 @@ impl FrameDecoder {
         self.magicless = magicless;
     }
 
+    /// Whether frame headers are read without the magic number.
+    pub(crate) fn is_magicless(&self) -> bool {
+        self.magicless
+    }
+
+    /// Whether every block of the frame is decoded and only its trailing
+    /// content checksum is still to be read.
+    pub(crate) fn awaits_checksum(&self) -> bool {
+        self.state.as_ref().is_some_and(|state| {
+            state.frame_finished
+                && state.frame_header.descriptor.content_checksum_flag()
+                && state.check_sum.is_none()
+        })
+    }
+
+    /// How many bytes from the start of `pending` the current frame's next
+    /// step needs in hand: a block header, a whole block, or the trailing
+    /// checksum; 0 once the frame wants no more input. Upstream zstd's
+    /// `ZSTD_nextSrcSizeToDecompress`. A block stating more than the frame's
+    /// block maximum needs only its header, whose decode then reports it.
+    pub(crate) fn input_needed(&self, pending: &[u8]) -> usize {
+        let Some(state) = self.state.as_ref() else {
+            return 0;
+        };
+        if state.frame_finished {
+            let checksum_due =
+                state.frame_header.descriptor.content_checksum_flag() && state.check_sum.is_none();
+            return if checksum_due { 4 } else { 0 };
+        }
+        let Some(&[b0, b1, b2]) = pending.first_chunk::<3>() else {
+            return 3;
+        };
+        // RFC 8878 3.1.1.2: Last_Block (bit 0), Block_Type (bits 1-2),
+        // Block_Size (bits 3-23). A Reserved block (3.1.1.2.2) is invalid
+        // from its header alone. Block_Size is held to the block maximum for
+        // every type: for an RLE block it is the repeat count, while its
+        // content is one byte.
+        let header = u32::from_le_bytes([b0, b1, b2, 0]);
+        let block_type = (header >> 1) & 3;
+        if block_type == 3 {
+            return 3;
+        }
+        let size = (header >> 3) as usize;
+        // A window wider than the address space cannot bound a block below
+        // the 128 KiB maximum, so it counts as unbounded here.
+        let window = state
+            .frame_header
+            .window_size()
+            .map_or(usize::MAX, |w| usize::try_from(w).unwrap_or(usize::MAX));
+        if size > decoding::block_decoder::block_maximum(window) {
+            return 3;
+        }
+        // The block header is parsed again by the block decoder. Carrying it
+        // across would cost a stored field per block for three byte loads.
+        3 + if block_type == 1 { 1 } else { size }
+    }
+
+    /// Start the Raw block whose 3-byte header is `header`, its content to
+    /// follow in parts through [`Self::raw_block_push`] as the source delivers
+    /// it, instead of being gathered whole first. Returns the
+    /// block's size and whether it is the frame's last; `Ok(None)`, with
+    /// nothing consumed, when `header` is not a Raw block's, or the frame
+    /// expects no block (its blocks are done and its checksum is next).
+    /// `reserve_window` is as for [`Self::decode_available`].
+    pub(crate) fn start_raw_block(
+        &mut self,
+        header: &[u8; 3],
+        reserve_window: bool,
+    ) -> Result<Option<(u32, bool)>, FrameDecoderError> {
+        let kernel = self.kernel;
+        #[cfg(feature = "hash")]
+        let checksum_mode = self.content_checksum;
+        let state = self
+            .state
+            .as_mut()
+            .ok_or(FrameDecoderError::NotYetInitialized)?;
+        // RFC 8878 3.1.1.2.2: Block_Type 0 is Raw.
+        if state.frame_finished || (header[0] >> 1) & 3 != 0 {
+            return Ok(None);
+        }
+        // The checksum mode is applied before any of the frame's output is
+        // written, as `decode_available` applies it.
+        #[cfg(feature = "hash")]
+        {
+            let compute_hash = checksum_mode != ContentChecksum::None
+                && state.frame_header.descriptor.content_checksum_flag();
+            state.decoder_scratch.set_compute_hash(compute_hash);
+        }
+        let block_index = state.block_counter as u32;
+        let block_frame_offset = state.bytes_read_counter as u32;
+        let mut block_dec = decoding::block_decoder::with_kernel(kernel);
+        let (block_header, header_size) = block_dec
+            .read_block_header(&header[..])
+            .map_err(|source| block_header_decode_error(source, block_index, block_frame_offset))?;
+        let window = state
+            .frame_header
+            .window_size()
+            .map_or(usize::MAX, |w| usize::try_from(w).unwrap_or(usize::MAX));
+        decoding::block_decoder::block_fits_the_maximum(&block_header, window).map_err(
+            |source| {
+                block_body_decode_error(
+                    source,
+                    block_index,
+                    block_frame_offset,
+                    &block_header,
+                    header_size,
+                )
+            },
+        )?;
+        state.bytes_read_counter += u64::from(header_size);
+        if state.block_counter == 0 && (reserve_window || state.frame_header.fcs_declared()) {
+            state.reserve_decoding_buffer();
+        }
+        Ok(Some((
+            block_header.decompressed_size,
+            block_header.last_block,
+        )))
+    }
+
+    /// Append `content`, the next part of the Raw block in progress, to the
+    /// decode buffer.
+    pub(crate) fn raw_block_push(&mut self, content: &[u8]) {
+        let kernel = self.kernel;
+        let state = self
+            .state
+            .as_mut()
+            .expect("a Raw block is started on an initialised frame");
+        state.decoder_scratch.buffer_push(content, kernel);
+    }
+
+    /// Whether [`Self::enable_per_block_checksums`] asked for block digests.
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    pub(crate) fn per_block_checksums_enabled(&self) -> bool {
+        self.per_block_checksums_enabled
+    }
+
+    /// Record the digest of a block decoded outside this decoder's own block
+    /// loops, in block order.
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    pub(crate) fn record_block_checksum(&mut self, digest: u32) {
+        self.computed_block_checksums.push(digest);
+    }
+
+    /// The error for a source that ended inside the Raw block of `size` bytes
+    /// in progress: a body read cut short, as the block decoder reports it.
+    pub(crate) fn raw_block_cut_short(&self, size: u32, last: bool) -> FrameDecoderError {
+        let state = self
+            .state
+            .as_ref()
+            .expect("a Raw block is started on an initialised frame");
+        let header = crate::blocks::block::BlockHeader {
+            last_block: last,
+            block_type: crate::blocks::block::BlockType::Raw,
+            decompressed_size: size,
+            content_size: size,
+        };
+        block_body_decode_error(
+            DecodeBlockContentError::ReadError {
+                step: crate::blocks::block::BlockType::Raw,
+                source: Error::from(crate::io::ErrorKind::UnexpectedEof),
+            },
+            state.block_counter as u32,
+            // The header was counted when the block started.
+            (state.bytes_read_counter - 3) as u32,
+            &header,
+            3,
+        )
+    }
+
+    /// Close the Raw block of `size` bytes whose content is all appended.
+    pub(crate) fn finish_raw_block(&mut self, size: u32, last: bool) {
+        let state = self
+            .state
+            .as_mut()
+            .expect("a Raw block is started on an initialised frame");
+        state.bytes_read_counter += u64::from(size);
+        state.block_counter += 1;
+        if last {
+            state.frame_finished = true;
+        }
+    }
+
     #[cfg(target_has_atomic = "ptr")]
     fn shared_dict_exists(&self, dict_id: u32) -> bool {
         self.shared_dicts.contains_key(&dict_id)
@@ -1770,6 +1989,45 @@ impl FrameDecoder {
         let cksum_64bit = state.decoder_scratch.hash_finish();
         //truncate to lower 32bit because reasons...
         Some(cksum_64bit as u32)
+    }
+
+    /// Check that a finished frame produced exactly the `Frame_Content_Size` its
+    /// header declared (RFC 8878 3.1.1.1.4), returning
+    /// [`FrameDecoderError::FrameContentSizeMismatch`] otherwise. No-op for a
+    /// frame that declares no size or has not decoded its last block yet.
+    ///
+    /// [`decode_all`](Self::decode_all), [`decode_from_to`](Self::decode_from_to)
+    /// and the streaming reader call this automatically. Callers driving
+    /// [`decode_blocks`](Self::decode_blocks) directly invoke it once the
+    /// frame is finished, as upstream zstd checks at its last block.
+    ///
+    /// # Examples
+    /// ```
+    /// use structured_zstd::decoding::{BlockDecodingStrategy, FrameDecoder};
+    /// use structured_zstd::encoding::{compress_to_vec, CompressionLevel};
+    ///
+    /// let frame = compress_to_vec(&b"declared and delivered"[..], CompressionLevel::Fastest);
+    /// let mut source = frame.as_slice();
+    /// let mut decoder = FrameDecoder::new();
+    /// decoder.init(&mut source).unwrap();
+    /// decoder.decode_blocks(&mut source, BlockDecodingStrategy::All).unwrap();
+    /// assert!(decoder.is_finished());
+    /// decoder.verify_content_size().unwrap();
+    /// assert_eq!(decoder.collect().unwrap(), b"declared and delivered");
+    /// ```
+    pub fn verify_content_size(&self) -> Result<(), FrameDecoderError> {
+        let Some(state) = self.state.as_ref() else {
+            return Ok(());
+        };
+        if !state.frame_finished || !state.frame_header.fcs_declared() {
+            return Ok(());
+        }
+        let declared = state.frame_header.frame_content_size();
+        let produced = state.decoder_scratch.total_output();
+        if produced != declared {
+            return Err(FrameDecoderError::FrameContentSizeMismatch { declared, produced });
+        }
+        Ok(())
     }
 
     /// Compare the frame's stored content checksum against the digest the
@@ -2462,6 +2720,29 @@ impl FrameDecoder {
         source: &[u8],
         target: &mut [u8],
     ) -> Result<(usize, usize), FrameDecoderError> {
+        let progress = self.decode_available(source, target, false)?;
+        // Once the frame is fully decoded and drained, its length and running
+        // digest are final: check the declared size, and the checksum in
+        // `Verify` mode (no-op otherwise).
+        if self.is_finished() && self.can_collect() == 0 {
+            self.verify_content_size()?;
+            #[cfg(feature = "hash")]
+            self.verify_content_checksum()?;
+        }
+        Ok(progress)
+    }
+
+    /// [`Self::decode_from_to`] without its finish-point checks, for a caller
+    /// that must not report an error in the same call that delivered bytes
+    /// (a `Read` adapter) and so runs them itself on a call that delivers
+    /// none. `reserve_window` sizes the buffer for a frame of unknown size to
+    /// its window at its first block instead of letting it grow.
+    pub(crate) fn decode_available(
+        &mut self,
+        source: &[u8],
+        target: &mut [u8],
+        reserve_window: bool,
+    ) -> Result<(usize, usize), FrameDecoderError> {
         use FrameDecoderError as err;
         let bytes_read_at_start = match &self.state {
             Some(s) => s.bytes_read_counter,
@@ -2571,9 +2852,15 @@ impl FrameDecoder {
                     // and page-fault passes per frame. Not on the header alone,
                     // which would let a header followed by nothing reserve its
                     // whole declared window. The size is content-capped, so a
-                    // small frame gets a small buffer; a frame of unknown size
-                    // keeps growing lazily rather than paying for its window.
-                    if state.block_counter == 0 && state.frame_header.fcs_declared() {
+                    // small frame gets a small buffer. A frame of unknown size
+                    // gets its window only when the caller asked for it: the
+                    // `Read` adapter does, as `decode_blocks` always has, since
+                    // growing a large frame by doubling copies it several times;
+                    // the slice API leaves it to grow, so a small unsized frame
+                    // does not pay for a window it never fills.
+                    if state.block_counter == 0
+                        && (reserve_window || state.frame_header.fcs_declared())
+                    {
                         state.reserve_decoding_buffer();
                     }
 
@@ -2588,9 +2875,15 @@ impl FrameDecoder {
                     } else {
                         None
                     };
+                    #[cfg(all(feature = "lsm", feature = "hash"))]
+                    let len_before_block = self
+                        .per_block_checksums_enabled
+                        .then(|| state.decoder_scratch.buffer_len());
+                    // The whole block is in `mt_source` (checked above), so
+                    // it decodes from the slice without a copy.
                     let bytes_read_in_block_body = state
                         .decoder_scratch
-                        .decode_block_content(
+                        .decode_block_content_from_slice(
                             &mut block_dec,
                             &block_header,
                             &mut mt_source,
@@ -2606,6 +2899,19 @@ impl FrameDecoder {
                             )
                         })?;
                     state.bytes_read_counter += bytes_read_in_block_body;
+                    // The block's digest, as `decode_blocks` takes it: output
+                    // is drained before a block decodes, never during, so the
+                    // whole block is still in the buffer here.
+                    #[cfg(all(feature = "lsm", feature = "hash"))]
+                    if let Some(len_before_block) = len_before_block {
+                        let added = state.decoder_scratch.buffer_len() - len_before_block;
+                        let (s1, s2) = state.decoder_scratch.last_n_as_slices(added);
+                        let mut h = twox_hash::XxHash64::with_seed(0);
+                        use core::hash::Hasher;
+                        h.write(s1);
+                        h.write(s2);
+                        self.computed_block_checksums.push(h.finish() as u32);
+                    }
                     state.block_counter += 1;
 
                     if block_header.last_block {
@@ -2629,13 +2935,6 @@ impl FrameDecoder {
             + self
                 .read(&mut target[written..])
                 .map_err(err::FailedToDrainDecodebuffer)?;
-        // Once the frame is fully decoded and drained, the running digest is
-        // final: validate it in `Verify` mode (no-op otherwise). Same finish
-        // point as the streaming reader.
-        #[cfg(feature = "hash")]
-        if self.is_finished() && self.can_collect() == 0 {
-            self.verify_content_checksum()?;
-        }
         let bytes_read_at_end = match &mut self.state {
             Some(s) => s.bytes_read_counter,
             None => panic!("Bug in library"),
@@ -3420,6 +3719,7 @@ impl FrameDecoder {
                         h.write(&output[..n]);
                         self.computed_block_checksums.push(h.finish() as u32);
                     }
+                    state.decoder_scratch.set_total_output(n as u64);
                     state.frame_finished = true;
                     return Ok(n);
                 }
@@ -3679,6 +3979,7 @@ impl FrameDecoder {
         }
 
         let written = produced as usize;
+        state.decoder_scratch.set_total_output(produced);
         state.frame_finished = true;
         // `direct`'s last use is in the decode loop above; NLL therefore
         // releases its `&mut output` borrow before here, freeing `output` for
