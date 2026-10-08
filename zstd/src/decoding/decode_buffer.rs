@@ -513,7 +513,6 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.total_output_counter += fill_length as u64;
         Ok(())
     }
-
     /// Add `n` to the cumulative produced-byte counter for output produced
     /// outside `push` / `repeat` — namely the inline `exec_sequence_inline`
     /// path, which writes through the backend directly and so bypasses the
@@ -1231,9 +1230,15 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// `push`/`repeat`/`extend_and_fill`; window drops and drains do NOT
     /// decrement it, so it equals the cumulative decompressed length even after
     /// the visible buffer has been bounded to `window_size`.
-    #[cfg(feature = "lsm")]
     pub(crate) fn total_output(&self) -> u64 {
         self.total_output_counter
+    }
+
+    /// Record the length of a frame decoded outside this buffer (the direct
+    /// path writes into the caller's slice), so the finished frame's size
+    /// check reads the true count.
+    pub(crate) fn set_total_output(&mut self, produced: u64) {
+        self.total_output_counter = produced;
     }
 
     /// drain the buffer completely
