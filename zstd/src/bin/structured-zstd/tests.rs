@@ -4057,17 +4057,86 @@ fn plain_input_is_passed_through_or_refused() {
         .expect_err("a damaged frame after a good one is refused");
     assert_eq!(out, b"first");
 
-    // A skippable frame is a frame too: plain bytes after one are refused.
+    // A skippable frame is a frame too: plain bytes after one are refused,
+    // with the message they get after any other frame.
     let mut after_skippable = 0x184D_2A50u32.to_le_bytes().to_vec();
     after_skippable.extend_from_slice(&0u32.to_le_bytes());
-    after_skippable.extend_from_slice(b"plain");
-    decompress_stream(
-        after_skippable.as_slice(),
-        io::sink(),
-        &mut no_dict(),
-        &pass,
-    )
-    .expect_err("plain bytes after a skippable frame are refused");
+    let mut plain_after = after_skippable.clone();
+    plain_after.extend_from_slice(b"plain");
+    let err = decompress_stream(plain_after.as_slice(), io::sink(), &mut no_dict(), &pass)
+        .expect_err("plain bytes after a skippable frame are refused")
+        .to_string();
+    assert!(err.contains("unsupported format"), "{err}");
+    let mut stump_after = after_skippable;
+    stump_after.extend_from_slice(b"ab");
+    let err = decompress_stream(stump_after.as_slice(), io::sink(), &mut no_dict(), &pass)
+        .expect_err("a stump after a skippable frame is refused")
+        .to_string();
+    assert!(err.contains("unknown header"), "{err}");
+
+    // A skippable frame cut short gets its own message, in front of the first
+    // frame and after one.
+    let mut cut_skippable = 0x184D_2A50u32.to_le_bytes().to_vec();
+    cut_skippable.extend_from_slice(&16u32.to_le_bytes());
+    cut_skippable.extend_from_slice(b"short");
+    let mut cut_after_frame = frame_of(b"framed");
+    cut_after_frame.extend_from_slice(&cut_skippable);
+    for (input, label) in [
+        (cut_skippable.as_slice(), "leading"),
+        (cut_after_frame.as_slice(), "after a frame"),
+    ] {
+        let err = decompress_stream(input, io::sink(), &mut no_dict(), &pass)
+            .expect_err("a truncated skippable frame is refused")
+            .to_string();
+        assert!(
+            err.contains("skippable frame is truncated"),
+            "{label}: {err}"
+        );
+    }
+
+    // A frame magic whose header is invalid (a window larger than any decoder
+    // accepts, RFC 8878 3.1.1.1.2) is a damaged frame, reported with its cause.
+    let mut bad_header = 0xFD2F_B528u32.to_le_bytes().to_vec();
+    bad_header.extend_from_slice(&[0x00, 0xF8]);
+    let err = decompress_stream(bad_header.as_slice(), io::sink(), &mut no_dict(), &pass)
+        .expect_err("a frame with an invalid header is refused")
+        .to_string();
+    assert!(err.contains("invalid zstd frame"), "{err}");
+
+    // A source that fails where the next frame would start is a read failure,
+    // not a stump of a header: "unknown header" is for input that ends there.
+    struct FailsAfter<'a> {
+        data: &'a [u8],
+    }
+    impl Read for FailsAfter<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.data.is_empty() {
+                return Err(io::Error::other("device went away"));
+            }
+            self.data.read(buf)
+        }
+    }
+    let mut skippable = 0x184D_2A50u32.to_le_bytes().to_vec();
+    skippable.extend_from_slice(&0u32.to_le_bytes());
+    let source = FailsAfter { data: &skippable };
+    let err = decompress_stream(source, io::sink(), &mut no_dict(), &pass)
+        .expect_err("a failing source is refused")
+        .to_string();
+    assert!(err.contains("failed to read the input"), "{err}");
+
+    // The same inside a skippable frame's content: the device failed, the
+    // frame is not truncated.
+    let mut metadata = 0x184D_2A50u32.to_le_bytes().to_vec();
+    metadata.extend_from_slice(&16u32.to_le_bytes());
+    metadata.extend_from_slice(b"partial");
+    let source = FailsAfter { data: &metadata };
+    let err = decompress_stream(source, io::sink(), &mut no_dict(), &pass)
+        .expect_err("a source failing inside a skippable frame is refused")
+        .to_string();
+    assert!(
+        err.contains("failed to read the input") && err.contains("device went away"),
+        "{err}"
+    );
 
     // The default follows the reference command: on when forced and writing
     // to stdout (`zstd -dcf`), off otherwise.
