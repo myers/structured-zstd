@@ -50,7 +50,7 @@ fn parse_as(preset: &ProgramPreset, default_level: i32, args: &[&str]) -> Result
     let owned: Vec<OsString> = args.iter().map(OsString::from).collect();
     match parse_args(&owned, preset, default_level).map_err(|failure| failure.error)? {
         Parsed::Run(opts) => Ok(*opts),
-        Parsed::Handled => bail!("parse handled (help/version) unexpectedly"),
+        Parsed::Handled { .. } => bail!("parse handled (help/version) unexpectedly"),
     }
 }
 
@@ -122,7 +122,7 @@ fn a_non_utf8_argument_survives_parsing() {
         .expect("parsing must not fail")
     {
         Parsed::Run(opts) => *opts,
-        Parsed::Handled => panic!("unexpected help/version"),
+        Parsed::Handled { .. } => panic!("unexpected help/version"),
     };
     assert_eq!(
         opts.inputs,
@@ -153,7 +153,7 @@ fn attached_path_options_keep_their_bytes() {
             .expect("parsing must not fail")
         {
             Parsed::Run(opts) => *opts,
-            Parsed::Handled => panic!("unexpected help/version"),
+            Parsed::Handled { .. } => panic!("unexpected help/version"),
         }
     };
 
@@ -1760,14 +1760,21 @@ fn fast_flag_maps_to_negative_level() {
 
 #[test]
 fn fast_level_reads_a_digit_run_and_ignores_the_tail() {
-    // upstream zstd (zstdcli.c:1139 -> readU32FromCharChecked, 350-376): the
+    // upstream zstd (zstdcli.c:1174 -> readU32FromCharChecked, 355-388): the
     // acceleration factor is the LEADING digit run; the parser stops at the
-    // first byte that is neither a digit nor a K/M multiplier and `--fast`
+    // first byte that is neither a digit nor a K/M/G multiplier and `--fast`
     // never looks at what is left. `zstd --fast=3.5` compresses at level -3,
     // so refusing it turns a working command line into an error.
     assert_eq!(parse(&["--fast=3.5"]).unwrap().level, -3);
     assert_eq!(parse(&["--fast=3x"]).unwrap().level, -3);
-    assert_eq!(parse(&["--fast=3G"]).unwrap().level, -3);
+    // The multipliers are upper case only there, so a lower-case one is tail.
+    assert_eq!(parse(&["--fast=3k"]).unwrap().level, -3);
+    // `G` multiplies like `K` and `M`, and the factor then clamps to the
+    // fastest level.
+    assert_eq!(
+        parse(&["--fast=3G"]).unwrap().level,
+        CompressionLevel::MIN_LEVEL
+    );
     // A sign is not a digit, so the run is empty and the factor is zero —
     // which upstream rejects. Rust's own integer parser accepts `+3`, and
     // accepting it here would take a level upstream refuses.
@@ -2167,11 +2174,13 @@ fn long_is_refused_at_levels_that_cannot_run_it() {
 #[test]
 fn out_of_range_long_window_log_is_refused() {
     assert!(parse(&["-19", "--long=99", "in.txt"]).is_err());
-    // The encoder would accept up to 30, but this build's decoder refuses any
-    // frame declaring a window above 128 MiB — so those levels only produce
-    // files it cannot read back. Refuse them at the flag instead.
+    // Past the default decoder ceiling is fine: such a frame decodes with
+    // `--long=N` or `--memory`, as the reference command's does. Past what the
+    // encoder writes is not.
     assert!(parse(&["-19", "--long=27", "in.txt"]).is_ok());
-    assert!(parse(&["-19", "--long=28", "in.txt"]).is_err());
+    assert!(parse(&["-19", "--long=28", "in.txt"]).is_ok());
+    let past = format!("--long={}", max_window_log() + 1);
+    assert!(parse(&["-19", &past, "in.txt"]).is_err());
 }
 
 /// A benchmark range is two levels, and both of them run. Checking only the
@@ -2211,8 +2220,8 @@ fn benchmark_flags_parse_level_range() {
     assert_eq!(opts.bench_end, opts.bench_start);
 }
 
-/// `-B#` is read the way the reference reads it (a count with `K` / `M`), and
-/// zero is no block size at all.
+/// `-B#` is read the way the reference reads it (a count with `K` / `M` /
+/// `G`), and zero is no block size at all.
 #[test]
 fn block_size_is_read_like_the_reference_reads_it() {
     assert_eq!(
@@ -2229,8 +2238,1335 @@ fn block_size_is_read_like_the_reference_reads_it() {
     );
     assert_eq!(parse(&["-b", "-B0", "f"]).unwrap().block_size, None);
     assert_eq!(parse(&["-b", "-B", "f"]).unwrap().block_size, None);
-    assert!(parse(&["-b", "-B1G", "f"]).is_err(), "no G multiplier");
+    assert_eq!(
+        parse(&["-b", "-B1G", "f"]).unwrap().block_size,
+        Some(1 << 30)
+    );
+    // Past 32 bits is an overflow, as `readU32FromChar` reports it.
+    assert!(parse(&["-b", "-B4G", "f"]).is_err());
     assert!(parse(&["-b", "-Bx", "f"]).is_err());
+}
+
+/// Every numeric option reads the reference's number grammar (zstdcli.c:355-460
+/// with `NEXT_UINT32` / `NEXT_TSIZE`): digits, a `K` / `M` / `G` multiplier,
+/// then `i` and `B` in either combination, and nothing after. `playTests.sh`
+/// passes `--maxdict=4K`, which a plain integer parse refused.
+#[test]
+fn numeric_options_read_the_reference_suffixes() {
+    assert_eq!(parse(&["--maxdict=4K", "f"]).unwrap().max_dict, 4096);
+    assert_eq!(parse(&["--maxdict", "1KiB", "f"]).unwrap().max_dict, 1024);
+    assert_eq!(parse(&["--dictID=1K", "f"]).unwrap().dict_id, Some(1024));
+    assert_eq!(
+        parse(&["--size-hint=1KiB", "f"]).unwrap().size_hint,
+        Some(1024)
+    );
+    assert_eq!(
+        parse(&["-b", "--block-size=1MiB", "f"]).unwrap().block_size,
+        Some(1 << 20)
+    );
+    // A whole value is unambiguous, so lower case reads too.
+    assert_eq!(parse(&["--maxdict=4kb", "f"]).unwrap().max_dict, 4096);
+    // A 32-bit option overflows past 32 bits, and anything after the suffix
+    // is the reference's error.
+    assert!(parse(&["--maxdict=4G", "f"]).is_err());
+    let tail = parse(&["--maxdict=4K5", "f"]).err().unwrap().to_string();
+    assert!(
+        tail.contains("only numeric values with optional suffixes"),
+        "{tail}"
+    );
+}
+
+/// `--split=#` and `--jobsize=#` are the reference's other spellings of the
+/// chunk size `-B#` sets (zstdcli.c:1108-1110); `playTests.sh` trains with
+/// `--split=2K`.
+#[test]
+fn split_and_jobsize_set_the_block_size() {
+    assert_eq!(
+        parse(&["--train", "--split=2K", "f"]).unwrap().block_size,
+        Some(2048)
+    );
+    assert_eq!(
+        parse(&["--jobsize", "1M", "f"]).unwrap().block_size,
+        Some(1 << 20)
+    );
+    assert!(parse(&["--split"]).is_err(), "the value is required");
+}
+
+/// A short flag that takes a number reads it and the cluster goes on, as the
+/// reference's loop does (zstdcli.c:1205-1345): `playTests.sh` runs
+/// `zstd -b1e10i0`, which is `-b -1 -e10 -i0`. The benchmark starts at the
+/// level however it was given.
+#[test]
+fn short_numbers_end_where_the_next_flag_starts() {
+    let opts = parse(&["-b1e10i0", "f"]).unwrap();
+    assert!(opts.bench);
+    assert_eq!((opts.level, opts.bench_start, opts.bench_end), (1, 1, 10));
+    // `-i0` is one pass per level, not a second.
+    assert_eq!(opts.bench_secs, 0.0);
+    // A lower-case letter after a number is the next flag, not a multiplier.
+    let opts = parse(&["-19k", "f"]).unwrap();
+    assert_eq!(opts.level, 19);
+    assert!(opts.keep);
+    let opts = parse(&["-B64Kc", "f"]).unwrap();
+    assert_eq!(opts.block_size, Some(64 << 10));
+    assert!(opts.to_stdout);
+    assert_eq!(parse(&["-5", "-b", "f"]).unwrap().bench_start, 5);
+    // The memory ceiling ends at its number too.
+    let opts = parse(&["-d", "-M512c", "f"]).unwrap();
+    assert_eq!(opts.memory_limit, Some(512 << 20));
+    assert!(opts.to_stdout);
+}
+
+/// The reference's remaining short flags: `-n` is gzip's "no name", which has
+/// nothing to do here; `-p` pauses before exiting, `-p#` tags benchmark lines,
+/// and `-P#` sets the generated data's compressibility.
+#[test]
+fn n_p_and_capital_p_are_read_as_the_reference_reads_them() {
+    assert!(parse(&["-n", "f"]).is_ok());
+    let opts = parse(&["-p", "f"]).unwrap();
+    assert!(opts.pause);
+    assert_eq!(opts.bench_param, None);
+    let opts = parse(&["-b", "-p7", "f"]).unwrap();
+    assert!(!opts.pause);
+    assert_eq!(opts.bench_param, Some(7));
+    assert_eq!(
+        parse(&["-b", "-P50"]).unwrap().bench_compressibility,
+        Some(50)
+    );
+    // `-p` takes a parameter only when a digit follows it (zstdcli.c:1324);
+    // otherwise it is the pause and the cluster goes on, so a suffix letter
+    // there is the next flag, not a multiplier of nothing.
+    let opts = parse(&["-pq", "f"]).unwrap();
+    assert!(opts.pause);
+    assert_eq!(opts.bench_param, None);
+    assert!(parse(&["-pK", "f"]).is_err());
+}
+
+/// `-p` holds every exit, including a command line that fails to parse or
+/// one that only prints, as the reference's common exit does (zstdcli.c,
+/// `_end` calls `waitEnter`).
+#[test]
+fn pause_holds_the_exits_parsing_takes() {
+    let parse_raw = |args: &[&str]| {
+        let owned: Vec<OsString> = args.iter().map(OsString::from).collect();
+        parse_args(&owned, &plain(), CompressionLevel::DEFAULT_LEVEL)
+    };
+    assert!(parse_raw(&["-p", "--bogus"]).err().unwrap().pause);
+    assert!(!parse_raw(&["--bogus"]).err().unwrap().pause);
+    for handled in ["-V", "-H", "-h", "--version", "--help"] {
+        assert!(
+            matches!(
+                parse_raw(&["-p", handled]),
+                Ok(Parsed::Handled { pause: true })
+            ),
+            "{handled}"
+        );
+        assert!(
+            matches!(parse_raw(&[handled]), Ok(Parsed::Handled { pause: false })),
+            "{handled}"
+        );
+    }
+}
+
+/// The whole command waits on stdin under `-p` at its one exit, whatever the
+/// outcome (printed, refused, run), and only then; the status is the run's.
+#[test]
+fn the_command_pauses_at_its_one_exit() {
+    let command = |args: &[&str]| {
+        let raw: Vec<OsString> = std::iter::once("zstd")
+            .chain(args.iter().copied())
+            .map(OsString::from)
+            .collect();
+        let mut stdin: &[u8] = b"\nleft";
+        let status = run_command(&raw, &mut stdin);
+        (status, stdin == b"left")
+    };
+    assert_eq!(command(&["-p", "-V"]), (0, true));
+    assert_eq!(command(&["-V"]), (0, false));
+    assert_eq!(command(&["-p", "--bogus"]), (1, true));
+    assert_eq!(command(&["--bogus"]), (1, false));
+    assert_eq!(command(&["-p", "-b1", "-i0", "-qq", "-B64K"]), (0, true));
+    assert_eq!(command(&["-b1", "-i0", "-qq", "-B64K"]), (0, false));
+    assert_eq!(
+        command(&["-p", "-qq", "-d", "/nonexistent/input.zst"]),
+        (1, true)
+    );
+    // A run that ends in an error rather than a failed input.
+    assert_eq!(command(&["-p", "-qq", "-b", "-"]), (1, true));
+    // A kernel ceiling from the other instruction-set ladder is refused before
+    // anything runs, and the pause still holds.
+    let foreign = if cfg!(target_arch = "aarch64") {
+        "--cpu=avx2"
+    } else {
+        "--cpu=neon"
+    };
+    assert_eq!(command(&["-p", "-qq", foreign]), (1, true));
+}
+
+/// Long options the reference takes for its own testing and tuning. The ones
+/// that cannot change what this build does are accepted; `--trace` still needs
+/// its file, as it does there.
+#[test]
+fn test_and_tuning_options_are_accepted() {
+    // `--priority=rt` asks the benchmark for real-time scheduling, as the
+    // reference's does before it measures (`benchzstd.c:950`).
+    assert!(parse(&["--priority=rt", "-b", "f"]).unwrap().bench_realtime);
+    assert!(!parse(&["-b", "f"]).unwrap().bench_realtime);
+    // `--trace-file-stat` prints the reference's own C calls by name; there is
+    // nothing of ours it could describe, so it is refused rather than taken
+    // and left silent.
+    let refused = parse(&["--trace-file-stat", "f"])
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(refused.contains("--trace-file-stat"), "{refused}");
+    for args in [&["--trace", "t.csv", "f"][..], &["--trace=t.csv", "f"]] {
+        assert!(parse(args).is_ok(), "{args:?}");
+    }
+    assert!(parse(&["--trace"]).is_err());
+    let opts = parse(&[
+        "--fake-stdin-is-console",
+        "--fake-stdout-is-console",
+        "--fake-stderr-is-console",
+    ])
+    .unwrap();
+    assert!(opts.console.stdin());
+    assert!(opts.console.stdout());
+    assert!(opts.console.stderr());
+}
+
+/// The decoder's window ceiling follows the command line as the reference's
+/// does: a patch reaches across its whole reference, `--long=N` and
+/// `--zstd=wlog=N` raise the ceiling to their window (the latter winning, as
+/// it wins when compressing), `-M` gives what its promise leaves after the
+/// other buffers and the dictionary, and nothing named keeps the default.
+/// Nothing lowers it below the default. A `-M` after `--patch-apply` is a
+/// promise the patch keeps too, as the reference's later `-M` replaces the
+/// limit `--patch-apply` lifted.
+#[test]
+fn the_decode_window_follows_the_command_line() {
+    use structured_zstd::decoding::{MAX_DECODER_WINDOW_SIZE, MAXIMUM_ALLOWED_WINDOW_SIZE};
+
+    let ceiling =
+        |args: &[&str], dictionary: u64| decode_window_ceiling(&parse(args).unwrap(), dictionary);
+    assert_eq!(ceiling(&["-d", "f.zst"], 0), MAXIMUM_ALLOWED_WINDOW_SIZE);
+    assert_eq!(ceiling(&["-d", "--long=28", "f.zst"], 0), 1 << 28);
+    assert_eq!(ceiling(&["-d", "--zstd=wlog=29", "f.zst"], 0), 1 << 29);
+    assert_eq!(
+        ceiling(&["-d", "--long=27", "--zstd=wlog=29", "f.zst"], 0),
+        1 << 29
+    );
+    assert_eq!(
+        ceiling(&["-d", "--long=20", "f.zst"], 0),
+        MAXIMUM_ALLOWED_WINDOW_SIZE
+    );
+    assert_eq!(
+        ceiling(&["--patch-apply=ref", "f.zst"], 0),
+        MAX_DECODER_WINDOW_SIZE
+    );
+    assert_eq!(
+        ceiling(&["--patch-apply=ref", "-M512MB", "f.zst"], 1 << 20),
+        (512 << 20) - (1 << 20) - (2 << 20)
+    );
+    // A later `-M0` asks for the default limit again, as zero replaces the
+    // reference command's limit (zstdcli.c:1572-1577); an earlier one is
+    // overridden by the patch like any other `-M`.
+    assert_eq!(
+        ceiling(&["--patch-apply=ref", "-M0", "f.zst"], 0),
+        MAXIMUM_ALLOWED_WINDOW_SIZE
+    );
+    assert_eq!(
+        ceiling(&["--patch-apply=ref", "--long=28", "-M0", "f.zst"], 0),
+        1 << 28
+    );
+    assert_eq!(
+        ceiling(&["-M0", "--patch-apply=ref", "f.zst"], 0),
+        MAX_DECODER_WINDOW_SIZE
+    );
+    assert_eq!(
+        ceiling(&["-d", "-M512MB", "f.zst"], 1 << 20),
+        (512 << 20) - (1 << 20) - (2 << 20)
+    );
+}
+
+/// A benchmark holds its input, frames, decoded copy, encoder and dictionaries
+/// while it decodes, so under `-M` its window may have only what the promise
+/// leaves after them and the decoder's other buffers; without `-M` nothing is
+/// promised and the run's own ceiling stands.
+#[test]
+fn a_benchmark_window_leaves_room_for_what_the_benchmark_holds() {
+    use structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE;
+
+    let mut opts = parse(&["-b19", "-M600MB", "--long=29", "f"]).unwrap();
+    opts.decode_window = decode_window_ceiling(&opts, 0);
+    let held = 400u64 << 20;
+    assert_eq!(
+        bench_decode_settings(&opts, Some(held)).max_window,
+        (600 << 20) - held - DECODER_AUXILIARY_BYTES
+    );
+    // The default window is always left: the limit was checked to cover it.
+    let tight = (600u64 << 20) - MAXIMUM_ALLOWED_WINDOW_SIZE;
+    assert_eq!(
+        bench_decode_settings(&opts, Some(tight)).max_window,
+        MAXIMUM_ALLOWED_WINDOW_SIZE
+    );
+    let mut free = parse(&["-b19", "--long=29", "f"]).unwrap();
+    free.decode_window = decode_window_ceiling(&free, 0);
+    assert_eq!(bench_decode_settings(&free, None).max_window, 1 << 29);
+}
+
+/// Decoding takes the decoder's widest window by `--long=N`, past what the
+/// encoder writes, as the reference command's `-d --long=31` does on a 64-bit
+/// build; compressing still stops at what this build writes.
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn decoding_takes_the_decoders_widest_window_log() {
+    use structured_zstd::decoding::MAX_DECODER_WINDOW_SIZE;
+
+    let widest = MAX_DECODER_WINDOW_SIZE.ilog2();
+    assert!(
+        widest > max_window_log(),
+        "the decoder reaches past the encoder"
+    );
+    let long = format!("--long={widest}");
+    let wlog = format!("--zstd=wlog={widest}");
+    for flag in [&long, &wlog] {
+        let opts = parse(&["-d", flag, "f.zst"]).unwrap();
+        assert_eq!(decode_window_ceiling(&opts, 0), MAX_DECODER_WINDOW_SIZE);
+        assert!(parse(&[flag, "f"]).is_err(), "{flag} compressing");
+    }
+    assert!(parse(&["-d", &format!("--long={}", widest + 1), "f.zst"]).is_err());
+}
+
+/// A frame past the ceiling is refused with the reference command's message,
+/// naming the flags that would decode it (fileio.c:2674-2684).
+/// The `--memory` named covers the window and what `-M` counts besides it, the
+/// decoder's other buffers and the dictionary, so it is a limit that decodes
+/// the frame.
+#[test]
+fn a_window_past_the_ceiling_names_the_flag_that_decodes_it() {
+    assert_eq!(
+        window_too_large_message(1 << 28, 1 << 27, Some(DECODER_AUXILIARY_BYTES)),
+        "Decoding error (36) : Frame requires too much memory for decoding\n\
+         Window size larger than maximum : 268435456 > 134217728\n\
+         Use --long=28 or --memory=257MB"
+    );
+    assert!(
+        window_too_large_message(1 << 40, 1 << 27, Some(DECODER_AUXILIARY_BYTES))
+            .contains("ZSTD_WINDOWLOG_MAX")
+    );
+}
+
+/// A frame from `zstd --long=28` does not decode with the default ceiling and
+/// does with `--long=28` or a `-M` large enough, as with the reference command;
+/// the `--memory` the refusal names is one of those.
+#[test]
+fn a_wide_window_decodes_with_long_or_memory() {
+    let scratch = Scratch::new("widewindow");
+    // No declared size, window log 28, one raw block of "abc".
+    let mut frame = 0xFD2F_B528u32.to_le_bytes().to_vec();
+    frame.extend_from_slice(&[0x00, (28 - 10) << 3, 0x19, 0x00, 0x00]);
+    frame.extend_from_slice(b"abc");
+    let input = scratch.file("wide.zst", &frame);
+    let input = input.to_str().unwrap();
+    let output = scratch.0.join("wide");
+    let output = output.to_str().unwrap();
+
+    let refused = run(parse(&["-d", "-qq", "-f", input, "-o", output]).unwrap())
+        .expect_err("the default ceiling refuses a 256 MiB window")
+        .to_string();
+    assert!(refused.contains("Use --long=28"), "{refused}");
+    let named = refused
+        .split_whitespace()
+        .find(|word| word.starts_with("--memory="))
+        .expect("the refusal names a --memory");
+    for flag in ["--long=28", "-M512MB", named] {
+        assert_eq!(
+            run(parse(&["-d", "-qq", "-f", flag, input, "-o", output]).unwrap()).unwrap(),
+            0,
+            "{flag}"
+        );
+        assert_eq!(fs::read(output).unwrap(), b"abc", "{flag}");
+    }
+
+    // A patch reaches across its whole reference, so applying one takes any
+    // window without a flag; this frame copies nothing from the reference.
+    let reference = scratch.file("reference", b"reference");
+    assert_eq!(
+        run(parse(&[
+            "-qq",
+            "-f",
+            &format!("--patch-apply={}", reference.display()),
+            input,
+            "-o",
+            output,
+        ])
+        .unwrap())
+        .unwrap(),
+        0
+    );
+    assert_eq!(fs::read(output).unwrap(), b"abc");
+}
+
+/// `--trace FILE` appends one line per frame in the reference's format:
+/// compressing two files appends two `compress` lines, decompressing and
+/// testing a file of two frames appends two `decompress` lines each, all
+/// `streaming`, and a benchmark's lines are `single-pass`. The header is
+/// written once, when the file is created.
+#[test]
+fn trace_records_every_frame() {
+    let scratch = Scratch::new("trace");
+    let trace = scratch.0.join("t.csv");
+    let trace = trace.to_str().unwrap();
+    let one = scratch.file("one", &b"the first input ".repeat(100));
+    let two = scratch.file("two", b"the second one");
+    let one = one.to_str().unwrap();
+    let two = two.to_str().unwrap();
+    let lines = || {
+        fs::read_to_string(trace)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        run(parse(&["-qq", "-f", "-19", "--trace", trace, one, two]).unwrap()).unwrap(),
+        0
+    );
+    let compressed = lines();
+    assert_eq!(compressed.len(), 3, "{compressed:#?}");
+    assert!(compressed[0].starts_with("Algorithm, Version, Method, Mode, Level"));
+    let one_frame = fs::read(format!("{one}.zst")).unwrap();
+    assert!(
+        compressed[1].starts_with(&format!(
+            "zstd, 10507, compress, streaming, 19, 0, 0, 1600, {}, ",
+            one_frame.len()
+        )),
+        "{}",
+        compressed[1]
+    );
+    assert!(compressed[2].starts_with("zstd, 10507, compress, streaming, 19, 0, 0, 14, "));
+
+    // Two frames back to back decode to both inputs, and each is a line.
+    let mut both = one_frame.clone();
+    both.extend_from_slice(&fs::read(format!("{two}.zst")).unwrap());
+    let both = scratch.file("both.zst", &both);
+    let both = both.to_str().unwrap();
+    let out = scratch.0.join("both");
+    let out = out.to_str().unwrap();
+    assert_eq!(
+        run(parse(&["-qq", "-f", "-d", "--trace", trace, both, "-o", out]).unwrap()).unwrap(),
+        0
+    );
+    assert_eq!(
+        run(parse(&["-qq", "-t", "--trace", trace, both]).unwrap()).unwrap(),
+        0
+    );
+    let decoded = &lines()[3..];
+    assert_eq!(decoded.len(), 4, "{decoded:#?}");
+    for pair in decoded.chunks(2) {
+        assert!(
+            pair[0].starts_with(&format!(
+                "zstd, 10507, decompress, streaming, 0, 0, 0, 1600, {}, ",
+                one_frame.len()
+            )),
+            "{}",
+            pair[0]
+        );
+        assert!(pair[1].starts_with("zstd, 10507, decompress, streaming, 0, 0, 0, 14, "));
+    }
+
+    // A benchmark compresses and decompresses each level once per pass.
+    assert_eq!(
+        run(parse(&["-qq", "-b1", "-i0", "--trace", trace, two]).unwrap()).unwrap(),
+        0
+    );
+    let benched = &lines()[7..];
+    assert!(!benched.is_empty());
+    assert!(
+        benched
+            .iter()
+            .all(|line| line.starts_with("zstd, 10507, ") && line.contains(", single-pass, ")),
+        "{benched:#?}"
+    );
+    assert!(benched.iter().any(|line| line.contains(", compress, ")));
+    assert!(benched.iter().any(|line| line.contains(", decompress, ")));
+}
+
+/// A decompressed frame's traced duration is the decoder's time, not the
+/// sink's: a writer that takes a long time over each write does not appear in
+/// the line, and neither does the write of the frame's last output, which
+/// happens before the decoder is called again to finish the frame.
+#[test]
+fn trace_times_decoding_without_the_writes() {
+    struct Slow;
+    impl Write for Slow {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let scratch = Scratch::new("trace-writes");
+    let path = scratch.0.join("t.csv");
+    let frame = frame_of(b"a small frame, decoded in microseconds");
+    let mut trace = Some(trace::Trace::open(&path, 10507, false).unwrap());
+    let mut decoder = structured_zstd::decoding::StreamingDecoder::new(frame.as_slice());
+    let mut buffer = [0u8; 16];
+    let no_reads = core::cell::Cell::new(None);
+    drain_decoded(
+        &mut decoder,
+        &mut Slow,
+        &mut buffer,
+        &mut trace,
+        &no_reads,
+        0,
+    )
+    .unwrap();
+    drop(trace);
+    let lines = fs::read_to_string(&path).unwrap();
+    let line = lines.lines().nth(1).unwrap();
+    let nanos: u64 = line.split(", ").nth(9).unwrap().parse().unwrap();
+    // Three writes of at least 100 ms each went to the sink.
+    assert!(nanos < 50_000_000, "{line}");
+}
+
+/// A trace that cannot be opened, or stops taking writes, costs the run its
+/// trace and nothing else: the frames are still written, the run succeeds,
+/// and a trace that failed a write is closed rather than retried per frame.
+#[test]
+fn a_trace_that_fails_leaves_the_run_untraced() {
+    let scratch = Scratch::new("trace-fails");
+    let input = scratch.file("in", b"compressed whatever the trace does");
+    let input = input.to_str().unwrap();
+    let unreachable = scratch.0.join("no-such-directory").join("t.csv");
+    let unreachable = unreachable.to_str().unwrap();
+    // At the default verbosity, so the report of the trace is made.
+    assert_eq!(
+        run(parse(&["-f", "--trace", unreachable, input]).unwrap()).unwrap(),
+        0
+    );
+    assert!(scratch.0.join("in.zst").exists());
+    assert!(!Path::new(unreachable).exists());
+
+    // Opened for reading only, so the first line written to it fails.
+    let read_only = scratch.file("read-only.csv", b"");
+    let mut trace = Some(trace::Trace::over(
+        fs::File::open(&read_only).unwrap(),
+        10507,
+        false,
+    ));
+    trace_frame(
+        &mut trace,
+        &trace::Frame {
+            method: trace::Method::Compress,
+            level: 3,
+            dictionary_size: 0,
+            uncompressed_size: 8,
+            compressed_size: 4,
+            duration: std::time::Duration::from_nanos(8),
+        },
+    );
+    assert!(trace.is_none(), "a trace that failed a write is closed");
+}
+
+/// The trace is checked against the files a run actually writes: an input
+/// that names no output (decompressing a file without a zstd suffix) and a
+/// mode that writes no file (`--list`) leave nothing to collide with, and the
+/// run goes on with its trace open.
+#[test]
+fn a_trace_beside_no_output_is_opened() {
+    let scratch = Scratch::new("trace-no-output");
+    let payload = b"listed and decoded";
+    let frame = scratch.file("frame.zst", &frame_of(payload));
+    let unsuffixed = scratch.file("unsuffixed", &frame_of(payload));
+    let trace = scratch.0.join("t.csv");
+    let trace = trace.to_str().unwrap();
+    // Refused for its name, which is not the trace's business.
+    assert_ne!(
+        run(parse(&["-qq", "-d", "--trace", trace, unsuffixed.to_str().unwrap()]).unwrap())
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        run(parse(&["-qq", "-l", "--trace", trace, frame.to_str().unwrap()]).unwrap()).unwrap(),
+        0
+    );
+    assert!(
+        fs::read_to_string(trace)
+            .unwrap()
+            .starts_with("Algorithm, Version")
+    );
+}
+
+/// A compression that fails part-way is reported from the stream, not
+/// counted as written: an input shorter than its pledge.
+#[test]
+fn a_failed_compression_is_an_error_of_the_stream() {
+    let opts = parse(&["-3", "f"]).unwrap();
+    let mut out = Vec::new();
+    let failed = stream(
+        &opts,
+        &mut no_dict(),
+        ProgressMonitor::new(&b"short"[..], None, false),
+        Some(64),
+        &DecodeSettings::from_options(&opts),
+        &mut out,
+    );
+    assert!(failed.is_err());
+}
+
+/// The dictionary size a trace line reports is the size of the dictionary as
+/// it was given, header and entropy tables included, both ways: upstream sets
+/// `dictContentSize` to the whole buffer it was handed and traces that, and
+/// decompression reports the whole `ZSTD_DDict`.
+#[test]
+fn trace_reports_the_whole_dictionary() {
+    use structured_zstd::dictionary::{
+        CoverOptions, FastCoverOptions, FinalizeOptions, train_fastcover_dict,
+    };
+    let corpus: Vec<u8> = (0..40_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    let options = FastCoverOptions {
+        cover: CoverOptions {
+            k: 256,
+            ..FastCoverOptions::default().cover
+        },
+        ..FastCoverOptions::default()
+    };
+    let blob = train_fastcover_dict(
+        corpus.as_slice(),
+        &[4_000; 10],
+        8 * 1024,
+        &options,
+        FinalizeOptions::default(),
+    )
+    .expect("training the fixture dictionary must succeed");
+    let scratch = Scratch::new("trace-dictionary");
+    let dictionary = scratch.file("dict", &blob);
+    let dictionary = dictionary.to_str().unwrap();
+    let input = scratch.file("in", &corpus[..4_000]);
+    let input = input.to_str().unwrap();
+    let trace = scratch.0.join("t.csv");
+    let trace = trace.to_str().unwrap();
+    assert_eq!(
+        run(parse(&["-qq", "-f", "-D", dictionary, "--trace", trace, input]).unwrap()).unwrap(),
+        0
+    );
+    let frame = format!("{input}.zst");
+    let out = scratch.0.join("out");
+    let out = out.to_str().unwrap();
+    assert_eq!(
+        run(parse(&[
+            "-qq", "-f", "-d", "-D", dictionary, "--trace", trace, &frame, "-o", out
+        ])
+        .unwrap())
+        .unwrap(),
+        0
+    );
+    let written = fs::read_to_string(trace).unwrap();
+    let sizes: Vec<&str> = written
+        .lines()
+        .skip(1)
+        .map(|line| line.split(", ").nth(6).unwrap())
+        .collect();
+    assert_eq!(sizes, [blob.len().to_string(), blob.len().to_string()]);
+}
+
+/// A `--filelist` is read by the run, so a trace of the same name, appended
+/// to, would change it; it is refused like an input.
+#[test]
+fn trace_naming_a_file_list_is_refused() {
+    let scratch = Scratch::new("trace-filelist");
+    let input = scratch.file("in", b"listed");
+    let list = scratch.file("list.txt", input.to_str().unwrap().as_bytes());
+    let list = list.to_str().unwrap();
+    let opts = parse(&["-f", "--filelist", list]).unwrap();
+    assert!(refuse_trace_alias(&opts, Path::new(list)).is_err());
+}
+
+/// The runs that write to standard output: data under `-c` or from stdin
+/// without `-o`, a benchmark's results unless `-qq` silences them, and
+/// `--list`'s table; not a run with `-o` (`-o -` included) or `-t`.
+#[test]
+fn the_runs_writing_to_stdout_are_known() {
+    assert!(writes_to_stdout(&parse(&["-c", "in"]).unwrap()));
+    assert!(writes_to_stdout(&parse(&["-d", "-"]).unwrap()));
+    assert!(!writes_to_stdout(&parse(&["in", "-o", "out"]).unwrap()));
+    // `-o -` names a file called `-`; only `-c` selects stdout.
+    assert!(!writes_to_stdout(&parse(&["in", "-o", "-"]).unwrap()));
+    assert!(writes_to_stdout(&parse(&["-b1", "in"]).unwrap()));
+    assert!(writes_to_stdout(&parse(&["-q", "-b1", "in"]).unwrap()));
+    assert!(!writes_to_stdout(&parse(&["-qq", "-b1", "in"]).unwrap()));
+    assert!(writes_to_stdout(&parse(&["-l", "in.zst"]).unwrap()));
+    assert!(!writes_to_stdout(&parse(&["-t", "in.zst"]).unwrap()));
+}
+
+/// Every name of a file has its identity, a hard link included, and another
+/// file has another.
+#[test]
+fn every_name_of_a_file_has_its_identity() {
+    let scratch = Scratch::new("file-identity");
+    let file = scratch.file("f", b"x");
+    let other = scratch.file("g", b"y");
+    let linked = scratch.0.join("h");
+    fs::hard_link(&file, &linked).unwrap();
+    let id = identity::of_path(&file);
+    assert!(id.is_some());
+    assert_eq!(identity::of_path(&scratch.0.join(".").join("f")), id);
+    assert_eq!(identity::of_path(&linked), id);
+    assert_ne!(identity::of_path(&other), id);
+}
+
+/// An input that is a dangling symlink names the file opening the trace
+/// would create when the two lead to the same place; the trace is refused
+/// rather than become the input.
+#[cfg(unix)]
+#[test]
+fn trace_where_a_dangling_input_leads_is_refused() {
+    let scratch = Scratch::new("trace-dangling-input");
+    let target = scratch.0.join("target");
+    let input = scratch.0.join("in");
+    std::os::unix::fs::symlink(&target, &input).unwrap();
+    let opts = parse(&["-f", input.to_str().unwrap(), "-o", "/dev/null"]).unwrap();
+    assert!(refuse_trace_alias(&opts, &target).is_err());
+}
+
+/// The names Unix gives standard output and standard input are them,
+/// whatever their identity reads as (a pipe under macOS `/dev/fd` reads as
+/// a node of its own).
+#[cfg(unix)]
+#[test]
+fn the_standard_stream_names_are_recognised() {
+    for name in ["/dev/stdout", "/dev/fd/1"] {
+        assert!(is_stdout(Path::new(name)), "{name}");
+    }
+    let reading_stdin = parse(&["-d", "-", "-o", "/dev/null"]).unwrap();
+    for name in ["/dev/stdin", "/dev/fd/0"] {
+        assert!(
+            refuse_trace_alias(&reading_stdin, Path::new(name)).is_err(),
+            "{name}"
+        );
+    }
+}
+
+/// Errors, summaries and progress go to stderr, so a trace there would
+/// interleave with them; it is refused unless `-qq` silences stderr.
+#[cfg(unix)]
+#[test]
+fn trace_on_stderr_is_refused_unless_silenced() {
+    let scratch = Scratch::new("trace-stderr");
+    let input = scratch.file("in", b"x");
+    let input = input.to_str().unwrap();
+    let speaking = parse(&["-f", input, "-o", "/dev/null"]).unwrap();
+    let silent = parse(&["-qq", "-f", input, "-o", "/dev/null"]).unwrap();
+    for name in ["/dev/stderr", "/dev/fd/2"] {
+        assert!(
+            refuse_trace_alias(&speaking, Path::new(name)).is_err(),
+            "{name}"
+        );
+        assert!(
+            refuse_trace_alias(&silent, Path::new(name)).is_ok(),
+            "{name}"
+        );
+    }
+}
+
+/// Standard input is never a place for a trace: besides the codec, a
+/// confirmation or `-p` may read it, so it is refused even when the inputs
+/// are named files.
+#[cfg(unix)]
+#[test]
+fn trace_on_stdin_is_refused_whatever_the_inputs() {
+    let scratch = Scratch::new("trace-stdin-named");
+    let out = scratch.0.join("out.zst");
+    let opts = parse(&["-f", "in", "-o", out.to_str().unwrap()]).unwrap();
+    assert!(refuse_trace_alias(&opts, Path::new("/dev/stdin")).is_err());
+}
+
+/// `--show-default-cparams`, `-p` and `--progress` write to stderr whatever
+/// the verbosity, so under `-qq` they still keep a trace off it.
+#[cfg(unix)]
+#[test]
+fn trace_on_stderr_is_refused_while_anything_writes_there() {
+    let stderr = Path::new("/dev/stderr");
+    for args in [
+        &["-qq", "--show-default-cparams", "in", "-o", "/dev/null"][..],
+        &["-qq", "-p", "in", "-o", "/dev/null"][..],
+        &["-qq", "--progress", "in", "-o", "/dev/null"][..],
+    ] {
+        let opts = parse(args).unwrap();
+        assert!(refuse_trace_alias(&opts, stderr).is_err(), "{args:?}");
+    }
+}
+
+/// A trace that closes on a stream of empty frames, which the decoder walks
+/// within one read, stops timing the source even though the read then ends
+/// the stream.
+#[test]
+fn a_trace_closed_on_empty_frames_stops_timing() {
+    let scratch = Scratch::new("trace-closed-empty");
+    let read_only = scratch.file("read-only.csv", b"");
+    let mut trace = Some(trace::Trace::over(
+        fs::File::open(&read_only).unwrap(),
+        10507,
+        false,
+    ));
+    let mut empties = frame_of(b"");
+    empties.extend_from_slice(&frame_of(b""));
+    let read_time = core::cell::Cell::new(Some(std::time::Duration::ZERO));
+    let mut decoder = structured_zstd::decoding::StreamingDecoder::new(Watched {
+        inner: empties.as_slice(),
+        failed: false,
+        read_time: &read_time,
+    });
+    let mut buffer = [0u8; 64];
+    drain_decoded(
+        &mut decoder,
+        &mut Vec::new(),
+        &mut buffer,
+        &mut trace,
+        &read_time,
+        0,
+    )
+    .unwrap();
+    assert!(trace.is_none());
+    assert_eq!(read_time.get(), None);
+}
+
+/// `--list` writes its table to stdout and ignores `-o`, so a trace may take
+/// that name.
+#[test]
+fn trace_named_like_a_listing_output_is_opened() {
+    let scratch = Scratch::new("trace-list-output");
+    let report = scratch.0.join("report.csv");
+    let report = report.to_str().unwrap();
+    let opts = parse(&["-qq", "-l", "-o", report, "archive.zst"]).unwrap();
+    assert!(refuse_trace_alias(&opts, Path::new(report)).is_ok());
+}
+
+/// A mirror root the run has yet to create must become a directory, so a
+/// trace there, created first as a file, would fail every input.
+#[test]
+fn trace_where_a_mirrored_directory_goes_is_refused() {
+    let scratch = Scratch::new("trace-mirror-root");
+    let input = scratch.file("in", b"mirrored");
+    let root = scratch.0.join("results");
+    let opts = parse(&[
+        "-f",
+        "--output-dir-mirror",
+        root.to_str().unwrap(),
+        input.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert!(refuse_trace_alias(&opts, &root).is_err());
+    assert!(!root.exists());
+}
+
+/// When the trace closes on a failed write, the source stops timing its
+/// reads: the rest of the stream decodes as an untraced one does.
+#[test]
+fn a_closed_trace_stops_timing_the_source() {
+    let scratch = Scratch::new("trace-closed-timing");
+    let read_only = scratch.file("read-only.csv", b"");
+    let mut trace = Some(trace::Trace::over(
+        fs::File::open(&read_only).unwrap(),
+        10507,
+        false,
+    ));
+    let mut both = frame_of(b"the first frame");
+    both.extend_from_slice(&frame_of(b"the second frame"));
+    let read_time = core::cell::Cell::new(Some(std::time::Duration::ZERO));
+    let mut decoder = structured_zstd::decoding::StreamingDecoder::new(Watched {
+        inner: both.as_slice(),
+        failed: false,
+        read_time: &read_time,
+    });
+    let mut out = Vec::new();
+    let mut buffer = [0u8; 8];
+    drain_decoded(
+        &mut decoder,
+        &mut out,
+        &mut buffer,
+        &mut trace,
+        &read_time,
+        0,
+    )
+    .unwrap();
+    assert_eq!(out, b"the first framethe second frame");
+    assert!(trace.is_none());
+    assert_eq!(read_time.get(), None);
+}
+
+/// When `--exclude-compressed` skips every input, the `-o` output is never
+/// written, and a trace may take its name.
+#[test]
+fn trace_named_like_an_unwritten_output_is_opened() {
+    let scratch = Scratch::new("trace-unwritten-output");
+    let input = scratch.file("a.zst", b"already compressed");
+    let out = scratch.0.join("out");
+    let opts = parse(&[
+        "--exclude-compressed",
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ])
+    .unwrap();
+    assert!(refuse_trace_alias(&opts, &out).is_ok());
+}
+
+/// Standard input has an identity to compare a regular file against, and a
+/// regular file that is not stdin is not taken for it.
+#[test]
+fn a_regular_file_is_not_taken_for_stdin() {
+    let scratch = Scratch::new("stdin-identity");
+    let file = scratch.file("f", b"x");
+    assert!(!is_stdin(&file));
+}
+
+/// Decoding drains the same way with a trace open or without one: a source
+/// that is interrupted is read again, and a damaged frame is an error.
+#[test]
+fn the_drain_retries_interrupts_and_reports_errors() {
+    struct InterruptedOnce<'a> {
+        data: &'a [u8],
+        interrupted: bool,
+    }
+    impl Read for InterruptedOnce<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.data.read(buf)
+        }
+    }
+    let scratch = Scratch::new("drain-paths");
+    let path = scratch.0.join("t.csv");
+    let frame = frame_of(b"drained with or without a trace");
+    for traced in [false, true] {
+        let mut trace = traced.then(|| trace::Trace::open(&path, 10507, false).unwrap());
+        let mut decoder = structured_zstd::decoding::StreamingDecoder::new(InterruptedOnce {
+            data: &frame,
+            interrupted: false,
+        });
+        let mut out = Vec::new();
+        let mut buffer = [0u8; 8];
+        let no_reads = core::cell::Cell::new(None);
+        let written = drain_decoded(
+            &mut decoder,
+            &mut out,
+            &mut buffer,
+            &mut trace,
+            &no_reads,
+            0,
+        )
+        .unwrap();
+        assert_eq!(out, b"drained with or without a trace", "traced: {traced}");
+        assert_eq!(written, out.len() as u64);
+
+        let mut damaged =
+            structured_zstd::decoding::StreamingDecoder::new(&frame[..frame.len() - 2]);
+        assert!(
+            drain_decoded(
+                &mut damaged,
+                &mut Vec::new(),
+                &mut buffer,
+                &mut trace,
+                &no_reads,
+                0
+            )
+            .is_err(),
+            "traced: {traced}"
+        );
+    }
+}
+
+/// Level 0 asks for the default level; the trace records the level the
+/// frame was compressed at, as the reference stores 0 as the default.
+#[test]
+fn trace_records_level_zero_as_the_default() {
+    let scratch = Scratch::new("trace-level-zero");
+    let path = scratch.0.join("t.csv");
+    let mut codecs = no_dict();
+    codecs.trace = Some(trace::Trace::open(&path, 10507, false).unwrap());
+    compress_stream(
+        &b"level zero"[..],
+        Vec::new(),
+        &FrameSettings {
+            level: 0,
+            ..FrameSettings::default()
+        },
+        &mut codecs,
+    )
+    .unwrap();
+    drop(codecs);
+    let lines = fs::read_to_string(&path).unwrap();
+    let level = lines.lines().nth(1).unwrap().split(", ").nth(4).unwrap();
+    assert_eq!(level, "3");
+}
+
+/// An input `--exclude-compressed` skips writes no output, so the output
+/// derived from it is no file of the run, and a trace may take its name.
+#[test]
+fn trace_named_like_a_skipped_input_output_is_opened() {
+    let scratch = Scratch::new("trace-excluded");
+    let input = scratch.file("a.zst", b"already compressed");
+    let input = input.to_str().unwrap();
+    let derived = format!("{input}.zst");
+    let opts = parse(&["--exclude-compressed", input]).unwrap();
+    assert!(refuse_trace_alias(&opts, Path::new(&derived)).is_ok());
+}
+
+/// A trace that is a hard link to an input is that input, under a name no
+/// canonical path tells apart; it is refused like the input itself.
+#[test]
+fn trace_hard_linked_to_an_input_is_refused() {
+    let scratch = Scratch::new("trace-hard-link");
+    let input = scratch.file("in", b"read by the run");
+    let linked = scratch.0.join("trace.csv");
+    fs::hard_link(&input, &linked).unwrap();
+    let opts = parse(&["-f", input.to_str().unwrap()]).unwrap();
+    assert!(refuse_trace_alias(&opts, &linked).is_err());
+}
+
+/// A `-D` file is checked only where the run reads it: `--list` and
+/// `--train` do not, so a trace may share its name there.
+#[test]
+fn trace_naming_an_unread_dictionary_is_opened() {
+    let scratch = Scratch::new("trace-unread-dictionary");
+    let named = scratch.file("report.csv", b"not a dictionary");
+    let named = named.to_str().unwrap();
+    let listing = parse(&["-l", "-D", named, "archive.zst"]).unwrap();
+    assert!(refuse_trace_alias(&listing, Path::new(named)).is_ok());
+    let compressing = parse(&["-D", named, "in"]).unwrap();
+    assert!(refuse_trace_alias(&compressing, Path::new(named)).is_err());
+}
+
+/// A trace that is the file standard output writes to would interleave its
+/// lines with the frames a run sends there, so it is refused when the run
+/// writes data to stdout; when the data goes to a file, a trace on stdout is
+/// a way to watch it, and is opened. Linux only: there `/dev/fd/1` reaches
+/// the test's stdout whatever it is.
+#[cfg(target_os = "linux")]
+#[test]
+fn trace_on_the_stdout_of_a_run_writing_there_is_refused() {
+    let scratch = Scratch::new("trace-stdout");
+    let input = scratch.file("in", b"to stdout");
+    let input = input.to_str().unwrap();
+    let stdout = Path::new("/dev/fd/1");
+    let to_stdout = parse(&["-c", input]).unwrap();
+    assert!(refuse_trace_alias(&to_stdout, stdout).is_err());
+    let out = scratch.0.join("out.zst");
+    // `-qq` keeps the stderr check out: a runner that sends both streams to
+    // one file would make `/dev/fd/1` stderr as well.
+    let to_file = parse(&["-qq", "-f", input, "-o", out.to_str().unwrap()]).unwrap();
+    assert!(refuse_trace_alias(&to_file, stdout).is_ok());
+}
+
+/// `--train` without `-o` writes `dictionary`; a trace of that name would be
+/// created first and then trained over, so it is refused like any output.
+#[test]
+fn trace_naming_the_default_training_output_is_refused() {
+    let opts = parse(&["--train", "sample"]).unwrap();
+    assert!(refuse_trace_alias(&opts, Path::new("dictionary")).is_err());
+    assert!(refuse_trace_alias(&opts, Path::new("elsewhere.csv")).is_ok());
+}
+
+/// A trace path that is a dangling symlink names the file it points at:
+/// opening it creates that file, so a link to an output still to be written
+/// is refused, and a dangling link to anything else is not.
+#[cfg(unix)]
+#[test]
+fn trace_through_a_dangling_link_to_an_output_is_refused() {
+    let scratch = Scratch::new("trace-dangling");
+    let input = scratch.file("in", b"compressed beside its trace");
+    let opts = parse(&["-f", input.to_str().unwrap()]).unwrap();
+    let to_output = scratch.0.join("to-output");
+    std::os::unix::fs::symlink(scratch.0.join("in.zst"), &to_output).unwrap();
+    assert!(refuse_trace_alias(&opts, &to_output).is_err());
+    // A relative target is read against the link's own directory.
+    let relative = scratch.0.join("relative");
+    std::os::unix::fs::symlink("in.zst", &relative).unwrap();
+    assert!(refuse_trace_alias(&opts, &relative).is_err());
+    let elsewhere = scratch.0.join("elsewhere");
+    std::os::unix::fs::symlink(scratch.0.join("t.csv"), &elsewhere).unwrap();
+    assert!(refuse_trace_alias(&opts, &elsewhere).is_ok());
+}
+
+/// A compressed frame's traced duration is the encoder's time, not the
+/// destination's: a writer that takes a long time over each write, the one
+/// that flushes the whole frame at its end included, does not appear in it.
+#[test]
+fn trace_times_compression_without_the_writes() {
+    struct Slow(u64);
+    impl Write for Slow {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            self.0 += buf.len() as u64;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl BytesWritten for Slow {
+        fn bytes_written(&self) -> u64 {
+            self.0
+        }
+    }
+    let scratch = Scratch::new("trace-compress-writes");
+    let path = scratch.0.join("t.csv");
+    let mut codecs = no_dict();
+    codecs.trace = Some(trace::Trace::open(&path, 10507, false).unwrap());
+    let payload = b"a small frame, compressed in microseconds";
+    compress_stream(
+        &payload[..],
+        Slow(0),
+        &FrameSettings {
+            level: 3,
+            ..FrameSettings::default()
+        },
+        &mut codecs,
+    )
+    .unwrap();
+    drop(codecs);
+    let lines = fs::read_to_string(&path).unwrap();
+    let line = lines.lines().nth(1).unwrap();
+    let nanos: u64 = line.split(", ").nth(9).unwrap().parse().unwrap();
+    assert!(nanos < 50_000_000, "{line}");
+}
+
+/// A decompressed frame's traced duration leaves out the source's time as it
+/// leaves out the sink's: a source that takes a long time over each read does
+/// not appear in it.
+#[test]
+fn trace_times_decoding_without_the_reads() {
+    struct Slow<'a>(&'a [u8]);
+    impl Read for Slow<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            self.0.read(buf)
+        }
+    }
+    let scratch = Scratch::new("trace-decode-reads");
+    let path = scratch.0.join("t.csv");
+    let frame = frame_of(b"a small frame, read slowly");
+    let mut trace = Some(trace::Trace::open(&path, 10507, false).unwrap());
+    let read_time = core::cell::Cell::new(Some(std::time::Duration::ZERO));
+    let mut decoder = structured_zstd::decoding::StreamingDecoder::new(Watched {
+        inner: Slow(&frame),
+        failed: false,
+        read_time: &read_time,
+    });
+    let mut buffer = [0u8; 64];
+    drain_decoded(
+        &mut decoder,
+        &mut Vec::new(),
+        &mut buffer,
+        &mut trace,
+        &read_time,
+        0,
+    )
+    .unwrap();
+    drop(trace);
+    let lines = fs::read_to_string(&path).unwrap();
+    let line = lines.lines().nth(1).unwrap();
+    let nanos: u64 = line.split(", ").nth(9).unwrap().parse().unwrap();
+    assert!(nanos < 50_000_000, "{line}");
+}
+
+/// A compressed frame's traced duration leaves out the source's time as it
+/// leaves out the destination's: a reader that takes a long time over each
+/// read does not appear in it.
+#[test]
+fn trace_times_compression_without_the_reads() {
+    struct Slow<'a>(&'a [u8]);
+    impl Read for Slow<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            self.0.read(buf)
+        }
+    }
+    let scratch = Scratch::new("trace-compress-reads");
+    let path = scratch.0.join("t.csv");
+    let mut codecs = no_dict();
+    codecs.trace = Some(trace::Trace::open(&path, 10507, false).unwrap());
+    let payload = b"a small frame, read slowly";
+    compress_stream(
+        io::BufReader::with_capacity(8, Slow(payload)),
+        Vec::new(),
+        &FrameSettings {
+            level: 3,
+            ..FrameSettings::default()
+        },
+        &mut codecs,
+    )
+    .unwrap();
+    drop(codecs);
+    let lines = fs::read_to_string(&path).unwrap();
+    let line = lines.lines().nth(1).unwrap();
+    let nanos: u64 = line.split(", ").nth(9).unwrap().parse().unwrap();
+    assert!(nanos < 50_000_000, "{line}");
+}
+
+/// A source whose `consume` takes long, as a progress display writing to a
+/// slow stderr does, is the caller's time too, and stays out of the frame's;
+/// the uncompressed size is still every byte consumed.
+#[test]
+fn trace_times_compression_without_the_consumes() {
+    struct SlowConsume<'a>(&'a [u8]);
+    impl Read for SlowConsume<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+    impl BufRead for SlowConsume<'_> {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Ok(&self.0[..self.0.len().min(8)])
+        }
+        fn consume(&mut self, amount: usize) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            self.0 = &self.0[amount..];
+        }
+    }
+    let scratch = Scratch::new("trace-compress-consumes");
+    let path = scratch.0.join("t.csv");
+    let mut codecs = no_dict();
+    codecs.trace = Some(trace::Trace::open(&path, 10507, false).unwrap());
+    let payload = b"a small frame, consumed slowly";
+    compress_stream(
+        SlowConsume(payload),
+        Vec::new(),
+        &FrameSettings {
+            level: 3,
+            ..FrameSettings::default()
+        },
+        &mut codecs,
+    )
+    .unwrap();
+    drop(codecs);
+    let lines = fs::read_to_string(&path).unwrap();
+    let line = lines.lines().nth(1).unwrap();
+    let fields: Vec<&str> = line.split(", ").collect();
+    assert_eq!(fields[7], payload.len().to_string(), "{line}");
+    let nanos: u64 = fields[9].parse().unwrap();
+    assert!(nanos < 50_000_000, "{line}");
+}
+
+/// A `--trace` file that is also a file the run reads or writes is refused
+/// before anything is opened: appending to an input would change it, and
+/// creating an output ahead of its own overwrite check would make the run
+/// refuse it, or rename the output over the trace. Nothing is touched.
+#[test]
+fn trace_naming_a_file_of_the_run_is_refused() {
+    let scratch = Scratch::new("trace-alias");
+    let payload = b"a file the run works on";
+    let input = scratch.file("in", payload);
+    let frame = scratch.file("frame.zst", &frame_of(payload));
+    let dictionary = scratch.file("dict", b"dictionary content, long enough to be used");
+    let input = input.to_str().unwrap();
+    let frame_path = frame.to_str().unwrap();
+    let dictionary_path = dictionary.to_str().unwrap();
+    let derived = scratch.0.join("in.zst");
+    let derived = derived.to_str().unwrap();
+    let named = scratch.0.join("named");
+    let named = named.to_str().unwrap();
+    let frame_bytes = fs::read(&frame).unwrap();
+
+    let refused = |args: &[&str]| run(parse(args).unwrap()).is_err();
+    // The input being decoded.
+    assert!(refused(&[
+        "-qq", "-d", "--trace", frame_path, frame_path, "-o", named
+    ]));
+    // An output derived from an input, and one named with `-o`.
+    assert!(refused(&["-qq", "--trace", derived, input]));
+    assert!(refused(&["-qq", "--trace", named, input, "-o", named]));
+    // The dictionary, and a benchmark's input.
+    assert!(refused(&[
+        "-qq",
+        "-D",
+        dictionary_path,
+        "--trace",
+        dictionary_path,
+        input,
+        "-o",
+        named
+    ]));
+    assert!(refused(&["-qq", "-b1", "-i0", "--trace", input, input]));
+
+    assert_eq!(fs::read(&frame).unwrap(), frame_bytes);
+    assert_eq!(fs::read(scratch.0.join("in")).unwrap(), payload);
+    assert!(!Path::new(derived).exists());
+    assert!(!Path::new(named).exists());
+}
+
+/// `--patch-apply=REF` decompresses against a `--patch-from` reference, with
+/// the memory ceiling lifted to the default as the reference lifts it.
+#[test]
+fn patch_apply_decompresses_against_the_reference() {
+    let opts = parse(&["-M64", "--patch-apply=ref", "f.zst"]).unwrap();
+    assert_eq!(opts.mode, Mode::Decompress);
+    assert_eq!(opts.patch_from, Some(PathBuf::from("ref")));
+    assert_eq!(opts.memory_limit, None);
+    let opts = parse(&["--patch-apply", "ref", "f.zst"]).unwrap();
+    assert_eq!(opts.patch_from, Some(PathBuf::from("ref")));
+}
+
+/// With no input named, `-b` measures generated data as the reference does:
+/// lorem ipsum, or with `-P#` data of that compressibility, `-B` bytes of it.
+/// Inputs named that select nothing are still refused (see
+/// `file_only_modes_refuse_an_empty_selection`).
+#[test]
+fn a_benchmark_without_inputs_measures_generated_data() {
+    for args in [
+        &["-b1", "-i0", "-qq", "-B64K"][..],
+        &["-b1", "-i0", "-qq", "-B64K", "-P50"],
+        &["-b1", "-i0", "-qq", "-B64K", "-P100"],
+        // `-q` prints the machine-readable lines, a `-p#` sweep's tagged.
+        &["-b1", "-i0", "-q", "-B64K"],
+        &["-b1", "-i0", "-q", "-B64K", "-p7"],
+        // Raising the priority needs a privilege a test does not have; the
+        // refusal is reported and the measurement runs.
+        &["-b1", "-i0", "-qq", "-B64K", "--priority=rt"],
+    ] {
+        assert_eq!(run(parse(args).unwrap()).unwrap(), 0, "{args:?}");
+    }
+    // The generated data is measured alone, as `BMK_syntheticTest` measures
+    // it, so a `-D` there is not even read: measuring through it would report
+    // another codec path under the same command line.
+    let opts = parse(&[
+        "-b1",
+        "-i0",
+        "-qq",
+        "-B64K",
+        "-D",
+        "/nonexistent/dictionary",
+    ])
+    .unwrap();
+    assert_eq!(run(opts).unwrap(), 0);
+    // Nor a `--patch-from` reference, which would otherwise ask for a stream
+    // size and resize the window of a benchmark that has no patch to make.
+    let opts = parse(&[
+        "-b1",
+        "-i0",
+        "-qq",
+        "-B64K",
+        "--patch-from",
+        "/nonexistent/reference",
+    ])
+    .unwrap();
+    assert_eq!(run(opts).unwrap(), 0);
+    // A size no allocator can give is an error, not an abort. `usize::MAX`
+    // parses on every target and is past what any allocation may be.
+    let too_large = format!("--block-size={}", usize::MAX);
+    let opts = parse(&["-b1", "-i0", "-qq", &too_large]).unwrap();
+    let refused = run(opts).err().unwrap().to_string();
+    assert!(refused.contains("memory"), "{refused}");
 }
 
 /// `--block-size=#` is the long spelling of `-B#`, as in the reference, which
@@ -3878,7 +5214,7 @@ fn decoding_counts_its_output_and_no_check_ignores_the_checksum() {
         &mut codecs,
         &DecodeSettings {
             verify_checksum: false,
-            pass_through: false,
+            ..DecodeSettings::default()
         },
     )
     .expect("--no-check decodes it regardless");
@@ -3968,8 +5304,8 @@ fn forced_pass_through_follows_each_inputs_destination() {
 #[test]
 fn an_empty_input_passes_through_and_is_refused_otherwise() {
     let pass = DecodeSettings {
-        verify_checksum: true,
         pass_through: true,
+        ..DecodeSettings::default()
     };
     let mut out = Vec::new();
     let written = decompress_stream(&b""[..], &mut out, &mut no_dict(), &pass)
@@ -3998,8 +5334,8 @@ fn an_empty_input_passes_through_and_is_refused_otherwise() {
 #[test]
 fn plain_input_is_passed_through_or_refused() {
     let pass = DecodeSettings {
-        verify_checksum: true,
         pass_through: true,
+        ..DecodeSettings::default()
     };
     let mut out = Vec::new();
     let written = decompress_stream(
@@ -4094,14 +5430,18 @@ fn plain_input_is_passed_through_or_refused() {
         );
     }
 
-    // A frame magic whose header is invalid (a window larger than any decoder
-    // accepts, RFC 8878 3.1.1.1.2) is a damaged frame, reported with its cause.
+    // A frame magic whose header asks for a window larger than any decoder
+    // accepts (RFC 8878 3.1.1.1.2) is refused with the reference command's
+    // message for it (fileio.c:2683).
     let mut bad_header = 0xFD2F_B528u32.to_le_bytes().to_vec();
     bad_header.extend_from_slice(&[0x00, 0xF8]);
     let err = decompress_stream(bad_header.as_slice(), io::sink(), &mut no_dict(), &pass)
         .expect_err("a frame with an invalid header is refused")
         .to_string();
-    assert!(err.contains("invalid zstd frame"), "{err}");
+    assert!(
+        err.contains("Window log larger than ZSTD_WINDOWLOG_MAX"),
+        "{err}"
+    );
 
     // A source that fails where the next frame would start is a read failure,
     // not a stump of a header: "unknown header" is for input that ends there.
@@ -4146,6 +5486,30 @@ fn plain_input_is_passed_through_or_refused() {
     assert!(
         DecodeSettings::from_options(&parse(&["-df", "--pass-through", "f"]).unwrap()).pass_through
     );
+}
+
+/// A frame whose descriptor has the Reserved_bit set is refused with the
+/// reference command's message for that error ("Decoding error (36) :
+/// Unsupported frame parameter"), with or without pass-through.
+#[test]
+fn a_frame_with_the_reserved_descriptor_bit_is_refused() {
+    let mut frame = frame_of(b"payload");
+    frame[4] |= 0x08;
+    for pass_through in [false, true] {
+        let settings = DecodeSettings {
+            pass_through,
+            ..DecodeSettings::default()
+        };
+        let mut out = Vec::new();
+        let err = decompress_stream(frame.as_slice(), &mut out, &mut no_dict(), &settings)
+            .expect_err("the reserved bit must be refused")
+            .to_string();
+        assert!(
+            err.contains("Decoding error (36) : Unsupported frame parameter"),
+            "pass_through={pass_through}: {err}"
+        );
+        assert!(out.is_empty(), "nothing of the frame reaches the output");
+    }
 }
 
 /// Data to stdout silences the result summary and sets `--rm` aside; the
@@ -4224,12 +5588,13 @@ fn attached_short_option_values_are_validated() {
     assert!(parse(&["-Tinvalid", "f"]).is_err());
     assert!(parse(&["-Binvalid", "f"]).is_err());
     assert!(parse(&["-Minvalid", "f"]).is_err());
-    // A thread count is a count. Sizes suffixes belong to `-B`, which is a
-    // size, and `--threads=` already refuses them — the short spelling has to
-    // agree with the long one.
+    // Every number takes the size suffixes, a thread count included, as the
+    // reference reads them all with one reader; the short spelling and the
+    // long one agree.
     assert!(parse(&["-B4K", "f"]).is_ok());
-    assert!(parse(&["-T4K", "f"]).is_err());
-    assert!(parse(&["--threads=4K", "f"]).is_err());
+    assert!(parse(&["-T4K", "f"]).is_ok());
+    assert!(parse(&["--threads=4K", "f"]).is_ok());
+    assert!(parse(&["--threads=4x", "f"]).is_err());
 }
 
 /// Ignoring what `--adapt` does is not a licence to ignore what it says. The
@@ -4443,7 +5808,7 @@ fn a_failed_frame_does_not_reach_the_next_input() {
     let payload = vec![b'x'; 300_000];
     compress_stream(
         payload.as_slice(),
-        &mut Vec::new(),
+        Vec::new(),
         &FrameSettings {
             pledged_size: Some(payload.len() as u64 + 1),
             ..settings
@@ -4627,8 +5992,9 @@ fn repeated_advanced_parameter_lists_accumulate() {
 }
 
 /// The knobs reach the encoder: a `--zstd=wlog=` window is what the frame
-/// declares, it wins over the window `--long` would set, and a window the
-/// decoder cannot read back is refused at the command line like `--long=N`.
+/// declares, it wins over the window `--long` would set, and a window past
+/// what this build writes and reads back is refused at the command line like
+/// `--long=N`.
 #[test]
 fn advanced_parameters_reach_the_frame() {
     use structured_zstd::decoding::read_frame_header_info;
@@ -4637,8 +6003,12 @@ fn advanced_parameters_reach_the_frame() {
     assert_eq!(opts.advanced.window_log, Some(20));
     assert_eq!(opts.advanced.strategy, Some(Strategy::Btopt));
     assert!(
-        parse(&["--zstd=wlog=28", "f"]).is_err(),
-        "beyond what decodes"
+        parse(&["--zstd=wlog=28", "f"]).is_ok(),
+        "within the encoder"
+    );
+    assert!(
+        parse(&[&format!("--zstd=wlog={}", max_window_log() + 1), "f"]).is_err(),
+        "beyond what this build writes"
     );
     assert!(
         parse(&["--zstd=mml=9", "f"]).is_err(),
@@ -4694,9 +6064,10 @@ fn advanced_parameters_reach_the_frame() {
 }
 
 /// `--max` sets every knob to its hardest end, as the reference's
-/// `setMaxCompression` does, with the window stopped where this build still
-/// decodes. It unlocks the ultra levels and long-distance matching, replaces a
-/// `--zstd=` list given before it, and is adjusted by one given after it.
+/// `setMaxCompression` does, with the window stopped at the widest this build
+/// writes and reads back. It unlocks the ultra levels and long-distance
+/// matching, replaces a `--zstd=` list given before it, and is adjusted by one
+/// given after it.
 #[test]
 #[cfg(target_pointer_width = "64")]
 fn max_sets_every_knob_to_its_hardest_end() {
@@ -4705,7 +6076,7 @@ fn max_sets_every_knob_to_its_hardest_end() {
     assert_eq!(
         opts.advanced,
         AdvancedParams {
-            window_log: Some(27),
+            window_log: Some(max_window_log()),
             chain_log: Some(30),
             hash_log: Some(30),
             search_log: Some(30),
@@ -5173,8 +6544,9 @@ fn a_named_file_sizes_its_patch_window_from_the_file() {
 }
 
 /// The patch window covers the input (`highbit(size) + 1`), is never below the
-/// smallest window the format allows, and stops where the decoder would refuse
-/// the frame.
+/// smallest window the format allows, and stops at the widest window this
+/// build writes and reads back. A patch past the decoder's default 128 MiB is
+/// fine: applying it raises the ceiling, as `--patch-apply` does upstream.
 #[test]
 fn the_patch_window_covers_the_input_within_what_decodes() {
     assert_eq!(patch_window_log(0).unwrap(), 10);
@@ -5182,7 +6554,10 @@ fn the_patch_window_covers_the_input_within_what_decodes() {
     assert_eq!(patch_window_log(2000).unwrap(), 11);
     assert_eq!(patch_window_log(1 << 20).unwrap(), 21);
     assert_eq!(patch_window_log((1 << 27) - 1).unwrap(), 27);
-    assert!(patch_window_log(1 << 27).is_err());
+    assert_eq!(patch_window_log(1 << 27).unwrap(), 28);
+    let upper = max_window_log();
+    assert_eq!(patch_window_log((1 << upper) - 1).unwrap(), upper);
+    assert!(patch_window_log(1 << upper).is_err());
 }
 
 /// `-b` prints its result in the reference command's layout, at the default
@@ -5201,9 +6576,29 @@ fn benchmark_lines_follow_the_reference_layout() {
         " 3#a.txt            :      7692 ->       255 (x30.16),  123.5 MB/s, 1234.5 MB/s"
     );
     assert_eq!(
-        result.quiet_line("a.txt"),
+        result.quiet_line("a.txt", None),
         "-3          255 (30.165) 123.46 MB/s 1234.5 MB/s  a.txt"
     );
+    // `-p#` tags the line with its parameter, as `benchzstd.c` does; zero is
+    // the reference's "no parameter".
+    assert_eq!(
+        result.quiet_line("a.txt", Some(7)),
+        "-3          255 (30.165) 123.46 MB/s 1234.5 MB/s  a.txt (param=7)"
+    );
+    assert_eq!(
+        result.quiet_line("a.txt", Some(0)),
+        result.quiet_line("a.txt", None)
+    );
+    // The `-q` header heads a plain run only: a parameter sweep's lines are
+    // the tagged rows alone (`benchzstd.c:955`).
+    let quiet = |args: &[&str]| bench_quiet_header(&parse(args).unwrap(), 7692);
+    assert_eq!(
+        quiet(&["-b", "-q", "-B64K", "f"]).as_deref(),
+        Some("bench 1.5.7 : input 7692 bytes, 3 seconds, 64 KB blocks")
+    );
+    assert_eq!(quiet(&["-b", "-q", "-p7", "f"]), None);
+    assert!(quiet(&["-b", "-q", "-p0", "f"]).is_some());
+    assert_eq!(quiet(&["-b", "f"]), None);
     let slow = BenchResult {
         compress_mb_s: 1.5,
         output: 7000,

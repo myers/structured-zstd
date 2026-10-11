@@ -69,7 +69,6 @@ fn main() {
     on_budget(kib, "StreamingDecoder", move || {
         let mut out = Vec::new();
         StreamingDecoder::new(frame.as_slice())
-            .expect("header")
             .read_to_end(&mut out)
             .expect("decode");
         assert_eq!(out, data);

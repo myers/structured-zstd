@@ -94,24 +94,26 @@ so a typo is an error rather than silence. `-b` measures every input as frames
 of its own, cut into `-B#` pieces when a size is given, as upstream's
 benchmark does.
 `--max` sets every compression parameter to its hardest end, as upstream's
-does, with the window stopped at 27 (the widest this build decodes), and
+does, with the window stopped at 30 (the widest this build writes), and
 `--show-default-cparams` prints what the level selects for each input in
 upstream's layout.
 `--target-compressed-block-size` does take effect: it bounds what goes into a
 block, so blocks flush sooner. `--long` means `--long=27`, as upstream
-documents, and is capped there: a larger window would produce frames this
-build's decoder refuses. It needs level 16 or above, where long-distance
-matching actually runs — below that it is refused rather than accepted as a
-wider window and nothing else. A window is never declared larger than the
-source can fill, so a small file compressed with `--long` does not ask its
-decoders to reserve 128 MiB.
+documents. It needs level 16 or above, where long-distance matching actually
+runs — below that it is refused rather than accepted as a wider window and
+nothing else. A window is never declared larger than the source can fill, so a
+small file compressed with `--long` does not ask its decoders to reserve
+128 MiB. Decoding takes windows up to 128 MiB by default; a wider frame (from
+`--long=28` and up) is refused with upstream's message, and decodes with
+`--long=N`, `--zstd=wlog=N` or a `--memory` large enough, as upstream's does.
+`--patch-apply` takes any window.
 
 Flags that would change the result are refused instead: `--format=` for
 anything but zstd and `--rsyncable`, which needs the worker threads this build
 does not have. `-M` is treated as the safety promise it is: on the
-runs that decode, a limit covering the 128 MiB window, the decoder's buffers
-and the `-D` dictionary is kept and a tighter one is refused rather than
-ignored. Compressing and listing allocate no decoder, so the flag is accepted
+runs that decode, a limit covering the 128 MiB default window, the decoder's
+buffers and the `-D` dictionary is kept and a tighter one is refused rather
+than ignored; a larger limit lets the window grow into what it leaves. Compressing and listing allocate no decoder, so the flag is accepted
 there and describes nothing, as upstream has it; for `--train` it caps the
 samples loaded, as below.
 
@@ -217,11 +219,17 @@ use structured_zstd::io::Read;
 
 let compressed_data: Vec<u8> = vec![];
 let mut source: &[u8] = &compressed_data;
-let mut decoder = StreamingDecoder::new(&mut source).unwrap();
+let mut decoder = StreamingDecoder::new(&mut source);
 
 let mut result = Vec::new();
 decoder.read_to_end(&mut result).unwrap();
 ```
+
+Creating a `StreamingDecoder` reads nothing from its source. The first read
+reads the first frame header and reports any problem with the input, and
+`into_inner()` hands the source back. A decoder that was never read returns
+the source untouched, so a container format can decide not to decompress an
+entry and copy its raw bytes instead.
 
 ### Dictionaries
 

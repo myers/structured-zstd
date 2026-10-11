@@ -124,22 +124,28 @@ fn malformed_block_does_not_panic_via_restore_checkpoint() {
     extern crate std;
     use std::io::Read;
 
+    // The artifact's descriptor was 0x5d, which also sets the Reserved_bit
+    // that a decoder must refuse (RFC 8878 3.1.1.1.1). Decoders that ignored the
+    // bit read 0x55 identically, so clearing it keeps the block path this
+    // regression guards reachable.
     let data: &[u8] = &[
-        0x28, 0xb5, 0x2f, 0xfd, 0x5d, 0x00, 0x00, 0xf7, 0x06, 0x5d, 0x00, 0x00, 0x5d, 0x00, 0x80,
+        0x28, 0xb5, 0x2f, 0xfd, 0x55, 0x00, 0x00, 0xf7, 0x06, 0x5d, 0x00, 0x00, 0x5d, 0x00, 0x80,
         0xf7, 0xff, 0x5d, 0x00, 0x00, 0x01, 0xe0, 0xe0, 0xe0, 0xe0, 0xe2, 0xe0, 0xa4, 0x00, 0x0c,
         0x0c, 0x2c, 0x0c,
     ];
 
     // Pre-fix: `restore_checkpoint`'s cap-mismatch assert turned the
-    // malformed block into a panic. Post-fix: frame construction
-    // succeeds (the header is well-formed) and `read_to_end` surfaces
-    // a normal decode `Err` once the corrupt block trips the bitstream
-    // validity check. Assert both legs explicitly so a future
-    // regression that lets the malformed block decode "successfully"
-    // (or that breaks frame construction) cannot silently re-mask the
-    // panic the way an `if let Ok(..) { let _ = ... }` shape would.
-    let mut decoder = crate::decoding::StreamingDecoder::new(data)
-        .expect("regression artifact must pass frame-header construction");
+    // malformed block into a panic. Post-fix: the frame header is
+    // well-formed and `read_to_end` surfaces a normal decode `Err` once
+    // the corrupt block trips the bitstream validity check. Assert both
+    // legs explicitly so a future regression that lets the malformed
+    // block decode "successfully" (or that rejects the header first)
+    // cannot silently re-mask the panic the way an
+    // `if let Ok(..) { let _ = ... }` shape would.
+    crate::decoding::FrameDecoder::new()
+        .init(data)
+        .expect("regression artifact must carry a well-formed frame header");
+    let mut decoder = crate::decoding::StreamingDecoder::new(data);
     let mut output = alloc::vec::Vec::new();
     assert!(
         decoder.read_to_end(&mut output).is_err(),
@@ -171,14 +177,16 @@ fn over_producing_block_does_not_oom_via_unbounded_reserve() {
         0x0a, 0x0a, 0x0a, 0x0a, 0xb5, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0xe5, 0x0a, 0xb5,
     ];
 
-    // Frame headers are well-formed, so streaming construction must
-    // succeed — make it mandatory so the test can't vacuously pass by
-    // skipping the OOM path if construction ever regresses. The decode
-    // must surface a normal Err (the per-block ceiling rejecting the
-    // over-producing match), not just "no OOM": asserting Err also locks
-    // in that the decoder never silently accepts this malformed frame.
-    let mut decoder = crate::decoding::StreamingDecoder::new(data)
-        .expect("regression artifact must pass frame-header construction");
+    // Frame headers are well-formed, so the first one must parse: make it
+    // mandatory so the test can't vacuously pass by failing on the header
+    // before the OOM path. The decode must surface a normal Err (the
+    // per-block ceiling rejecting the over-producing match), not just
+    // "no OOM": asserting Err also locks in that the decoder never
+    // silently accepts this malformed frame.
+    crate::decoding::FrameDecoder::new()
+        .init(data)
+        .expect("regression artifact must carry a well-formed frame header");
+    let mut decoder = crate::decoding::StreamingDecoder::new(data);
     let mut output = alloc::vec::Vec::new();
     assert!(
         decoder.read_to_end(&mut output).is_err(),
@@ -199,8 +207,12 @@ fn multi_frame_flat_buf_path_does_not_panic() {
     extern crate std;
     use std::io::Read;
 
+    // The artifact's first descriptor was 0x28, which also sets the
+    // Reserved_bit that a decoder must refuse (RFC 8878 3.1.1.1.1). Decoders
+    // that ignored the bit read 0x20 identically, so clearing it keeps the
+    // later frames this regression guards reachable.
     let data: &[u8] = &[
-        0x28, 0xB5, 0x2F, 0xFD, 0x28, 0x28, 0xF5, 0x00, 0x00, 0x2D, 0x27, 0x8C, 0xB4, 0xB4, 0x20,
+        0x28, 0xB5, 0x2F, 0xFD, 0x20, 0x28, 0xF5, 0x00, 0x00, 0x2D, 0x27, 0x8C, 0xB4, 0xB4, 0x20,
         0xA0, 0x00, 0x02, 0x00, 0xF2, 0xF2, 0xF2, 0xF2, 0x85, 0x21, 0xF2, 0xF2, 0xF2, 0xF2, 0xF2,
         0xF2, 0xF2, 0xF2, 0xF2, 0xA8, 0xA8, 0xA8, 0xA8, 0x28, 0xB5, 0x2F, 0xFD, 0x30, 0x28, 0x2D,
         0x00, 0x00, 0x61, 0x6A, 0x10, 0x00, 0x2D, 0x00, 0xA8, 0xA8, 0xA8, 0xA8, 0xA8, 0xA8, 0xA8,
@@ -217,13 +229,14 @@ fn multi_frame_flat_buf_path_does_not_panic() {
     // Reaching the assertion at all (no panic from `read_to_end`) is
     // the contract this test enforces — the return value can be
     // either Ok or Err depending on whether the constructed sequence
-    // of frames terminates cleanly. Frame-header construction MUST
-    // succeed (the bytes start with the zstd magic) so an
-    // `if let Ok(..)` shape would silently turn this regression into
-    // a no-op if a future change broke ctor for this artifact and
-    // hid the flat-buffer panic path that the test actually targets.
-    let mut decoder = crate::decoding::StreamingDecoder::new(data)
-        .expect("regression artifact must pass frame-header construction");
+    // of frames terminates cleanly. The first frame header MUST parse
+    // (the bytes start with the zstd magic): were it rejected, the
+    // decode would stop before the flat-buffer panic path the test
+    // actually targets and pass as a no-op.
+    crate::decoding::FrameDecoder::new()
+        .init(data)
+        .expect("regression artifact must carry a well-formed frame header");
+    let mut decoder = crate::decoding::StreamingDecoder::new(data);
     let mut output = alloc::vec::Vec::new();
     let _ = decoder.read_to_end(&mut output);
 }
