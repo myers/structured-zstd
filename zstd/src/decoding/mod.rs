@@ -36,17 +36,21 @@ mod streaming_decoder;
 pub use dictionary::{Dictionary, DictionaryHandle, MAGIC_NUM as DICTIONARY_MAGIC};
 pub use frame_decoder::{BlockDecodingStrategy, ContentChecksum, FrameDecoder};
 
-/// Largest window a frame may declare before this decoder refuses it.
+/// Largest window a frame may declare before a decoder that holds the window
+/// itself refuses it, unless [`FrameDecoder::set_max_window_size`] raised the
+/// ceiling.
 ///
 /// The bound is what makes decoding untrusted input safe: a frame header can
 /// ask for a window far larger than the data behind it, and honouring that
-/// would let a few bytes of input demand gigabytes of memory. Callers that
-/// impose their own ceiling can compare against this one to see which is the
-/// stricter, and tools can report the bound they actually enforce.
+/// would let a few bytes of input demand gigabytes of memory.
 pub use crate::common::MAXIMUM_ALLOWED_WINDOW_SIZE;
+
+/// Largest window any decode accepts, the ceiling
+/// [`FrameDecoder::set_max_window_size`] can be raised to.
+pub use crate::common::MAX_DECODER_WINDOW_SIZE;
 #[cfg(feature = "lsm")]
 pub use frame_decoder::{PartialDecode, ResumeInput, ResumeState};
-pub use streaming_decoder::StreamingDecoder;
+pub use streaming_decoder::{DictionaryRefused, FinishedFrame, StreamingDecoder};
 
 /// Decompressed size a frame declares in its header, as read by
 /// [`read_frame_content_size`] without decoding the frame body.
@@ -302,12 +306,24 @@ pub struct FrameHeaderInfo {
 /// 4-byte magic number (the offset at which the first block begins). Backs the
 /// C `ZSTD_frameHeaderSize`.
 ///
+/// Only the magic number and the descriptor byte are needed: the length
+/// follows from the descriptor alone, so a caller holding just that five-byte
+/// prefix learns how much of the header is still to read. Upstream's
+/// `ZSTD_frameHeaderSize` measures it the same way
+/// (`zstd_decompress.c:416-429`), without looking at the descriptor's other
+/// bits, so a header this library refuses to decode is still measured.
+///
 /// # Errors
-/// [`ReadFrameHeaderError`](errors::ReadFrameHeaderError) when the header is
-/// too short, has a bad magic number, or is a skippable frame.
+/// [`ReadFrameHeaderError`](errors::ReadFrameHeaderError) when `src` is shorter
+/// than five bytes, has a bad magic number, or is a skippable frame.
+///
+/// ```rust
+/// use structured_zstd::decoding::frame_header_size;
+/// // Magic number and a descriptor announcing a window byte only.
+/// assert_eq!(frame_header_size(&[0x28, 0xB5, 0x2F, 0xFD, 0x00]).unwrap(), 6);
+/// ```
 pub fn frame_header_size(src: &[u8]) -> Result<usize, errors::ReadFrameHeaderError> {
-    let (_header, consumed) = frame::read_frame_header_with_format(src, false)?;
-    Ok(consumed as usize)
+    frame::measure_header_from_slice(src)
 }
 
 /// Decode the leading frame header fields of `src` without decoding the body.
