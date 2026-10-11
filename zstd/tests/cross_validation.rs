@@ -140,7 +140,7 @@ fn cross_rust_fastest_with_source_hint_ffi_decompress_iteration_23() {
         out
     };
 
-    let mut rust_decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut rust_decoder = StreamingDecoder::new(compressed.as_slice());
     let mut rust_result = Vec::new();
     rust_decoder.read_to_end(&mut rust_result).unwrap();
     assert_eq!(data, rust_result, "rust decoder must accept hinted stream");
@@ -158,7 +158,7 @@ fn cross_ffi_compress_rust_decompress_1000() {
         let data = generate_data(i.wrapping_add(0xBEEF), len);
 
         let compressed = zstd::encode_all(&data[..], 1).unwrap();
-        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice());
         let mut result = Vec::new();
         decoder.read_to_end(&mut result).unwrap();
         assert_eq!(
@@ -199,7 +199,7 @@ fn cross_ffi_compress_rust_decompress_large_blocks() {
         let data = generate_huffman_friendly(i as u64 + 400, size, 48);
 
         let compressed = zstd::encode_all(&data[..], 1).unwrap();
-        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice());
         let mut result = Vec::new();
         decoder.read_to_end(&mut result).unwrap();
         assert_eq!(
@@ -211,7 +211,7 @@ fn cross_ffi_compress_rust_decompress_large_blocks() {
     // Multi-block: 512KB
     let data = generate_huffman_friendly(500, 512 * 1024, 48);
     let compressed = zstd::encode_all(&data[..], 1).unwrap();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut result = Vec::new();
     decoder.read_to_end(&mut result).unwrap();
     assert_eq!(data, result, "ffi→rust multi-block roundtrip failed");
@@ -233,7 +233,7 @@ fn cross_rust_compress_ffi_decompress_huffman_seed100() {
 fn cross_ffi_compress_rust_decompress_huffman_seed100() {
     let data = generate_huffman_friendly(100, 512 * 1024, 48);
     let compressed = zstd::encode_all(&data[..], 1).unwrap();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut result = Vec::new();
     decoder.read_to_end(&mut result).unwrap();
     assert_eq!(data, result, "ffi→rust seed=100 512KB roundtrip failed");
@@ -278,7 +278,7 @@ fn cross_ffi_compress_rust_decompress_repeat_offsets() {
         data.extend_from_slice(pattern);
     }
     let compressed = zstd::encode_all(&data[..], 1).unwrap();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut result = Vec::new();
     decoder.read_to_end(&mut result).unwrap();
     assert_eq!(data, result, "ffi→rust repeat offset roundtrip failed");
@@ -289,7 +289,7 @@ fn cross_ffi_compress_rust_decompress_repeat_offsets() {
     }
     multi_block.truncate(512 * 1024);
     let compressed = zstd::encode_all(&multi_block[..], 1).unwrap();
-    let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+    let mut decoder = StreamingDecoder::new(compressed.as_slice());
     let mut result = Vec::new();
     decoder.read_to_end(&mut result).unwrap();
     assert_eq!(
@@ -486,7 +486,7 @@ fn cross_ffi_compress_rust_decompress_rle_mode_tables() {
     for level in [-6i32, -1, 1, 3, 9, 19] {
         for (idx, data) in inputs.iter().enumerate() {
             let compressed = zstd::encode_all(&data[..], level).unwrap();
-            let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+            let mut decoder = StreamingDecoder::new(compressed.as_slice());
             let mut result = Vec::new();
             decoder.read_to_end(&mut result).unwrap();
             // `assert_eq!(*data, result, ...)` borrows both operands
@@ -535,7 +535,7 @@ fn cross_every_level_roundtrips_through_the_c_codec_both_ways() {
             );
 
             let theirs = zstd::encode_all(data, level).unwrap();
-            let mut decoder = StreamingDecoder::new(theirs.as_slice()).unwrap();
+            let mut decoder = StreamingDecoder::new(theirs.as_slice());
             let mut ours_decoded = Vec::with_capacity(data.len());
             decoder
                 .read_to_end(&mut ours_decoded)
@@ -651,4 +651,66 @@ fn cross_every_level_with_ldm_and_dictionary_roundtrips_both_ways() {
         "long-distance matching never changed the output, so the LDM half of \
          this matrix was not exercising anything"
     );
+}
+
+/// A frame whose descriptor has the Reserved_bit (bit 3) set is refused by
+/// libzstd and by this decoder, and the same frame with only the Unused_bit
+/// (bit 4) set is accepted by both. libzstd's code is
+/// `frameParameter_unsupported`, which the C ABI's own test pins for this
+/// library; its header size query answers either way.
+#[test]
+fn reserved_descriptor_bit_is_refused_like_the_reference() {
+    use zstd::zstd_safe;
+    // Multi-segment frame, 1 KiB window, one last Raw block of three bytes.
+    let clean = [
+        0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00, 0x19, 0x00, 0x00, 0xAA, 0xBB, 0xCC,
+    ];
+    let mut reserved = clean;
+    reserved[4] |= 0x08;
+    let mut unused = clean;
+    unused[4] |= 0x10;
+
+    let mut out = [0u8; 16];
+    let code = zstd_safe::decompress(&mut out[..], &reserved[..]).unwrap_err();
+    assert_eq!(
+        zstd_safe::get_error_name(code),
+        "Unsupported frame parameter"
+    );
+    let code = zstd_safe::find_frame_compressed_size(&reserved[..]).unwrap_err();
+    assert_eq!(
+        zstd_safe::get_error_name(code),
+        "Unsupported frame parameter",
+        "libzstd's compressed-size query refuses it the same way"
+    );
+    let header_size = unsafe {
+        zstd_safe::zstd_sys::ZSTD_frameHeaderSize(reserved.as_ptr().cast(), reserved.len())
+    };
+    assert_eq!(
+        header_size, 6,
+        "libzstd measures the header regardless of the bit"
+    );
+    assert_eq!(
+        structured_zstd::decoding::frame_header_size(&reserved).unwrap(),
+        header_size
+    );
+    // Both answer from the five-byte prefix alone.
+    let prefix_size =
+        unsafe { zstd_safe::zstd_sys::ZSTD_frameHeaderSize(reserved.as_ptr().cast(), 5) };
+    assert_eq!(prefix_size, 6);
+    assert_eq!(
+        structured_zstd::decoding::frame_header_size(&reserved[..5]).unwrap(),
+        prefix_size
+    );
+    assert!(
+        structured_zstd::decoding::FrameDecoder::new()
+            .decode_all(&reserved, &mut out)
+            .is_err()
+    );
+
+    let written = zstd_safe::decompress(&mut out[..], &unused[..]).unwrap();
+    assert_eq!(&out[..written], &[0xAA, 0xBB, 0xCC]);
+    let written = structured_zstd::decoding::FrameDecoder::new()
+        .decode_all(&unused, &mut out)
+        .unwrap();
+    assert_eq!(&out[..written], &[0xAA, 0xBB, 0xCC]);
 }

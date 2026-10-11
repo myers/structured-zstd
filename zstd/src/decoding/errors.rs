@@ -12,7 +12,12 @@ use std::error::Error as StdError;
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum FrameDescriptorError {
-    InvalidFrameContentSizeFlag { got: u8 },
+    InvalidFrameContentSizeFlag {
+        got: u8,
+    },
+    /// The descriptor's `Reserved_bit` (bit 3) is set, which a decoder of this
+    /// format version must refuse.
+    ReservedBitSet,
 }
 
 impl fmt::Display for FrameDescriptorError {
@@ -21,6 +26,10 @@ impl fmt::Display for FrameDescriptorError {
             Self::InvalidFrameContentSizeFlag { got } => write!(
                 f,
                 "Invalid Frame_Content_Size_Flag; Is: {got}, Should be one of: 0, 1, 2, 3"
+            ),
+            Self::ReservedBitSet => write!(
+                f,
+                "Reserved_bit of the Frame_Header_Descriptor is set; it must be zero"
             ),
         }
     }
@@ -588,7 +597,21 @@ impl From<HuffmanTableError> for DictionaryDecodeError {
 pub enum FrameDecoderError {
     ReadFrameHeaderError(ReadFrameHeaderError),
     FrameHeaderError(FrameHeaderError),
+    /// The frame's window exceeds the ceiling in force: the decoder's
+    /// [`FrameDecoder::set_max_window_size`](crate::decoding::FrameDecoder::set_max_window_size)
+    /// setting, or [`MAX_DECODER_WINDOW_SIZE`](crate::decoding::MAX_DECODER_WINDOW_SIZE).
+    #[non_exhaustive]
     WindowSizeTooBig {
+        /// The window the frame declares.
+        requested: u64,
+        /// The ceiling it exceeded.
+        limit: u64,
+    },
+    /// A requested window ceiling lies outside 1 KiB (the smallest window a
+    /// frame declares, RFC 8878 3.1.1.1.2) ..=
+    /// [`MAX_DECODER_WINDOW_SIZE`](crate::decoding::MAX_DECODER_WINDOW_SIZE).
+    WindowCeilingOutOfRange {
+        /// The ceiling asked for.
         requested: u64,
     },
     DictionaryDecodeError(DictionaryDecodeError),
@@ -599,9 +622,6 @@ pub enum FrameDecoderError {
     FailedToInitialize(FrameHeaderError),
     FailedToDrainDecodebuffer(Error),
     FailedToSkipFrame,
-    /// The source failed, rather than ended, while a skippable frame's
-    /// content was being stepped over; carries the source's own error.
-    FailedToReadSkippableFrame(Error),
     TargetTooSmall,
     /// Decoded block sizes don't sum to the frame's declared
     /// `frame_content_size` (either a block claims to expand past
@@ -760,7 +780,6 @@ impl StdError for FrameDecoderError {
             FrameDecoderError::FailedToReadChecksum(source) => Some(source),
             FrameDecoderError::FailedToInitialize(source) => Some(source),
             FrameDecoderError::FailedToDrainDecodebuffer(source) => Some(source),
-            FrameDecoderError::FailedToReadSkippableFrame(source) => Some(source),
             _ => None,
         }
     }
@@ -775,12 +794,18 @@ impl core::fmt::Display for FrameDecoderError {
             FrameDecoderError::FrameHeaderError(e) => {
                 write!(f, "{e:?}")
             }
-            FrameDecoderError::WindowSizeTooBig { requested } => {
+            FrameDecoderError::WindowSizeTooBig { requested, limit } => {
                 write!(
                     f,
-                    "Specified window_size is too big; Requested: {}, Allowed: {}",
-                    requested,
-                    crate::common::MAXIMUM_ALLOWED_WINDOW_SIZE,
+                    "Specified window_size is too big; Requested: {requested}, Allowed: {limit}",
+                )
+            }
+            FrameDecoderError::WindowCeilingOutOfRange { requested } => {
+                write!(
+                    f,
+                    "window ceiling {requested} is outside {}..={}",
+                    crate::common::MIN_WINDOW_SIZE,
+                    crate::common::MAX_DECODER_WINDOW_SIZE,
                 )
             }
             FrameDecoderError::DictionaryDecodeError(e) => {
@@ -835,9 +860,6 @@ impl core::fmt::Display for FrameDecoderError {
                     f,
                     "Failed to skip bytes for the length given in the frame header"
                 )
-            }
-            FrameDecoderError::FailedToReadSkippableFrame(e) => {
-                write!(f, "Failed to read a skippable frame's content: {e}")
             }
             FrameDecoderError::TargetTooSmall => {
                 write!(
